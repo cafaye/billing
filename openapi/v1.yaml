@@ -1,0 +1,664 @@
+# The HTTP surface of billing, v1.
+#
+# Written against core's docs/openapi-conventions.md: `/v1` on every path,
+# `application/problem+json` for every non-2xx, cursor pagination on every
+# collection, `Idempotency-Key` on every retriable POST, and `X-Trace-Id` on
+# every response. `test/contract` checks the event side of the same contract
+# against core's envelope schema.
+#
+# Two things a reader should know before trusting this document:
+#
+# 1. `security` is declared but empty, and the endpoints answer without a
+#    token. Authorization is a later platform packet; until it lands this
+#    surface is open, which is a recorded gap in README.md and not an oversight
+#    here. `GET /v1/customers` in particular returns every customer, because
+#    there is no account to scope it by.
+# 2. The plans read/write asymmetry is deliberate: `GET /v1/plans/{slug}` reads
+#    by the public handle, `PATCH /v1/plans/{id}` writes by uuid, because a slug
+#    can be changed by the very request being made and a mutable handle is not a
+#    safe thing to address a mutation by.
+openapi: 3.1.0
+info:
+  title: billing
+  version: 1.0.0
+  description: >-
+    Plans, customers, subscriptions, prepaid credit and usage metering for
+    cafaye. This document describes the v0 surface: customers and plans.
+    The two health probes (/healthz, /readyz) are infrastructure and are
+    deliberately not here.
+  contact:
+    name: billing
+    email: billing@cafaye.com
+servers:
+  - url: https://billing.cafaye.com
+    description: Production
+  - url: http://localhost:3000
+    description: Local
+
+# Declared, and empty. See note 1 above.
+security: []
+
+tags:
+  - name: customers
+    description: Billing records of the users and accounts identity knows about.
+  - name: plans
+    description: What can be bought, at what price, on what cadence.
+
+paths:
+  /v1/customers:
+    get:
+      tags: [customers]
+      operationId: listCustomers
+      summary: List customers
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Order'
+        - $ref: '#/components/parameters/TraceId'
+      responses:
+        '200':
+          description: A page of customers, newest first.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerPage'
+        '400':
+          $ref: '#/components/responses/CursorInvalid'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+    post:
+      tags: [customers]
+      operationId: createCustomer
+      summary: Create a customer
+      description: >-
+        Creates billing's record of an identity user or account. One customer
+        per (owner, processor): a second attempt is a 409.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerCreate'
+      responses:
+        '201':
+          description: Created.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            Location:
+              description: The path of the new customer.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/customers/{id}:
+    parameters:
+      - $ref: '#/components/parameters/CustomerId'
+    get:
+      tags: [customers]
+      operationId: getCustomer
+      summary: Get a customer
+      parameters:
+        - $ref: '#/components/parameters/TraceId'
+      responses:
+        '200':
+          description: The customer.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [customers]
+      operationId: updateCustomer
+      summary: Update a customer
+      description: >-
+        Partial update. Emits no event: core's event catalog has no
+        `billing.customer.updated` row, and this service does not publish a type
+        the catalog does not list.
+      parameters:
+        - $ref: '#/components/parameters/TraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerUpdate'
+      responses:
+        '200':
+          description: The updated customer.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Customer'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/plans:
+    get:
+      tags: [plans]
+      operationId: listPlans
+      summary: List plans
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Order'
+        - $ref: '#/components/parameters/TraceId'
+      responses:
+        '200':
+          description: A page of plans, newest first.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanPage'
+        '400':
+          $ref: '#/components/responses/CursorInvalid'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+    post:
+      tags: [plans]
+      operationId: createPlan
+      summary: Create a plan
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlanCreate'
+      responses:
+        '201':
+          description: Created.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+            Location:
+              description: The path of the new plan.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Plan'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+  /v1/plans/{slug}:
+    get:
+      tags: [plans]
+      operationId: getPlan
+      summary: Get a plan by slug
+      description: >-
+        Read by slug, the handle that appears in a pricing page. A uuid is a 404
+        here: this operation does not look plans up by id.
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          description: The plan's kebab-case slug.
+          schema:
+            type: string
+            pattern: '^[a-z0-9]+(-[a-z0-9]+)*$'
+        - $ref: '#/components/parameters/TraceId'
+      responses:
+        '200':
+          description: The plan.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Plan'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/plans/{id}:
+    parameters:
+      - $ref: '#/components/parameters/PlanId'
+    patch:
+      tags: [plans]
+      operationId: updatePlan
+      summary: Update a plan
+      description: >-
+        Write by uuid, because the slug can be changed by this very request and
+        a mutable handle is not a safe thing to address a mutation by. A slug
+        is a 404 here: this operation does not look plans up by slug. Emits
+        `billing.plan.updated` only when a field actually changed.
+      parameters:
+        - $ref: '#/components/parameters/TraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlanUpdate'
+      responses:
+        '200':
+          description: The updated plan.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Plan'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+
+components:
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Rows per page. Defaults to 25, capped at 100.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: >-
+        Opaque base64url cursor from a previous page's `page.next_cursor`.
+        Clients must not parse it; its encoding may change without notice.
+        Expires after 24 hours.
+      schema:
+        type: string
+    Order:
+      name: order
+      in: query
+      required: false
+      description: Sort direction. Defaults to desc (newest first).
+      schema:
+        type: string
+        enum: [asc, desc]
+        default: desc
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: >-
+        A uuid chosen by the client. The same key with the same body replays the
+        original response and sets `Idempotency-Replayed: true`; the same key
+        with a different body is a 409 `idempotency_key_reused`. A request
+        without the key is processed normally.
+      schema:
+        type: string
+        format: uuid
+    TraceId:
+      name: X-Trace-Id
+      in: header
+      required: false
+      description: >-
+        The caller's trace id, echoed on the response and repeated in the body
+        of every error. Supplying one is how a call is followed.
+      schema:
+        type: string
+    CustomerId:
+      name: id
+      in: path
+      required: true
+      description: The customer's uuid.
+      schema:
+        type: string
+        format: uuid
+    PlanId:
+      name: id
+      in: path
+      required: true
+      description: The plan's uuid.
+      schema:
+        type: string
+        format: uuid
+
+  headers:
+    TraceId:
+      description: The trace id, always present.
+      required: true
+      schema:
+        type: string
+    IdempotencyReplayed:
+      description: '`true` when this response was replayed from a stored one.'
+      schema:
+        type: string
+        enum: ['true']
+
+  schemas:
+    # The money rule at the wire: an amount crosses a boundary as integer minor
+    # units plus a currency, never as a decimal and never as a float.
+    Money:
+      type: object
+      description: An amount of money in integer minor units.
+      required: [amount_minor, currency]
+      additionalProperties: false
+      properties:
+        amount_minor:
+          type: integer
+          description: >-
+            A whole number of minor units. A decimal here — as a number or as a
+            string — is a 422: a float cannot represent 0.10 exactly, so it never
+            carries an amount.
+          minimum: 0
+          example: 1900
+        currency:
+          type: string
+          description: An ISO 4217 code, stored and returned upper case.
+          pattern: '^[A-Z]{3}$'
+          example: USD
+
+    CustomerOwner:
+      type: object
+      description: >-
+        A reference to an identity record. A uuid, stored without a foreign
+        key: it crosses a service boundary, and billing never loads it.
+      required: [type, id]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          enum: [User, Account]
+        id:
+          type: string
+          format: uuid
+
+    Customer:
+      type: object
+      required:
+        [id, owner, processor, processor_customer_id, email, metadata, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        owner:
+          $ref: '#/components/schemas/CustomerOwner'
+        processor:
+          type: string
+          description: The payment processor. Only `stripe` in v0.
+          enum: [stripe]
+        processor_customer_id:
+          type: [string, 'null']
+          description: >-
+            The processor-side id. Always null in v0: this build makes no Stripe
+            call.
+        email:
+          type: [string, 'null']
+          format: email
+        metadata:
+          type: object
+          description: Caller-supplied data. Never a scalar.
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CustomerCreate:
+      type: object
+      required: [owner, processor]
+      additionalProperties: false
+      properties:
+        owner:
+          $ref: '#/components/schemas/CustomerOwner'
+        processor:
+          type: string
+          enum: [stripe]
+        email:
+          type: [string, 'null']
+          format: email
+        metadata:
+          type: object
+          additionalProperties: true
+
+    CustomerUpdate:
+      type: object
+      additionalProperties: false
+      description: >-
+        Every field is optional, and an absent field is left alone. `owner` and
+        `processor` are not updatable: they are the key the uniqueness rule is
+        built on, and moving a customer is a delete and a create.
+      properties:
+        email:
+          type: [string, 'null']
+          format: email
+        processor_customer_id:
+          type: [string, 'null']
+        metadata:
+          type: object
+          additionalProperties: true
+
+    CustomerPage:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          description: Always an array, empty rather than absent.
+          items:
+            $ref: '#/components/schemas/Customer'
+        page:
+          $ref: '#/components/schemas/Page'
+
+    Plan:
+      type: object
+      required:
+        [id, name, slug, processor_product_id, processor_price_id, price, interval, trial_days, active, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        slug:
+          type: string
+          pattern: '^[a-z0-9]+(-[a-z0-9]+)*$'
+        processor_product_id:
+          type: [string, 'null']
+        processor_price_id:
+          type: [string, 'null']
+        price:
+          $ref: '#/components/schemas/Money'
+        interval:
+          type: string
+          enum: [month, year, one_time]
+        trial_days:
+          type: integer
+          minimum: 0
+        active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    PlanCreate:
+      type: object
+      required: [name, slug, price, interval]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+        slug:
+          type: string
+          pattern: '^[a-z0-9]+(-[a-z0-9]+)*$'
+        price:
+          $ref: '#/components/schemas/Money'
+        interval:
+          type: string
+          enum: [month, year, one_time]
+        trial_days:
+          type: integer
+          minimum: 0
+          default: 0
+        active:
+          type: boolean
+          default: true
+        processor_product_id:
+          type: [string, 'null']
+        processor_price_id:
+          type: [string, 'null']
+
+    PlanUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+        slug:
+          type: string
+          pattern: '^[a-z0-9]+(-[a-z0-9]+)*$'
+        price:
+          $ref: '#/components/schemas/Money'
+        interval:
+          type: string
+          enum: [month, year, one_time]
+        trial_days:
+          type: integer
+          minimum: 0
+        active:
+          type: boolean
+        processor_product_id:
+          type: [string, 'null']
+        processor_price_id:
+          type: [string, 'null']
+
+    PlanPage:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Plan'
+        page:
+          $ref: '#/components/schemas/Page'
+
+    Page:
+      type: object
+      required: [next_cursor, has_more]
+      properties:
+        next_cursor:
+          type: [string, 'null']
+          description: Null on the last page.
+        has_more:
+          type: boolean
+
+    # core's error envelope. `errors` appears only on a 422.
+    Problem:
+      type: object
+      required: [type, title, status, detail, instance, code, trace_id]
+      properties:
+        type:
+          type: string
+          description: 'Stable URI: `https://errors.cafaye.com/<code>`.'
+          format: uri
+        title:
+          type: string
+          description: A fixed summary for the code. May be reworded without a version bump.
+        status:
+          type: integer
+        detail:
+          type: string
+          description: Specific to this occurrence. Not parsed by clients.
+        instance:
+          type: string
+          description: The path the caller asked for.
+        code:
+          type: string
+          description: The last segment of `type`, in snake_case.
+        trace_id:
+          type: string
+          description: Matches the `X-Trace-Id` response header. Support starts here.
+        errors:
+          type: array
+          description: Present only on a 422.
+          items:
+            type: object
+            required: [field, code]
+            additionalProperties: false
+            properties:
+              field:
+                type: string
+              code:
+                type: string
+
+  responses:
+    BadRequest:
+      description: The body could not be read as JSON.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    CursorInvalid:
+      description: >-
+        The cursor could not be read, or is older than 24 hours. A 400 rather
+        than a 422 because a cursor is opaque and a client could not have known.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: No record matches that identifier.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: >-
+        The request collides with something that already exists: a duplicate
+        customer, a duplicate slug, or an `Idempotency-Key` reused for a
+        different body. Carries no `errors` array.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ValidationFailed:
+      description: One or more fields are wrong. `detail` names them.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
