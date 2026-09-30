@@ -116,7 +116,7 @@ are later packets with their own briefs.
 billing/
 ├── mise.toml               # toolchain pins + the tasks (mise run prime)
 ├── bin/prime               # the gate: bundle, db:prepare, rubocop, rails test
-├── docker-compose.yml      # local postgres:17, the only service in the stack
+├── docker-compose.yml      # local postgres:17-alpine, the only service in the stack
 ├── Dockerfile              # ruby slim, multi-stage, non-root, via Kamal/Thruster
 ├── cafaye.yml              # the manifest; DECISION NEEDED notes are load-bearing
 ├── openapi/v1.yaml         # the HTTP contract, and what `exposes.api` points at

@@ -251,10 +251,14 @@ jobs:
 
     services:
       postgres:
-        # Pinned to the major in `docker-compose.yml` (postgres:17). An unpinned
-        # `postgres` means the suite's result depends on which tag was cached when
-        # the job started.
-        image: postgres:17
+        # Pinned to the exact tag in `docker-compose.yml` (postgres:17-alpine).
+        # An unpinned `postgres` means the suite's result depends on which tag was
+        # cached when the job started, and a compose file and a CI service on
+        # *different* pins means the suite proves something about a build nothing
+        # runs. These two move together; see the note in `docker-compose.yml` for
+        # what the alpine (musl) build changes, which includes the collation
+        # defaults.
+        image: postgres:17-alpine
         env:
           # TEST-ONLY. A throwaway credential for a container that exists for the
           # length of this job, and not a production default — nothing in this
@@ -1076,3 +1080,55 @@ jobs:
             exit 1
           fi
           echo "::notice::no credential and no secret reference in $workflow"
+
+      - name: one postgres image, in compose and in this workflow
+        # The reason this packet existed, as a build failure.
+        #
+        # `docker-compose.yml` and the `gate` job's `services:` block each named a
+        # postgres image, and nothing asserted they were the same one. A developer
+        # ran the suite against `postgres:17` on a laptop and CI ran it against
+        # whatever tag that job resolved — so a green tick could be a green tick
+        # about a build nobody else was running, and the two databases could
+        # disagree about collation or authentication defaults without anything
+        # going red. billing-11 moved both to `postgres:17-alpine`; this step is
+        # what keeps the second half of that true.
+        #
+        # Read, not assumed. Each side is read out of the file by pattern, and a
+        # pattern that matches nothing is a failure rather than agreement — the
+        # same rule the Ruby pin above exists for. The tag is required to be a
+        # full `major` or `major-variety` tag: an unpinned `postgres`, a bare
+        # major with no variant, or `latest` all fail, because each of them makes
+        # the suite's result a function of what happened to be on the machine.
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose="docker-compose.yml"
+          workflow=".github/workflows/ci.yml"
+
+          # `image:` under `services:` in compose — the only image this repo runs.
+          compose_pin="$(sed -n 's/^[[:space:]]*image:[[:space:]]*postgres:\([^[:space:]#]*\).*/\1/p' "$compose")"
+          # The `gate` service's image, same shape.
+          ci_pin="$(sed -n 's/^[[:space:]]*image:[[:space:]]*postgres:\([^[:space:]#]*\).*/\1/p' "$workflow")"
+
+          for side in "compose:$compose_pin" "workflow:$ci_pin"; do
+            file="${side%%:*}"; value="${side#*:}"
+            if [ -z "$value" ]; then
+              echo "::error::no postgres image pin readable in $file — this check cannot" >&2
+              echo "  see a pin that is not there, and a missing pin is the drift." >&2
+              exit 1
+            fi
+            if ! printf '%s' "$value" | grep -Eq '^[0-9]+(-[a-z0-9.]+)?$'; then
+              echo "::error::$file pins postgres:$value, which is not a full major tag" >&2
+              echo "  with a variant. \`postgres\`, \`postgres:latest\` and a bare major" >&2
+              echo "  all make the suite's result depend on what was cached." >&2
+              exit 1
+            fi
+          done
+
+          if [ "$compose_pin" != "$ci_pin" ]; then
+            echo "::error::compose pins postgres:$compose_pin; CI pins postgres:$ci_pin." >&2
+            echo "  A developer and a runner testing different database builds is the" >&2
+            echo "  drift this check exists to fail on." >&2
+            exit 1
+          fi
+          echo "::notice::postgres:$compose_pin in $compose and in $workflow"

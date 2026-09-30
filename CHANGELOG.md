@@ -8,6 +8,45 @@ All notable changes to billing are recorded here. The format follows
 
 ### Changed
 
+- **One postgres image across the platform: `postgres:17` → `postgres:17-alpine`.**
+  `docker-compose.yml` and the `gate` job's `services:` block both named
+  `postgres:17`, the debian build. Both now name `postgres:17-alpine`, the tag
+  every running database container on the machine already uses and the smallest
+  current-major variant — **291MB against 477MB**. The other postgres images had
+  been dropped from the local docker cache, so the debian tag had to be re-pulled
+  in full on the next `compose up` to start a database that was already here at
+  291MB.
+
+  What the smaller build changes, measured rather than assumed. Alpine 3.24 on
+  musl 1.2.6; `pg_database` reports `datcollate`/`datctype` of `en_US.utf8` with
+  `datlocprovider = 'c'`, which *reads* like glibc but is not: a sort through the
+  default collation returns byte order —
+  `'Apple,Banana,Zebra,_under,apple,apple2,banana,cherry'` — identical to an
+  explicit `COLLATE "C"` and different from `en-US-x-icu`, where a glibc-built
+  postgres:17 with the same `LANG` sorts case- and accent-insensitively. **No test
+  in this repository depends on it.** Every ordered read is
+  `order(created_at:, id:)` — a `timestamptz` and a `uuid` — in
+  `CursorPaging#paginate` and `OutboxEvent.oldest_first`, and no spec sorts a text
+  column. That is a property of the code, not of the pin, and it is the first
+  thing to re-check if a later packet adds a `name` or `slug` to an ordering.
+
+  Authentication defaults are unchanged: `POSTGRES_HOST_AUTH_METHOD: trust` is
+  explicit and honoured identically on both builds. The data directory is still
+  `/var/lib/postgresql/data`, confirmed by booting it — that default moves in
+  PostgreSQL 18, so it is the major bump and not this pin that makes that line
+  worth re-reading.
+
+  A **`pins` step now fails the build when the two disagree**, which is what
+  "one image" means as an invariant rather than as a one-time edit. It reads each
+  pin out of its file by pattern and requires a full `major` or `major-variant`
+  tag, so `postgres`, `postgres:latest` and a deleted pin all fail rather than
+  reading as agreement. Proven by mutation: reverting compose alone, both a bare
+  `postgres` and a `:latest` pin, and a removed pin each fail by name.
+
+  The two `postgres:17` mentions lower down in this file are billing-01's
+  historical entries and are left as written — a changelog records what a release
+  shipped, and rewriting that is not this packet's business.
+
 - **CI now calls kit's reusable workflow, and holds master's suite size.**
   `.github/workflows/ci.yml` replaces the Rails-generated workflow with
   `uses: cafaye/kit/.github/workflows/ci.reusable.yml@master` and
