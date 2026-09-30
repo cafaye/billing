@@ -153,14 +153,17 @@ class HttpSurfaceContractTest < ActiveSupport::TestCase
   ].freeze
 
   test "every operation the document declares is served, and every operation served is declared" do
-    assert_empty declared_and_unserved,
-      "the document declares operations this service does not serve, so a client generated " \
-      "from it would call a 404: #{names(declared_and_unserved)}"
+    # One assertion over the whole symmetric difference, and not one assertion
+    # per direction: a test that stops at the first failure hides the second
+    # direction behind it, and the second direction is the one that found the
+    # `PUT`. Every disagreement is reported, by direction and by name.
+    breaches = []
+    breaches << "declared by the document but not served, so a client generated from it would " \
+      "call a 404: #{names(declared_and_unserved)}" if declared_and_unserved.any?
+    breaches << "served by the router but neither declared nor named on the exclusion list with " \
+      "a reason: #{names(served_and_unexplained)}" if served_and_unexplained.any?
 
-    assert_empty served_and_unexplained,
-      "the router serves operations that are neither declared nor on the exclusion list " \
-      "with a reason: #{names(served_and_unexplained)}. Add them to openapi/v1.yaml, or name " \
-      "them in NOT_A_CLIENT_OPERATION with why they are not client operations"
+    assert_empty breaches, breaches.join(" — ")
   end
 
   # The other half of what keeps the list above from rotting: an exclusion that
