@@ -200,7 +200,7 @@ class HttpSurfaceContractTest < ActiveSupport::TestCase
   end
 
   # `EVERY_METHOD` above is a claim about what `via: :all` means, and the
-  # exclusion list below is written as though the claim holds. This reads it back
+  # exclusion list above is written as though the claim holds. This reads it back
   # out of the router: for every route drawn with no verb constraint, the methods
   # the exclusions are keyed by are exactly the ones the router answers. Narrow a
   # `via:` and this goes red, rather than the list quietly covering a route that
