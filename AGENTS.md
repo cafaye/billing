@@ -30,7 +30,7 @@ repository. If a rule is not written here, it is not a rule.
 
 ## What exists so far
 
-Two packets, in order.
+Three packets, in order.
 
 - **billing-01** was a scaffold: health probes and the money primitive. It
   exists so the shape was settled before the first price was modelled.
@@ -42,13 +42,26 @@ Two packets, in order.
   verification over the raw body, and `processor_webhooks` as the
   at-most-once record of what arrived. It emits five more events —
   `billing.subscription.started|updated|canceled` and
-  `billing.payment.succeeded|failed` — into **billing-02's** outbox. It still
-  makes no Stripe API call; it only receives.
+  `billing.payment.succeeded|failed` — into **billing-02's** outbox.
+- **billing-04** is the subscription lifecycle: the `subscriptions` table, the
+  state machine that decides which transitions are possible, the `/v1`
+  endpoints that buy a subscription and cancel one and move it between plans,
+  and the three requests this service now makes *to* Stripe.
 
-There are no subscriptions, invoices, payments or usage metering yet. Do not
-read their absence as something to fix in a side patch; those are later packets
-with their own briefs. The webhook is how those packets will learn that
-something happened — it is not the state, only the report of it.
+That last one changes a claim the earlier packets made, so it is stated plainly:
+**this service now talks to Stripe.** It did not, and saying so was true when it
+was written. A subscription is bought through a Checkout Session, cancelled by
+asking Stripe to cancel, and moved between plans by asking Stripe to move it; a
+lifecycle that cannot make those three requests is not a lifecycle. The claim
+that replaces it is narrower and checkable by reading one file: **every request
+this service makes to Stripe is one of the three methods on
+`Processor::StripeClient`, and there is no other `Stripe::` call in the
+repository.** No new dependency — the `stripe` gem was already here, for
+`Stripe::Webhook.construct_event`.
+
+There are no invoices, no usage metering, no prepaid credit and no publisher
+loop yet. Do not read their absence as something to fix in a side patch; those
+are later packets with their own briefs.
 
 ## Layout
 
@@ -65,7 +78,7 @@ billing/
 │   │   ├── health_controller.rb       # /healthz, /readyz
 │   │   ├── errors_controller.rb       # what Rails raises into
 │   │   ├── concerns/                  # trace id, problem+json, paging, idempotency
-│   │   ├── v1/                        # customers, plans
+│   │   ├── v1/                        # customers, plans, subscriptions
 │   │   └── webhooks/                  # signed inbound, from a processor not a client
 │   ├── lib/
 │   │   ├── problem.rb                 # the one error shape
@@ -75,16 +88,24 @@ billing/
 │   │   ├── money.rb                   # the money primitive
 │   │   ├── customer.rb                # owner_type + owner_id, one per processor
 │   │   ├── plan.rb                    # price is a Money or it is not a price
+│   │   ├── subscription.rb            # a status this service did not decide
 │   │   ├── processor_webhook.rb       # what a processor sent, stored once
 │   │   └── outbox_event.rb            # the event, and the envelope it becomes
 │   └── services/
+│       ├── processor/
+│       │   └── stripe_client.rb       # the three requests this service makes
+│       ├── subscriptions/             # the lifecycle, as three pure objects
+│       │   ├── state_machine.rb       # which transitions are possible
+│       │   ├── plan_change.rb         # when a move takes effect
+│       │   └── lifecycle.rb           # the only writer of a subscription
 │       └── webhooks/                  # verify, store, normalize, emit — in that order
 ├── test/
 │   ├── contract/                      # the checks that read core
+│   ├── coverage/                      # the money-path coverage gate, and its inventory
 │   ├── integration/                   # health, and the webhook's HTTP edge
 │   ├── models/                        # minitest, table-driven
 │   ├── requests/v1/                   # the API specs
-│   └── services/webhooks/             # ingestion and the Stripe mapping
+│   └── services/                      # the lifecycle, the client, the webhook mapping
 └── .github/workflows/ci.yml           # brakeman, bundler-audit, rubocop, rails test
 ```
 
@@ -129,10 +150,43 @@ it. The rules that are not negotiable:
   A 422 about an amount names `price` — the field the client sent — and never
   the columns underneath it.
 
+- **No amount is ever computed to send to a processor.** A plan change sends a
+  `proration_behavior`; a cancellation sends an id and a boolean. The credit for
+  an unused period is the processor's, and a figure calculated in Ruby and sent to
+  Stripe would be a figure this service did not keep — the two would eventually
+  disagree, in a customer's invoice. `Processor::StripeClient` has no accessor
+  for a credit, a refund or a prorated amount, and the specs assert the *absent*
+  keys as well as the present ones.
+
+### The gate on the money paths
+
 Money paths are held to **100% line and branch coverage** (PLAN §3), measured
-with Ruby's standard library `Coverage` (`Coverage.start(branches: true)`) so the
-gate costs no gem. The table-driven cases in `test/models/money_test.rb` are the
-gate: every row must be reachable and asserted.
+with Ruby's standard library `Coverage` so the gate costs no gem. Two files are
+in the list: `app/models/money.rb` and `app/services/subscriptions/plan_change.rb`
+— the primitive, and the only place in the repository that *compares* two
+amounts.
+
+Four things about how that gate runs are not incidental, and each was a bug first:
+
+- **`Coverage.start` runs before the application boots, and the app is
+  eager-loaded inside the measurement window.** Measuring from inside the minitest
+  process reports a file as covered when the corpus merely autoloaded it, because
+  `Coverage` records only what executes after it starts. A gate that passes for
+  the wrong reason is worse than no gate.
+- **The measurement runs in a subprocess**, with a report path unique per run.
+  The suite runs in parallel, and two workers sharing one path would read each
+  other's coverage — one of them asserting numbers that belonged to a different
+  corpus.
+- **The gate's honesty is asserted.** `test/coverage/money_paths_coverage_test.rb`
+  measures a corpus that reaches almost nothing and requires it to be *reported*
+  uncovered, and requires a full corpus and a minimal one to differ.
+- **The list itself is checked against the repository.**
+  `test/coverage/money_path_inventory_test.rb` partitions every file under `app/`
+  that touches money into "is a money path" and "has money in it", so a new money
+  path cannot be added ungated. The second group carries a *reason* that is
+  asserted to still hold, and its money entry points are asserted behaviourally —
+  so "not in the gate's list" never quietly comes to mean "not covered". A file
+  that contradicts its reason belongs in the first group or in neither.
 
 ## Events
 
@@ -154,14 +208,63 @@ The rules are core's, in `core: docs/event-outbox.md` and
   producer in this service. A webhook publishes through `OutboxEvent.publish!`
   like a model callback does; a second table, a second envelope builder or a
   second `to_envelope` is a second answer to a question a consumer asks once.
+- **A subscription event's type is derived from what the delivery did to the
+  row**, not from which processor event carried it. This is the one place the
+  "same type, same vocabulary" rule needs explaining rather than restating, and
+  it is what makes out-of-order delivery safe.
 - The publisher loop that moves rows to NATS **does not exist yet**. Until it
   does, `published_at` is always null, `attempts` always zero, and nothing
-  consumes these events. Do not write a row and call it delivered.
+  consumes these events — including courier, which is how
+  `billing.subscription.started` and `.canceled` become transactional mail. Do not
+  write a row and call it delivered.
+
+## Subscriptions
+
+The lifecycle is three objects, and which one you are editing tells you which
+rules you are about to break.
+
+- **`Subscriptions::StateMachine`** is pure: a from-status and a to-status in, an
+  answer out, no database and no clock. **The whole legal/illegal grid is one
+  table**, so the set of *impossible* transitions is readable rather than inferred
+  from conditionals. There is one rule and everything else is ordinary code:
+  **`canceled` is terminal, and nothing leaves it.** A status the processor uses
+  and this service does not model is refused by the constructor — a row that said
+  `active` for a subscription the processor calls `incomplete` would grant
+  entitlements nobody paid for.
+- **`Subscriptions::PlanChange`** compares two prices and decides when a move
+  takes effect. An upgrade is invoiced immediately; a downgrade or a lateral move
+  lands at the renewal. Cross-currency and cross-interval comparisons are refused
+  rather than guessed. It has no amount in it at all.
+- **`Subscriptions::Lifecycle`** is the **only** writer of a subscription's state
+  and the only thing that emits its events. There is no `after_update` on
+  `Subscription` and no branch of the API that changes a status. Do not add one:
+  the processor is the party that can bill, and a local row that disagreed with it
+  would grant entitlements nobody is paying for.
+
+Two rules that are not obvious and that the specs exist to hold:
+
+- **A deletion arriving before its creation creates a `canceled` row.** It is the
+  only statement about that subscription that has arrived, and dropping it would
+  leave an *active* row — and an active row grants entitlements — for something
+  the processor says is gone. The `created` that follows is then refused by the
+  terminal rule. billing-03b published both events and left the active row; that
+  was the bug this rule fixes.
+- **A delivery that changes nothing is refused, not published.**
+  `no_change_to_record` — otherwise a processor that repeats itself under a fresh
+  event id produces updates that carry no update, and a consumer counting plan
+  changes stops meaning anything.
+
+Every refusal raises `Subscriptions::Refused`, which the webhook layer records as
+`ignored:<reason>` and answers 200. The reasons are part of the contract:
+`unknown_customer`, `unknown_plan`, `no_subscription_to_update`,
+`canceled_is_terminal`, `no_change_to_record`.
 
 ## Webhooks in
 
 A processor's event arrives signed, is stored verbatim, is acted on at most
-once, and leaves as one of this service's own events. The rules:
+once, and leaves as one of this service's own events. It may also *write*: a
+subscription event applies to the subscriptions table, inside the same
+transaction that marks the delivery finished. The rules:
 
 - **The signature is over the raw bytes.** `request.raw_post`, never `params`
   and never a re-serialized parse — the digest is computed over
@@ -265,6 +368,28 @@ once, and leaves as one of this service's own events. The rules:
   `self.inheritance_column = nil`. That line is load-bearing, not tidiness:
   without it every `find` on the table tries to resolve
   `customer.subscription.updated` to a class and raises.
+- **A partial unique index is a statement about a set of statuses, and it is
+  tested behaviourally.** `subscriptions` is unique on `(account_id, plan_id)`
+  *where the subscription is live*, because `canceled` is the only terminal status
+  and a customer who cancels and returns has to be able to subscribe to the same
+  plan again. Comparing the index's predicate to a string in the model would prove
+  two texts agree, which is not the same fact; the specs insert two rows per
+  status pair and ask whether the database objects.
+- **A `uuid` column casts before a validation sees it.** `"not-a-uuid"` assigned to
+  a `uuid` attribute becomes `nil`, so a shape validation on such a column is
+  unreachable code that reads as if it were doing something. `Subscription#account_id`
+  deliberately has none, and the presence validation is what reports the problem.
+  (`Customer#owner_id` has one and it is equally unreachable — noted, not changed:
+  it is not this packet's model to refactor.)
+- **Every problem in a request body is reported at once.** A client that sent
+  three wrong fields gets three failures, not the first one three times. That is
+  why `V1::SubscriptionsController#refuse` *records* and the action renders once,
+  and it is the same rule `render_validation_failure` already follows for a
+  model's own errors.
+- **A processor's message never returns to a caller.** It is logged with the
+  identifier that was refused, and the body says only what this service knows: a
+  503 for a processor it cannot reach, a 422 naming the plan. The processor's
+  internal text is the processor's to decide who sees it.
 - Time is UTC, and stored `timestamptz` where the column is an instant. IDs are
   opaque strings. `db/schema.rb` is committed.
 - A webhook's event carries the **processor's** timestamp in `time`, not the
@@ -285,9 +410,13 @@ once, and leaves as one of this service's own events. The rules:
   specs in `test/contract/`. Never hand-write a response shape the OpenAPI
   document does not describe.
 - **`/v1` is unauthenticated in v0.** No endpoint reads a token because core's
-  JWKS verification is not in this repository yet, so `GET /v1/customers`
-  returns every customer. This is a recorded gap, not a design: do not expose
-  the surface to anything but the gateway, and do not build on it.
+  JWKS verification is not in this repository yet, so `GET /v1/customers` and
+  `GET /v1/subscriptions` return every row, and `POST /v1/subscriptions` takes a
+  `customer_id` in the body. This is a recorded gap, not a design: do not expose
+  the surface to anything but the gateway, and do not build on it. Which is also
+  why a `User`-owned customer is refused by that endpoint — which account a user
+  belongs to is identity's fact, and no event carrying it is in this build's
+  `consumes`.
 - **`/v1/webhooks/stripe` is the one authenticated path, by signature.** It
   authenticates the *processor*, not a cafaye client, and it is declared in
   `openapi/v1.yaml` under the `webhooks` tag with its own `200`/`400`/`503`
@@ -299,12 +428,29 @@ once, and leaves as one of this service's own events. The rules:
   and in `cafaye.yml`. A type that is not would be refused at the write, from
   inside a processor request, and answered 200 — an outage visible only in the
   processor's dashboard. `test/contract/` and the webhook specs both assert it.
-- **`billing.subscription.started` does not satisfy core's payload schema** for
-  this build, and the exact difference is in `PENDING_PAYLOAD_ALIGNMENT` in the
-  contract spec. Core's schema wants `pln_…` and `acc_…` ids this service does
-  not have. The event is published anyway — the catalog row exists and the
-  envelope is core-shaped — and the gap is a decision recorded in `cafaye.yml`
-  for the manager, not a silent skip.
+- **`billing.subscription.started` satisfies core's payload schema except for the
+  id format.** The fields and their types do: a started event is built to core's
+  eight fields and nothing else, because that schema is closed with
+  `additionalProperties: false`. What does not match is that core asks for
+  `sub_…` / `pln_…` / `acc_…` prefixed ULIDs and this service's ids are uuids,
+  which `Plan#id` and `Customer#owner_id` have been since billing-02. Changing
+  them is a breaking change to a contract several services already read, so it is
+  a platform decision. It is tracked as `PENDING_ID_PATTERNS` in the contract
+  spec and asserted in **both** directions: core's pattern must still be the one
+  recorded, and our value must still miss it, so the entry is removed rather than
+  forgotten when it stops being true.
+- **`billing.subscription.updated`, not `.changed`.** The action vocabulary in
+  core's `docs/event-naming.md` is a closed list for v0 and `changed` is not on
+  it; `billing.subscription.updated` is, and it is already in core's catalog. The
+  vocabulary core has fixed is the vocabulary used here. If the manager disagrees
+  it is one constant, `Subscriptions::Lifecycle::UPDATED_EVENT`, and a catalog
+  row agreed first.
+- **Every path in `openapi/v1.yaml` is served, and every served path is
+  described.** `test/contract/` compares the two, so a path added to one and not
+  the other fails rather than describing an API nobody can call. The same test
+  holds `info.version`, because a non-breaking addition that forgets to bump the
+  document's own version leaves a reader with no way to tell "nothing moved" from
+  "the whole document was regenerated".
 - Breaking a contract is a major version plus a migration note in `README.md`
   and `CHANGELOG.md`, reviewed by a human — not a patch.
 
@@ -312,7 +458,12 @@ once, and leaves as one of this service's own events. The rules:
 
 - [ ] `bin/prime` is green from a clean worktree
 - [ ] New behavior has a test that fails without it
-- [ ] Money changes keep 100% line and branch coverage on `money.rb`
+- [ ] Money changes keep 100% line and branch coverage on every file in
+      `MoneyPathsCoverageTest::MONEY_PATHS`, and a file that touches money is in
+      that list or in `MIXED_MONEY_FILES` with a reason that still holds
+- [ ] A new subscription status is added to the state machine's table, the model's
+      set, the migration's `CHECK` and the spec that asserts the grid — the test
+      that covers every status fails if any of the four is missing
 - [ ] Anything published is in `cafaye.yml`, in `OutboxEvent::TYPES`, and in
       core's catalog — or the gap is written down in both places
 - [ ] Lint and security scans are green, and nothing was disabled to get there

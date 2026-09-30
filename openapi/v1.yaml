@@ -22,15 +22,29 @@
 #    body, so it takes no `Idempotency-Key` (the processor's own event id is the
 #    dedupe key, and it is enforced by a unique index rather than by a header),
 #    and it must never grow a token check.
+# 4. **The subscription endpoints do not decide a subscription's state.** Every
+#    mutating one asks the payment processor to do something and returns; the
+#    subscription's own status changes only when `customer.subscription.*` arrives
+#    on the webhook path. So `POST /v1/subscriptions` returns a Checkout session
+#    and not a subscription, and carries no `Location`, and `POST
+#    /v1/subscriptions/{id}/cancel` returns a subscription that is still
+#    `active`. Each operation says so, and the one place that is not true —
+#    `change_plan`, which also returns the timing decision it made — explains why
+#    in the operation's own description.
 openapi: 3.1.0
 info:
   title: billing
-  version: 1.0.0
+  # A non-breaking addition: five new paths under the same /v1 prefix, plus a new
+  # response field on the subscription resource (`price`) and a new one on the
+  # plan resource (`entitlements`). core's sync rule: a non-breaking change bumps
+  # only `info.version`.
+  version: 1.1.0
   description: >-
     Plans, customers, subscriptions, prepaid credit, usage metering and inbound
     payment-processor webhooks for cafaye. This document describes the v0
-    surface: customers, plans, and one Stripe webhook endpoint. The two health
-    probes (/healthz, /readyz) are infrastructure and are deliberately not here.
+    surface: customers, plans, the subscription lifecycle, and one Stripe webhook
+    endpoint. The two health probes (/healthz, /readyz) are infrastructure and are
+    deliberately not here.
   contact:
     name: billing
     email: billing@cafaye.com
@@ -835,7 +849,7 @@ components:
     Plan:
       type: object
       required:
-        [id, name, slug, processor_product_id, processor_price_id, price, interval, trial_days, active, created_at, updated_at]
+        [id, name, slug, processor_product_id, processor_price_id, price, interval, trial_days, entitlements, active, created_at, updated_at]
       properties:
         id:
           type: string
@@ -857,6 +871,8 @@ components:
         trial_days:
           type: integer
           minimum: 0
+        entitlements:
+          $ref: '#/components/schemas/PlanEntitlements'
         active:
           type: boolean
         created_at:
@@ -916,6 +932,29 @@ components:
           type: [string, 'null']
         processor_price_id:
           type: [string, 'null']
+
+    PlanEntitlements:
+      type: object
+      description: >-
+        What buying this plan grants. An object with at most two members, so a
+        reader never has to ask whether a key it does not know is one it should
+        honour. `features` is a list of things switched on; `limits` is how many
+        of each. A limit is a count and never an amount: there is no currency
+        anywhere in this object, deliberately.
+      additionalProperties: false
+      properties:
+        features:
+          type: array
+          description: Always an array, empty rather than absent.
+          items:
+            type: string
+            minLength: 1
+        limits:
+          type: object
+          description: Always an object, empty rather than absent.
+          additionalProperties:
+            type: integer
+            minimum: 0
 
     PlanPage:
       type: object
@@ -1194,6 +1233,17 @@ components:
     # `billing.payment.succeeded`, while a session in subscription mode restates
     # what `customer.subscription.created` says moments later and is ignored, so a
     # signup is not counted twice.
+    #
+    # The three subscription types do not map one-to-one onto the three cafaye ones,
+    # and that is deliberate rather than an omission: the event is chosen from what
+    # the delivery *did to the row*. A `customer.subscription.updated` that reports
+    # `canceled` publishes `billing.subscription.canceled`; a
+    # `customer.subscription.deleted` that arrives before the creation it belongs to
+    # finds no row, creates a canceled one, and publishes
+    # `billing.subscription.canceled` — and then the `created` that follows is
+    # refused, because `canceled` is terminal. An update that changes nothing
+    # publishes nothing, and is recorded on the delivery row as
+    # `ignored:no_change_to_record` rather than as a failure.
     StripeEventMapping:
       type: object
       properties:

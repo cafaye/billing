@@ -5,88 +5,83 @@
 # a worker records the shape it is being built against and marks what it cannot
 # decide. See AGENTS.md.
 #
-# > `exposes` now names the eight events this build publishes, in the
-# > three-segment form core v0.2 made mandatory (D1): three from the models and
-# > five from the Stripe webhook mapping. One cross-repo obligation follows from
-# > it and cannot be discharged from this worktree, because core is read-only
-# > here:
+# > `exposes` names the eight events this build publishes, in the three-segment
+# > form core v0.2 made mandatory (D1). Three come from the models and five from
+# > the Stripe webhook mapping.
 # >
-# > * `billing.plan.created` and `billing.customer.created` already have catalog
-# >   rows in core's docs/event-naming.md.
-# > * `billing.plan.updated` does not, and core's suite cannot catch that for
-# >   this repository: `tests/test_specs.py` asserts the catalog rule over core's
-# >   own `examples/valid/*.cafaye.yml`, and `caf contract lint` — which would
-# >   check a service's real manifest — does not exist yet. So the row is a
-# >   review obligation rather than a currently-failing test. The entity is
-# >   already catalogued and `updated` is already in core's action vocabulary, so
-# >   the row is a one-line addition to core's billing table. Until it lands,
-# >   `test/contract/outbox_envelope_contract_test.rb` carries the obligation in
-# >   code, so a *new* event published without a catalog row still fails here.
+# > The subscription events are *written by the lifecycle, from the state the
+# > delivery produced*, not mapped from the processor's event type. That is not a
+# > detail: an `updated` delivery that turns out to be a cancellation publishes a
+# > cancellation, and a `deleted` delivery that arrived before its `created` — which
+# > Stripe's lack of ordering guarantees is entirely possible — publishes a
+# > cancellation for a row it created, and refuses the creation that follows. The
+# > mapping is therefore derived from `(did the row exist, what was it, what is it
+# > now)`, and the whole grid of legal and illegal transitions is one table in
+# > `Subscriptions::StateMachine`.
 # >
-# > Three more gaps are recorded here rather than fixed:
+# > Two cross-repo obligations follow, and neither can be discharged from this
+# > worktree because core is read-only here:
 # >
-# > 1. `bad_request`, `cursor_invalid` and `cursor_expired` are problem codes this
-# >    service answers with that core's reserved list does not name. 400 is absent
-# >    from the list entirely and `cursor_expired` appears only in the pagination
-# >    prose, so all three need adding before another service copies them.
-# > 2. The two probes (/healthz, /readyz) are deliberately not declared. They are
-# >    infrastructure, not contract surface, and guard left the same gap for the
-# >    same reason.
-# > 3. No payload schema exists in core for the three events the models emit.
-# >    core's outbox checklist asks for `data` to be validated against
-# >    `schemas/events/<service>/<entity>/<action>.schema.json` before the insert,
-# >    and core ships only two payload schemas in total. `test/contract` enforces
-# >    the rule for any event that has one, and skips the three that do not, so
-# >    the moment a schema lands this service is checked against it. The five
-# >    webhook events are a separate and larger gap, recorded in the
-# >    DECISION NEEDED below.
+# > * `billing.plan.updated` does not have a catalog row in core's
+# >   `docs/event-naming.md`, and `billing.subscription.updated` **is** in core's
+# >   catalog but under the name a plan change might suggest it should not have.
+# >   core's catalog row for `billing.subscription.updated` reads "Plan, quantity,
+# >   or interval changes" and the row for `billing.subscription.canceled` reads
+# >   "Cancellation takes effect, not when requested" — which is precisely the rule
+# >   this build implements, so the vocabulary core already fixes is the vocabulary
+# >   used here. `billing.subscription.changed` is **not** in core's action
+# >   vocabulary and **not** in its catalog, so declaring it here would be a
+# >   contract drift the manager has not agreed to and a consumer would have
+# >   nothing to validate against. The one-line change, if the manager disagrees,
+# >   is `Subscriptions::Lifecycle::UPDATED_EVENT`.
+# > * The payload gap recorded in billing-03b is now closed for
+# >   `billing.subscription.started`, and replaced by a smaller one. core's
+# >   `schemas/events/billing/subscription/started.schema.json` names eight fields
+# >   and is closed with `additionalProperties: false`; this build now emits exactly
+# >   those eight, and `test/contract/` asserts the difference in both directions
+# >   rather than subtracting it from the failures. What remains is the **id
+# >   format**: core asks for `sub_`/`pln_`/`acc_` prefixed ULIDs and this service's
+# >   ids are uuids, which `Plan#id` and `Customer#owner_id` have been since
+# >   billing-02. Changing them is a breaking change to a contract several services
+# >   already read, so it is a platform decision and is tracked as
+# >   `PENDING_ID_PATTERNS` in the contract spec. The other two subscription events
+# >   still have no payload schema in core; `NO_PAYLOAD_SCHEMA_YET` accounts for
+# >   them and fails the day one lands.
+# >
+# > Two more decisions, both of which change what this service *is*:
+# >
+# > **DECISION NEEDED (billing-04, on the subject).** billing-03 recorded a
+# > decision: the envelope's subject had to be the processor's own id, because there
+# > was no subscriptions table; it recommended landing one "before the first real
+# > customer" and said flipping it was one line. This is that line, and the flip is
+# > now done — a subscription event's subject is billing's own `Subscription#id`,
+# > > which is also what core's started schema says its `subscription_id` must equal.
+# > A consumer can now join `started`, `updated` and `canceled` on one key with no
+# > > lookup table, which was the whole point. Payment events keep the processor's id
+# > as their subject, because an invoice references a subscription rather than being
+# > > one and the join key is the processor's subscription id in the payload.
+# >
+# > **DECISION NEEDED (billing-04, on the outbound direction).** billing-03b's
+# > claim was that "this service receives, it does not call out to Stripe". That is
+# > > no longer true, and a lifecycle cannot work without it: a subscription is
+# > bought through a Stripe Checkout Session, cancelled by asking Stripe to cancel,
+# > > and moved between plans by asking Stripe to move it. The claim now reads "this
+# > service makes exactly three kinds of request to Stripe and every one of them is
+# > > a `Processor::StripeClient` method", which is checkable — there is no other
+# > `Stripe::` call in the repository — rather than checkable only by reading. No new
+# > dependency: the `stripe` gem was already here for `Stripe::Webhook.construct_event`.
 # >
 # > `consumes` is empty and `dependencies` is empty. The customers created here
 # > reference identity's users and accounts by uuid, which is a data dependency
 # > rather than a call — this build never asks identity anything, and declaring a
 # > dependency on a service that is not called would have `caf` start it for
-# > nothing.
-# >
-# > DECISION NEEDED (billing-03, on `subject`): the envelope's `subject` is the
-# > entity the event is about, and for a subscription or a payment this build has
-# > no id of its own — there is no subscriptions table. So a subscription or
-# > payment event carries Stripe's subscription id when the payload has one and
-# > Stripe's customer id otherwise. Two costs: a consumer cannot join these events
-# > to a cafaye account without the mapping, and when a subscriptions table lands
-# > the subject changes, which is a semantic change to every event already
-# > published. The alternative — emitting cafaye ids that do not exist yet — is
-# > worse. Recommendation: land a subscriptions table before the first real
-# > customer, and treat the change as a versioned event payload rather than a new
-# > type, per core's evolution table. Manager decides; flipping it is one line in
-# > `Webhooks::StripeEvents.subject_for`.
-# >
-# > DECISION NEEDED (billing-03, on `checkout.session.completed`): the packet
-# > asked for a `billing.checkout.completed` event. core's catalog has no such
-# > row, and core's rules say the catalog is the registry and the manifest must
-# > agree with it in both directions — so declaring one here would be a contract
-# > drift the manager has not agreed to, and a consumer would have nothing to
-# > validate against. This build therefore emits `billing.payment.succeeded` for a
-# > one-time Checkout session (the only record of that charge) and deliberately
-# > ignores a subscription-mode session, which restates
-# > `customer.subscription.created` and would otherwise count every Checkout
-# > signup twice. If the manager wants a distinct `checkout.completed`, it needs a
-# > catalog row in core first, and the mapping is then one line in
-# > `Webhooks::StripeEvents.event_type_for`.
-# >
-# > DECISION NEEDED (billing-03, on payload schemas): core ships one payload
-# > schema for billing —
-# > `schemas/events/billing/subscription/started.schema.json` — and this build
-# > does not satisfy it. It requires `plan_id` and `account_id`, which are
-# > `pln_…` and `acc_…` ids this service does not have and cannot invent, and it
-# > is closed with `additionalProperties: false` over eight fields, so the eleven
-# > this service actually sends are unexpected to it. Emitting the event anyway is
-# > the right call: the catalog row exists, the envelope is core-shaped, and a
-# > payload a consumer cannot read is a gap in core rather than a reason to stop
-# > publishing. The exact difference is asserted in
-# > `test/contract/outbox_envelope_contract_test.rb` as
-# > `PENDING_PAYLOAD_ALIGNMENT`, so the day the payload changes this file has to
-# > change with it. Closing it is a core-side decision plus a subscriptions
-# > table.
+# > nothing. `billing.subscription.past_due` is in core's catalog and is *not*
+# > published here: this build reports arrears as a change to the subscription's
+# > status in `billing.subscription.updated`, and whether a failed charge is one
+# > event or two is a question about what a consumer does with them rather than
+# > about the charge, which `billing.payment.failed` already states. A manager who
+# > wants the second type needs a row agreed in core first, and the mapping is then
+# > one line in `Subscriptions::Lifecycle`.
 name: billing
 description: Plans, subscriptions, prepaid credit, usage metering, webhooks in.
 language: ruby
@@ -100,8 +95,8 @@ exposes:
     # core's catalog is the two-segment form and is a *different* type: the
     # catalog row has to be renamed, not reused.
     #
-    # The list is the union of what the models emit and what the Stripe webhook
-    # mapping emits, and it is asserted to be the same list as
+    # The list is the union of what the models emit and what the subscription
+    # lifecycle emits, and it is asserted to be the same list as
     # `OutboxEvent::TYPES` in `test/contract/`. Nothing else is here on purpose:
     # core's catalog lists more for billing (subscription.past_due,
     # payment.refunded, invoice.created, usage.recorded), and naming a type this
@@ -120,6 +115,12 @@ exposes:
 # would react to identity's user and account events are later packets, and
 # declaring an event this build does not handle would tell `caf` to wire a
 # consumer that has nothing to do.
+#
+# `billing.subscription.started` and `billing.subscription.canceled` are how
+# courier hears about a signup and a cancellation, which is the whole of this
+# packet's transactional mail: billing publishes and courier delivers, and
+# nothing is sent from a request. There is no entry here for that — `consumes`
+# is what *this* service listens to, and it listens to nothing.
 consumes: []
 
 # No service-level dependencies yet. Stripe is a vendor, not a cafaye service,

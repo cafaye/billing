@@ -95,6 +95,39 @@ class SubscriptionTest < ActiveSupport::TestCase
     end
   end
 
+  # The migration inlines the statuses rather than reading them from the model, so
+  # that it still means what it meant the day it ran. The cost of inlining is that a
+  # status added to the model and not to the constraint is invisible, so it is
+  # checked here: the constraint is read out of the database and compared with the
+  # model's set.
+  test "the database accepts every status the model stores" do
+    definition = check_constraint_definition("subscriptions_status_known")
+
+    Subscription::STATUSES.each do |status|
+      assert_includes definition, "'#{status}'",
+        "#{status} is a status this service stores but the CHECK constraint does not name"
+    end
+  end
+
+  test "the database's constraint names no status the model does not" do
+    definition = check_constraint_definition("subscriptions_status_known")
+
+    assert_empty definition.scan(/'([a-z_]+)'/).flatten - Subscription::STATUSES,
+      "the CHECK constraint names a status the model does not, so the model would refuse a row the database allows"
+  end
+
+  # The live-uniqueness index, read out of the database, against the model's own
+  # statement about what "live" is. `catalog.pg_constraint` rather than the
+  # migration's source, because the migration is a comment about the past and this
+  # is the database.
+  test "the live index excludes exactly the terminal statuses" do
+    predicate = index_predicate("subscriptions_live_account_plan_idx")
+
+    Subscription::TERMINAL_STATUSES.each do |status|
+      assert_includes predicate, "'#{status}'"
+    end
+  end
+
   test "the account must be the customer's own account" do
     subscription = build_subscription(account_id: create_account)
 
@@ -264,6 +297,22 @@ class SubscriptionTest < ActiveSupport::TestCase
   end
 
   private
+    def connection
+      ActiveRecord::Base.lease_connection
+    end
+
+    def check_constraint_definition(name)
+      connection.select_value(<<~SQL).to_s
+        select pg_get_constraintdef(oid) from pg_constraint where conname = '#{name}'
+      SQL
+    end
+
+    def index_predicate(name)
+      connection.select_value(<<~SQL).to_s
+        select pg_get_expr(indpred, indrelid) from pg_index where indexrelid = '#{name}'::regclass
+      SQL
+    end
+
     def collides?(status)
       build_subscription(status: status, processor_subscription_id: "sub_collision").save
       false
