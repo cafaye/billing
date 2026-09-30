@@ -34,42 +34,81 @@
 # >   contract drift the manager has not agreed to and a consumer would have
 # >   nothing to validate against. The one-line change, if the manager disagrees,
 # >   is `Subscriptions::Lifecycle::UPDATED_EVENT`.
-# > * The payload gap recorded in billing-03b is now closed for
-# >   `billing.subscription.started`, and replaced by a smaller one. core's
-# >   `schemas/events/billing/subscription/started.schema.json` names eight fields
-# >   and is closed with `additionalProperties: false`; this build now emits exactly
-# >   those eight, and `test/contract/` asserts the difference in both directions
-# >   rather than subtracting it from the failures. What remains is the **id
-# >   format**: core asks for `sub_`/`pln_`/`acc_` prefixed ULIDs and this service's
-# >   ids are uuids, which `Plan#id` and `Customer#owner_id` have been since
-# >   billing-02. Changing them is a breaking change to a contract several services
-# >   already read, so it is a platform decision and is tracked as
-# >   `PENDING_ID_PATTERNS` in the contract spec. The other two subscription events
-# >   still have no payload schema in core; `NO_PAYLOAD_SCHEMA_YET` accounts for
-# >   them and fails the day one lands.
+# > * core-03 (**D10**) rewrote
+# >   `schemas/events/billing/subscription/started.schema.json`, and with it the
+# >   id-format debt this file used to carry. That schema no longer declares a
+# >   `pattern` for `subscription_id` and no longer names `plan_id` or
+# >   `account_id` at all, so `PENDING_ID_PATTERNS` in the contract spec is empty:
+# >   a field core does not constrain cannot have an unclosed gap against it. The
+# >   same packet shipped a payload schema for all eight of this service's types,
+# >   so `NO_PAYLOAD_SCHEMA_YET` is empty too, and billing owes core no payload
+# >   schema at all.
+# > * **The same rewrite opened a larger gap, and it is a spec question rather
+# >   than a bug in a payload.** core's D10 gives the reason it was rewritten as
+# >   "billing has no subscriptions table and cannot invent ids it does not
+# >   have". That was true of billing-03b, which is what core-03 read. billing-04
+# >   added the table and moved the three subscription events onto billing's own
+# >   ids: `subscription_id` is `Subscription#id`, with `plan_id`, `account_id`,
+# >   `currency`, `started_at` and `processor_subscription_id` beside it and no
+# >   `kind`. core's `started`, `updated` and `canceled` schemas instead describe
+# >   the processor-normalised payload billing-03b emitted, and are closed with
+# >   `additionalProperties: false`, so a payload that satisfies them drops the
+# >   ids a consumer needs. core's own D10 anticipates exactly this — "when
+# >   billing grows a subscriptions table, the shape moves again … that is a
+# >   second breaking change" — and that change is core's to make, because core
+# >   is read-only from a service worktree. The difference is therefore recorded
+# >   in `PENDING_PAYLOAD_ALIGNMENT` and asserted in both directions rather than
+# >   paid for by editing a published payload: emitting one nobody has agreed to,
+# >   and dropping fields a consumer needs, are both the spec changing without a
+# >   decision. See the DECISION NEEDED below.
+# > * `billing.plan.created` and `billing.plan.updated` are closed with
+# >   `additionalProperties: false` and do not name `entitlements`, which
+# >   billing-04 added to `Plan#as_json`. core's plan schema is missing a field
+# >   this publisher sends; recorded, not worked around, because removing it from
+# >   the payload is a contract change this worktree does not get to make, and the
+# >   plan payload is the shape an HTTP response uses, so it cannot be quietly
+# >   narrowed here either.
 # >
-# > Two more decisions, both of which change what this service *is*:
+# > Four decisions are recorded here. Two change what this service *is*, and two
+# > are questions core owns that this worktree cannot answer.
+# >
+# > **DECISION NEEDED (billing-05, on the subscription payload).** core's D10
+# > described billing-03b. billing-04 answered the question D10 asked — the
+# > subscriptions table landed — and the answer moves the payload. core now owes a
+# > second breaking change: either the processor's ids sit alongside billing's, or
+# > they are replaced, and which of those is a consumer's problem rather than
+# > billing's to settle from a read-only reference. Until it is made, the three
+# > subscription events are **published in a shape core's schema rejects**, and
+# > `test/contract/` says so out loud rather than absorbing it. The action item is
+# > one decision in `core/DECISIONS.md` and one file rewrite; what it needs from
+# > billing is a payload change or nothing at all.
 # >
 # > **DECISION NEEDED (billing-04, on the subject).** billing-03 recorded a
-# > decision: the envelope's subject had to be the processor's own id, because there
-# > was no subscriptions table; it recommended landing one "before the first real
-# > customer" and said flipping it was one line. This is that line, and the flip is
-# > now done — a subscription event's subject is billing's own `Subscription#id`,
-# > > which is also what core's started schema says its `subscription_id` must equal.
-# > A consumer can now join `started`, `updated` and `canceled` on one key with no
-# > > lookup table, which was the whole point. Payment events keep the processor's id
-# > as their subject, because an invoice references a subscription rather than being
-# > > one and the join key is the processor's subscription id in the payload.
+# > decision: the envelope's subject had to be the processor's own id, because
+# > there was no subscriptions table; it recommended landing one "before the first
+# > real customer" and said flipping it was one line. This is that line, and the
+# > flip is now done — a subscription event's subject is billing's own
+# > `Subscription#id`. A consumer can now join `started`, `updated` and `canceled`
+# > on one key with no lookup table, which was the whole point. Payment events keep
+# > the processor's id as their subject, because an invoice references a
+# > subscription rather than being one and the join key is the processor's
+# > subscription id in the payload.
+# >
+# > (core's D10 still reads a subscription payload's `subscription_id` as the
+# > processor's id and equal to the subject. Under billing-04 both are billing's
+# > own id instead — the same invariant on a different value. See the decision
+# > above.)
 # >
 # > **DECISION NEEDED (billing-04, on the outbound direction).** billing-03b's
 # > claim was that "this service receives, it does not call out to Stripe". That is
-# > > no longer true, and a lifecycle cannot work without it: a subscription is
+# > no longer true, and a lifecycle cannot work without it: a subscription is
 # > bought through a Stripe Checkout Session, cancelled by asking Stripe to cancel,
-# > > and moved between plans by asking Stripe to move it. The claim now reads "this
+# > and moved between plans by asking Stripe to move it. The claim now reads "this
 # > service makes exactly three kinds of request to Stripe and every one of them is
-# > > a `Processor::StripeClient` method", which is checkable — there is no other
-# > `Stripe::` call in the repository — rather than checkable only by reading. No new
-# > dependency: the `stripe` gem was already here for `Stripe::Webhook.construct_event`.
+# > a `Processor::StripeClient` method", which is checkable — there is no other
+# > `Stripe::` call in the repository — rather than checkable only by reading. No
+# > new dependency: the `stripe` gem was already here for
+# > `Stripe::Webhook.construct_event`.
 # >
 # > `consumes` is empty and `dependencies` is empty. The customers created here
 # > reference identity's users and accounts by uuid, which is a data dependency
@@ -85,6 +124,14 @@
 name: billing
 description: Plans, subscriptions, prepaid credit, usage metering, webhooks in.
 language: ruby
+# The last released core spec is 0.2.0 and this pins to it honestly. core-03's D10
+# is marked **Breaking** and is still in core's `[Unreleased]`, so there is no
+# 0.3.0 to pin to yet and writing one here would be inventing a release. The day
+# core tags it this becomes `^0.3.0` — and so does every other service in the
+# fleet, at the same time, because `^0.2.0` means `>=0.2.0 <0.3.0`: a service
+# whose CI resolves core would be resolving a *different* core from the one this
+# contract test reads off disk. Raised rather than moved, because the pin is the
+# manager's to cut.
 core: ^0.2.0
 
 exposes:
