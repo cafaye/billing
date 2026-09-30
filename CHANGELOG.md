@@ -8,6 +8,41 @@ All notable changes to billing are recorded here. The format follows
 
 ### Changed
 
+- **CI now calls kit's reusable workflow, and holds master's suite size.**
+  `.github/workflows/ci.yml` replaces the Rails-generated workflow with
+  `uses: cafaye/kit/.github/workflows/ci.reusable.yml@master` and
+  `language: ruby` — the fleet's first Ruby adopter of it — plus the half kit
+  cannot own: a `gate` job that runs `bin/prime` against a real PostgreSQL, a
+  `security` job for `brakeman` and `bundler-audit`, and a `pins` job that
+  checks the Ruby number agrees across `.ruby-version`, `mise.toml` and the
+  `Dockerfile`, that the `uses:` path is the one that resolves, and that no
+  secret is anywhere in the workflow.
+
+  The `gate` job is the load-bearing part, and it exists for one specific
+  reason. `test/contract/outbox_envelope_contract_test.rb` **skips every test in
+  the file** when core's schema is not readable. Measured on this commit:
+
+  | `CORE_PATH` | result |
+  |---|---|
+  | `../core` (a developer with the repositories side by side) | 22 runs, 345 assertions, 0 skips |
+  | a path that does not exist (every CI checkout) | 22 runs, 0 assertions, **22 skips** |
+
+  and the whole-suite summary line reads the same in both cases. So CI checks
+  `cafaye/core` out of the repository itself — public, `schemas` and `docs`
+  only, at `master` rather than a pinned SHA, because a pinned ref would blind
+  the one guard that exists to catch a change in core — and **fails the build on
+  a single skipped test**. A suite that reports `0 assertions; 22 skipped` has
+  verified nothing, and a green badge is a claim.
+
+  The gate also pins the suite by **equality** against master's
+  `759 runs / 2087 assertions / 0 failures / 0 errors / 0 skips`, and asserts
+  three tiers by name and count — the contract tier (22), the webhook tier (138)
+  and the money-path coverage gate (5). These are decrease detectors, not
+  targets: adding a test turns CI red until the number is raised in the same
+  commit, which is the intended direction.
+
+  **No behaviour in `app/` changed.**
+
 - **The outbox contract test now describes the world core shipped in core-03.**
   core added a payload schema for all eight of this service's published types and
   raised **D10**, a breaking spec change that removed the `sub_…` / `pln_…` /
@@ -566,11 +601,15 @@ later billing packet builds on, with no billing logic in it.
 - CI runs Brakeman, `bundler-audit`, RuboCop and the suite. Nothing was
   disabled to make it green. Its PostgreSQL service is pinned to `postgres:17` to
   match `docker-compose.yml`.
-- CI is the standalone Rails-generated workflow, not a call to
-  `cafaye/kit/workflows/ci.reusable.yml@master`. That workflow is the house
-  direction, but it resolves the `kit` repository on GitHub, and `kit` is not
-  pushed yet — calling it today would leave every push red. Migrating to it is
-  a one-file change once `kit` has a release, and is deliberately not done here.
+- CI calls `cafaye/kit/.github/workflows/ci.reusable.yml@master`, which is kit's
+  path and not the one an earlier note here named. kit-04 moved the file: GitHub
+  documents that subdirectories of `.github/workflows` are not supported, so
+  `cafaye/kit/workflows/ci.reusable.yml@master` resolved to nothing and no
+  repository in the fleet was calling it. The `ruby` job is expected to be red
+  on two steps for reasons that live in kit's file — `bundle exec rake` with no
+  database, and `bundle exec rake coverage` against a task this service does not
+  have — and the workflow's header names both with the errors reproduced.
+  Everything load-bearing is in `gate`.
 
 ### Not in this release
 
