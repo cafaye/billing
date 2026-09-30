@@ -35,8 +35,13 @@ module MoneyCoverage
 
       tmp = Rails.root.join("tmp")
       FileUtils.mkdir_p(tmp)
-      script = tmp.join("money_coverage_probe.rb")
-      report = tmp.join("money_coverage_report.json")
+      # A name per measurement, not one shared path. The suite runs in parallel and
+      # two workers measuring at once would otherwise read each other's report — and
+      # one of them would assert a coverage number that belonged to a different
+      # corpus, which is precisely the kind of vacuous pass this gate must not have.
+      run_id = "#{Process.pid}-#{@runs = @runs.to_i + 1}"
+      script = tmp.join("money_coverage_probe-#{run_id}.rb")
+      report = tmp.join("money_coverage_report-#{run_id}.json")
       FileUtils.rm_f(report)
 
       File.write(script, probe_source(paths, corpus, report))
@@ -49,7 +54,8 @@ module MoneyCoverage
 
       JSON.parse(File.read(report))
     ensure
-      FileUtils.rm_f(script)
+      FileUtils.rm_f(script) if script
+      FileUtils.rm_f(report) if report
     end
 
     private

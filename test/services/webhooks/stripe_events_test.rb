@@ -167,19 +167,25 @@ class Webhooks::StripeEventsTest < ActiveSupport::TestCase
   # The processor's own ids are load-bearing until cafaye's land, so a shape
   # change that drops one has to be a failing test, not a surprise in a
   # consumer's inbox.
+  #
+  # Four keys were added in billing-04 and each is load-bearing.
+  # `cafaye_customer_id` is the link back to a cafaye customer, carried in the
+  # subscription's metadata because a customer created through `/v1` has a null
+  # `processor_customer_id` until its first subscription names one. `trial_ends_at`
+  # is the shape core's payload schema asks for. `event_created_at` and
+  # `event_created_instant` are the processor's own timestamp, which the lifecycle
+  # writes to the row so a delivery that arrived late can be told from one that
+  # arrived now.
+  SUBSCRIPTION_KEYS = %w[
+    kind processor processor_event_id subscription_id customer_id cafaye_customer_id status
+    quantity price_id unit_amount current_period_start current_period_end cancel_at_period_end
+    canceled_at trial trial_ends_at event_created_at event_created_instant
+  ]
+
   KNOWN_KEYS = {
-    "customer.subscription.created" => %w[
-      kind processor processor_event_id subscription_id customer_id status quantity price_id
-      unit_amount current_period_start current_period_end cancel_at_period_end canceled_at trial
-    ],
-    "customer.subscription.updated" => %w[
-      kind processor processor_event_id subscription_id customer_id status quantity price_id
-      unit_amount current_period_start current_period_end cancel_at_period_end canceled_at trial
-    ],
-    "customer.subscription.deleted" => %w[
-      kind processor processor_event_id subscription_id customer_id status quantity price_id
-      unit_amount current_period_start current_period_end cancel_at_period_end canceled_at trial
-    ],
+    "customer.subscription.created" => SUBSCRIPTION_KEYS,
+    "customer.subscription.updated" => SUBSCRIPTION_KEYS,
+    "customer.subscription.deleted" => SUBSCRIPTION_KEYS,
     "invoice.paid" => %w[
       kind processor processor_event_id customer_id subscription_id invoice_id payment_intent_id
       paid amount attempt_count next_payment_attempt

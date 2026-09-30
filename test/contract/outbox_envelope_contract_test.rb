@@ -23,39 +23,51 @@ class OutboxEnvelopeContractTest < ActiveSupport::TestCase
   PENDING_CORE_CATALOG_ROWS = %w[billing.plan.updated].freeze
 
   # Events whose `data` does not yet satisfy core's payload schema, and exactly
-  # how it differs.
+  # how it differs. **Empty in billing-04.**
   #
-  # Core ships two payload schemas in total, and one of them is billing's:
-  # `schemas/events/billing/subscription/started.schema.json`. The gap is not a
-  # disagreement about the event — it is that the schema describes a world in
-  # which this service holds ids it does not have yet:
+  # billing-03b recorded a large gap here: core's
+  # `schemas/events/billing/subscription/started.schema.json` names eight fields
+  # and is closed with `additionalProperties: false`, while that build sent eleven
+  # fields of its own and was missing two of core's. Two changes closed almost all
+  # of it, and both are real work rather than a change of assertion:
   #
-  #   * `plan_id` and `account_id` are required, and a Stripe webhook carries a
-  #     Stripe price id and a Stripe customer id. There is no subscriptions table,
-  #     and `Plan#id` is a uuid rather than core's `pln_[0-9A-Z]{26}`.
-  #   * `additionalProperties: false` and the schema names eight fields, so
-  #     everything this service does send — which processor it came from, the
-  #     period it covers, the cancellation intent — is unexpected to core until
-  #     the schema is widened.
+  #   * the subscriptions table landed, so `plan_id` and `account_id` are now
+  #     carried from a real plan and a real account rather than absent;
+  #   * a `billing.subscription.started` event is now built to core's shape — its
+  #     eight fields and nothing else — so the processor's provenance stayed out of
+  #     a payload core's schema rejects.
   #
-  # Recorded rather than skipped, and asserted as a set rather than subtracted
-  # from the failures. Subtracting would let a payload that starts matching sit
-  # here forever, and would let a new event stop matching without anyone
-  # noticing. A set means a difference in either direction fails.
-  PENDING_PAYLOAD_ALIGNMENT = {
+  # What is *not* closed is the id format, and that is recorded below instead, in
+  # `PENDING_ID_PATTERNS`, because it is a different kind of debt: the fields and
+  # their types now match, and what is left is that this service's ids are uuids
+  # where core asks for `sub_`/`pln_`/`acc_` prefixed ULIDs. That is an id scheme
+  # for the platform to decide, not something a worktree can change.
+  #
+  # Asserted as a set rather than subtracted from the failures. Subtracting would
+  # let a payload that starts matching sit here forever, and would let a new event
+  # stop matching without anyone noticing. A set means a difference in either
+  # direction fails.
+  PENDING_PAYLOAD_ALIGNMENT = {}.freeze
+
+  # core's pattern for each id in its started payload, and the reason this service
+  # does not meet it yet.
+  #
+  # This is the one disagreement left with core's schema, so it is asserted in both
+  # directions: the pattern core declares must be the one recorded here, and the
+  # value this service emits must *not* match it. A payload that starts matching
+  # fails, which is how the entry gets removed rather than forgotten.
+  PENDING_ID_PATTERNS = {
     "billing.subscription.started" => {
-      missing: %w[account_id plan_id],
-      unexpected: %w[
-        cancel_at_period_end canceled_at current_period_end current_period_start
-        customer_id kind price_id processor processor_event_id trial unit_amount
-      ].sort
+      "subscription_id" => /\Asub_[0-9A-Z]{26}\z/,
+      "plan_id" => /\Apln_[0-9A-Z]{26}\z/,
+      "account_id" => /\Aacc_[0-9A-Z]{26}\z/
     }
   }.freeze
 
   # The events core has no payload schema for, which core's outbox checklist asks
   # for. This is the accounting, and it fails the day core lands one so the entry
   # is dropped deliberately rather than by accident.
-  NO_PAYLOAD_SCHEMA_YET = (OutboxEvent::TYPES - PENDING_PAYLOAD_ALIGNMENT.keys).freeze
+  NO_PAYLOAD_SCHEMA_YET = (OutboxEvent::TYPES - PENDING_PAYLOAD_ALIGNMENT.keys - PENDING_ID_PATTERNS.keys).freeze
 
   # The webhook fixtures that produce the events that do not come from a model
   # callback. Ingested for real by the fixtures under test, so the payloads
@@ -131,6 +143,99 @@ class OutboxEnvelopeContractTest < ActiveSupport::TestCase
       "the payloads that do not match core's schemas have changed: fix them, or record the new gap in PENDING_PAYLOAD_ALIGNMENT and in cafaye.yml"
   end
 
+  # The one disagreement left with core's started schema: the three ids.
+  #
+  # core asks for `sub_`/`pln_`/`acc_` prefixed ULIDs. This service's ids are
+  # uuids — `Plan#id` and `Customer#owner_id` have been uuids since billing-02, and
+  # changing the id scheme of a published API is a breaking change to a contract
+  # several services already read. So the fields are present and correctly typed,
+  # and the *format* is a decision for whoever owns the platform's id scheme.
+  #
+  # Asserted in both directions: the pattern core declares must be the one recorded,
+  # and the value emitted must not match it. A payload that starts matching fails,
+  # which is how the entry is removed rather than forgotten.
+  PENDING_ID_PATTERN_TEST = "every pending id pattern is still core's, and our ids still miss it"
+
+  # The corpus the patterns are compared over. Behaviour, not text: the same
+  # grammar is the same *set of accepted strings*, and `Regexp#source` is not a
+  # reliable way to read one back — Ruby rewrites a pattern's source depending on
+  # the encoding it was compiled in, so comparing texts passes once and fails
+  # forever after with nothing changed in between. `assert_same_grammar` below is
+  # the same technique the envelope patterns use, for the same reason.
+  ID_PATTERN_CORPUS = [
+    "sub_01J9Z8QK5M4N7P2R3T6V8W9X0A",
+    "pln_01J9Z8QK5M4N7P2R3T6V8W9X0A",
+    "acc_01J9Z8QK5M4N7P2R3T6V8W9X0A",
+    # What this service actually emits: a uuid.
+    "0198f1c2-7a41-7c3b-9d55-2f0b6a1e4c88",
+    "11111111-1111-4111-8111-111111111111",
+    # Neighbouring shapes, where a difference in the pattern would show up.
+    "sub_01j9z8qk5m4n7p2r3t6v8w9x0a",
+    "sub_01J9Z8QK5M4N7P2R3T6V8W9X0",
+    "sub_01J9Z8QK5M4N7P2R3T6V8W9X0AB",
+    "sub_",
+    "sub",
+    "pln_",
+    "acc_",
+    "customer_01J9Z8QK5M4N7P2R3T6V8W9X0A",
+    "usub_01J9Z8QK5M4N7P2R3T6V8W9X0A"
+  ].freeze
+
+  test PENDING_ID_PATTERN_TEST do
+    PENDING_ID_PATTERNS.each do |event_type, fields|
+      data = data_for(event_type)
+      properties = payload_schema_for(event_type).fetch("properties")
+
+      fields.each do |field, pattern|
+        core_pattern = properties.fetch(field).fetch("pattern")
+
+        assert_same_grammar core_pattern, pattern, ID_PATTERN_CORPUS
+
+        assert_not pattern.match?(data.fetch(field)),
+          "#{event_type}.#{field} now matches core's pattern, so the gap is closed: drop it from PENDING_ID_PATTERNS"
+      end
+    end
+  end
+
+  # core's patterns are written with `^` and `$`, which in a Ruby `Regexp` anchor
+  # to a *line* rather than to the string, while this service's anchor the whole
+  # string with `\A` and `\z`. The difference is asserted rather than papered over:
+  # ours is strictly narrower, so an id can never be smuggled through by appending a
+  # second line, and comparing the two on a corpus containing one is meaningless
+  # without saying so.
+  test "our id patterns are anchored to the whole string, where core's are anchored to a line" do
+    PENDING_ID_PATTERNS.each do |event_type, fields|
+      properties = payload_schema_for(event_type).fetch("properties")
+
+      fields.each do |field, pattern|
+        assert_not pattern.match?("sub_01J9Z8QK5M4N7P2R3T6V8W9X0A\nsub_forged"),
+          "#{event_type}.#{field} accepts a second line, which core's pattern would"
+        assert_equal properties.fetch(field).fetch("pattern").start_with?("^"), true,
+          "core's pattern for #{event_type}.#{field} is no longer anchored with ^: re-read the schema"
+      end
+    end
+  end
+
+  test "the corpus would notice a pattern that had changed" do
+    # The corpus is only evidence about the strings in it, so it is checked against
+    # a pattern that is deliberately different — here, one that wants a different
+    # length. Without this, a corpus of strings every plausible pattern accepts
+    # would compare equal to anything and the assertion above would be decorative.
+    changed = Regexp.new("^pln_[0-9A-Z]{25}$")
+    ours = PENDING_ID_PATTERNS.fetch("billing.subscription.started").fetch("plan_id")
+
+    disagreements = ID_PATTERN_CORPUS.reject { |candidate| changed.match?(candidate) == ours.match?(candidate) }
+
+    assert_not_empty disagreements, "the corpus cannot tell two different id patterns apart"
+  end
+
+  test "the set of events with an id-pattern gap has changed" do
+    with_schema = OutboxEvent::TYPES.select { |event_type| payload_schema_for(event_type)&.dig("properties") }
+
+    assert_equal PENDING_ID_PATTERNS.keys.sort, with_schema.sort,
+      "the set of events checked for an id-format gap has changed: update PENDING_ID_PATTERNS and the reason in cafaye.yml"
+  end
+
   test "the set of events with no payload schema in core has changed" do
     unspecified = OutboxEvent::TYPES.reject { |event_type| payload_schema_for(event_type) }
 
@@ -161,9 +266,28 @@ class OutboxEnvelopeContractTest < ActiveSupport::TestCase
     # webhook mapping. Both are produced here the way production produces them —
     # a record written, a signed fixture ingested — because an envelope assembled
     # by hand in a test is an envelope nothing has checked this service against.
+    # A subscription delivery is acted on only when it resolves to a cafaye customer
+    # and a cafaye plan, so the customer and the plan here carry the *processor's*
+    # ids the fixtures use. Without them the three subscription fixtures would be
+    # refused and there would be no subscription envelope to check against core.
     def emit_one_event_of_every_type
-      Customer.create!(owner_type: "User", owner_id: "11111111-1111-4111-8111-111111111111", processor: "stripe")
-      plan = Plan.create!(name: "Pro monthly", slug: "pro-monthly", price: Money.new(1900, "USD"), interval: "month")
+      # Account-owned, not user-owned, and that is load-bearing: a subscription is
+      # billed to an account, and the lifecycle refuses to attach one to a customer
+      # that belongs to a user — which account a user belongs to is identity's fact
+      # and no event carrying it is in this build's `consumes`.
+      Customer.create!(
+        owner_type: "Account",
+        owner_id: "11111111-1111-4111-8111-111111111111",
+        processor: "stripe",
+        processor_customer_id: StripeSubscriptionFixtures::PROCESSOR_CUSTOMER_ID
+      )
+      plan = Plan.create!(
+        name: "Pro monthly",
+        slug: "pro-monthly",
+        price: Money.new(1900, "USD"),
+        interval: "month",
+        processor_price_id: StripeSubscriptionFixtures::PROCESSOR_PRICE_ID
+      )
       plan.update!(active: false)
 
       WEBHOOK_FIXTURES.each { |fixture| ingest(fixture) }
@@ -354,10 +478,10 @@ class OutboxEnvelopeContractTest < ActiveSupport::TestCase
       "cus@1"
     ].freeze
 
-    def assert_same_grammar(core_pattern, ours)
+    def assert_same_grammar(core_pattern, ours, corpus = GRAMMAR_CORPUS)
       theirs = Regexp.new(core_pattern)
 
-      disagreements = GRAMMAR_CORPUS.reject { |candidate| theirs.match?(candidate) == ours.match?(candidate) }
+      disagreements = corpus.reject { |candidate| theirs.match?(candidate) == ours.match?(candidate) }
 
       assert_empty disagreements, "core and this service disagree about: #{disagreements.inspect}"
     end

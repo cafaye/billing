@@ -61,8 +61,14 @@ module Webhooks
         # One transaction for the event and the marking. Either a consumer sees
         # `billing.payment.succeeded` and the row is finished, or neither exists
         # and the next delivery redoes the work from the stored payload.
+        #
+        # The handler is *inside* the transaction, and that is load-bearing now
+        # that a handler can also write domain state: a subscription event applies
+        # to the subscriptions table and the row it writes commits or rolls back
+        # with the event and the receipt. `Webhooks::Ingestion` itself is unchanged
+        # by that; the ordering is what was already here.
         ProcessorWebhook.transaction do
-          emission = handler.call(payload)
+          emission = handler.call(payload, event_time)
           OutboxEvent.publish!(
             type: emission.event_type,
             subject: emission.subject,
@@ -84,6 +90,11 @@ module Webhooks
       # unpublished for an hour must still report when the change happened, and an
       # out-of-order delivery is only detectable by a consumer if this is not
       # `Time.current`.
+      #
+      # Computed once here and handed to the handler as well, because a handler that
+      # publishes an event about a subscription has to put the same instant in the
+      # event's `time` and in the payload's `started_at` — core's schema requires the
+      # two to be equal — and two readings of the same field is how they drift.
       def event_time
         created = payload["created"]
         created.present? ? Time.at(created).utc : Time.current
