@@ -6,6 +6,75 @@ All notable changes to billing are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`gate.yml`: this repository's gate is now declared, and `bin/prime` refuses
+  an unpinned Ruby.** billing was one of the six cafaye services with no gate
+  declaration, so a developer here could run `bin/prime`, see green, and learn
+  nothing about whether the gate could detect anything. `gate.yml` is written
+  against `core/schemas/gate.schema.json` and checked by
+  `core/harness/gate_check.py`; `gate.command` is `bin/prime`, `gate.miseTask` is
+  `prime` (which already resolved to the same file), and six proofs say what
+  "the gate ran" looks like — the pinned toolchain, `bundle install`,
+  `db:prepare`, rubocop's file count, the suite's summary line, and the gate's
+  own last line. Every floor was measured on this commit, never guessed, and no
+  floor carries a margin.
+
+  Two of the six proofs are numeric and they are independent on purpose, which
+  is a measured decision rather than a stylistic one. guard measured the
+  near-miss this is copied from: a `pass` floor set with a margin of five stayed
+  **green** through the deletion of a five-test file, and only a second
+  `files` floor caught it. Deleting `test/integration/health_test.rb` here — 5
+  tests, referenced by nothing, touching no money — is caught twice:
+
+  ```
+  FAIL gate.floor: proof 'lint'  reported 92  and the declaration's floor is 93
+  FAIL gate.floor: proof 'suite' reported 758 and the declaration's floor is 763
+  ```
+
+  **The `0 skips` in the suite proof is the load-bearing part of this entry, and
+  it is a finding rather than tidiness.** Measured here, same commit, same
+  command, twice:
+
+  | `CORE_PATH` | result | `bin/prime` |
+  |---|---|---|
+  | a core checkout | `763 runs, 2100 assertions, 0 failures, 0 errors, 0 skips` | `prime ok`, exit 0 |
+  | pointing at nothing | `763 runs, 1757 assertions, 0 failures, 0 errors, 20 skips` | `prime ok`, exit 0 |
+
+  Same run count, same exit code, **343 assertions of contract checking not
+  done** — the contract tier skips rather than fails when it cannot read core's
+  schemas, which is correct for a standalone checkout and wrong for a green
+  badge. Pinning `0 skips` makes that a `gate.proof-missing`, so the declared
+  gate is red without a core checkout, and `external` carries a `filesystem`
+  requirement naming `CORE_PATH` with the measured symptom as its `unmet`.
+
+  `bin/prime` gains the toolchain half of that story. It used to satisfy
+  `require ruby` with *any* interpreter and print `ruby --version`; with macOS's
+  system Ruby first on `PATH` the run died four lines later on
+  `Could not find 'bundler' (4.0.18) (Gem::GemNotFoundException)` — a red that
+  names a gem, nowhere near the toolchain that is wrong, and the 4.0.1 pin
+  appears in no line of it. It now reads `.ruby-version`, compares, and exits
+  **127** naming both numbers before a gem is touched. `.ruby-version` is the
+  same file mise, `ruby/setup-ruby` and the `pins` CI job read, so there is
+  still one copy of the number.
+
+  `script/gate_declaration_self_test.sh` breaks the declaration five times on
+  purpose and asserts the checker goes red **and names the finding** —
+  `bin/prime` replaced by `exit 0` (six `gate.proof-missing`), a deleted test
+  file (two `gate.floor`), a floor raised past the count (`gate.floor`),
+  `bin/prime` deleted (`gate.command-missing` + `gate.entrypoint-missing`), and
+  a `ruby` answering 3.4.2 (`gate.nonzero` at exit 127, with the message itself
+  asserted rather than just the status). 181s, sequential, every breakage
+  reverted, and a final control that re-runs the check so a script that damages
+  the tree it is testing cannot report success.
+
+  Measured with `gate-check --prove`: `0 failures, 3 warnings`, and the three
+  warnings are `gate.requirement-unproven` for `mise`, `git` and `bundle` —
+  bare-name requirements the checker deliberately does not run, which is the
+  documented tri-state contract and not a defect. `REPORT-billing-10-gate.md`
+  records the pass and skip counts per tier, the two environment-gated tiers by
+  variable name, and three open items this packet deliberately did not change.
+
 ### Changed
 
 - **CI now calls kit's reusable workflow, and holds master's suite size.**
