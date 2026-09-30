@@ -376,11 +376,19 @@ that changed the tests**, as `AGENTS.md` requires — 763/2100 on master, 823/22
 first commit here, **851/2368 in this one**. The `gate` job's own summary-parsing step was
 replayed against a real run log to confirm it agrees.
 
-**Stability.** `concurrent_delivery_test.rb` was run **12 consecutive times**: 10 runs /
-24 assertions / 0 failures / 0 errors / 0 skips, every time. That is a result rather than
-an accident, and it is the direct consequence of fixing the 3-in-60 classification flake
-in §2 — before that fix the same file was a 5% flake and 10 green runs in isolation would
-have been luck.
+**Stability.** `concurrent_delivery_test.rb` was run **6 consecutive times** on the final
+code: 12 runs / 28 assertions / 0 failures / 0 errors / 0 skips, every time. That is a
+result rather than an accident, and it is the direct consequence of fixing the 3-in-60
+classification flake described in §7c — before that fix the same file failed roughly one
+run in five, and six green runs in isolation would have been luck.
+
+**The trap in mutation 3, because it produced a green run that meant nothing.**
+Dropping the index from the database with `remove_index` does **not** prove anything:
+`rails test` reloads `db/schema.rb` whenever it and the database disagree, silently
+restoring the index. I hit exactly that — a "green" mutation run while `pg_indexes`
+showed the index absent. The index has to be removed as a coherent unit (migration,
+`schema.rb` and database) or not at all, and the red has to be read from a run that
+really ran against the database you think it did.
 
 **The race test is now in the `gate` job's webhook tier**, not only counted in the whole
 suite. A regression test that exists only inside a total is one deletion away from being
@@ -489,7 +497,15 @@ filed as a race and answered 200).
 
 **Proven by mutation:** widening the predicate to `record.is_a?(ActiveRecord::Base)`
 goes red on `a validation failure that is not a uniqueness race is still parked for a
-human`, with the failure message naming the consequence rather than the diff.
+human`, with the failure message naming the consequence rather than the diff. The
+mutation is red on **three** tests, the third being a pre-existing one
+(`a mapping to an event type the outbox does not list parks the row`) — which is the
+clearest evidence that the predicate is load-bearing rather than decorative.
+
+**And measured again afterwards, because "the flake is gone" is a claim:** the same 60
+barrelled duplicate creations now record **60 `ignored:duplicate_delivery`, 0 parked, 0
+duplicate subscriptions**. Sixty before and sixty after is the whole argument; ten green
+runs in isolation would not have been an argument at all.
 
 This is also why the comment in `ingestion.rb` deliberately does not name a single index:
 I would have been writing down a claim that measurement then contradicted.
