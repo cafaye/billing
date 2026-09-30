@@ -23,7 +23,10 @@
 # MEASURED, NOT GUESSED. Every number and every pattern here came from running
 # this repository's gate on billing at `bd6ac84`, on a saturated 8-core host
 # (load average 83-107, ruby 4.0.1 via mise 2026.8.4, rails 8.1.4, PostgreSQL
-# 18.4 on macOS arm64). What it printed, in full, is:
+# 18.4 on macOS arm64). Re-run after the host restarted under a lighter load
+# (31-64) and every number below came back identical — 93 files, 763 runs, 2100
+# assertions, 0 skips — which is the second data point a floor wants. What it
+# printed, in full, is:
 #
 #   == ruby 4.0.1 (pinned by .ruby-version)
 #   == bundle install
@@ -226,7 +229,9 @@ gate:
       # 93 of the repository's 94 tracked `.rb` files; rubocop excludes one.
       # Verified stable between this worktree and a plain directory copy, which
       # matters because a count that moved with the checkout would be a coin
-      # flip.
+      # flip. Goes to 97 when billing-09-race merges — four new test files, no
+      # new app file; see the `suite` floor below, which is the other half of
+      # that pair and the reason both move together.
       minimum: 93
     # ---------------------------------------------------------------------
     # The suite. THE load-bearing proof, and the only line that cannot appear
@@ -283,10 +288,13 @@ gate:
       # weaker place for the number to rot.
       #
       # WHEN billing-09-race MERGES, raise this and `BASELINE_RUNS` together in
-      # that commit, or in the merge. That branch adds two test files and four
-      # more, so the honest number becomes larger than 763 and a floor left at
-      # 763 is a floor with a hole in it. Floors never block a merge, so nothing
-      # goes red to say so — which is exactly why it is written here.
+      # that commit, or in the merge. That branch has landed and carries its own
+      # `BASELINE_RUNS: '851'`, so the honest number is 851 and a floor left at
+      # 763 is a floor with a hole in it. The matching `lint` floor goes 93 ->
+      # 97, which is that branch's four new `test/` files and no new `app/` file.
+      # Measure the merge result rather than trusting that arithmetic: the number
+      # to raise is the one the gate prints. Floors never block a merge, so
+      # nothing goes red to say so — which is exactly why it is written here.
       minimum: 763
     # ---------------------------------------------------------------------
     # The gate reached its own last line. With the five above it, the step
@@ -351,11 +359,23 @@ external:
           bin/prime: .ruby-version pins ruby 4.0.1; the ruby on PATH answers
           '2.6.10' (exit 127)
     - kind: database
-      # PostgreSQL. `docker-compose.yml` pins postgres:17 for local work; the
-      # measurement above ran against a PostgreSQL 18.4 already on this host, and
-      # CI runs postgres:17. Nothing in the suite depends on the major, but the
-      # three numbers are named rather than rounded because a suite that passes
-      # on 18.4 has not been shown to pass on the 17 the image ships.
+      # PostgreSQL, and THREE servers rather than one — which is the reason the
+      # tag is named as "the image docker-compose.yml pins" and not written out
+      # here. Measured on this host: `bin/prime` connected to a Homebrew
+      # PostgreSQL 18.4 over the local socket, while Docker ran the compose
+      # image on 5432 as well, and CI runs the tag `ci.yml` pins. So a
+      # developer, a compose stack and a CI runner can each be answering on a
+      # different major at the same time, and a tag copied into a comment here
+      # is a third copy to go stale the moment one of the other two moves —
+      # which is why this names the file instead of the string.
+      #
+      # Nothing in the suite depends on the major, and that is a property of the
+      # code rather than of the pin: every ordered read is `order(created_at:,
+      # id:)` — a timestamptz and a uuid — and no spec sorts a text column, so
+      # the alpine build's `C` default collation (the one thing the smaller
+      # image really changes) cannot reach a result. A suite green on 18.4 has
+      # still not been shown green on the image, and that gap is recorded in
+      # REPORT-billing-10-gate.md rather than papered over.
       #
       # The two credential paths differ, and both were read from the files
       # rather than assumed: `docker-compose.yml` sets
@@ -370,8 +390,8 @@ external:
       # below deliberately quotes an error rather than a URL.
       name: >-
         a PostgreSQL server for this checkout's own test database: docker
-        compose up -d (postgres:17) locally, or DATABASE_URL in CI. The two
-        paths differ, and the difference is in the comment above.
+        compose up -d (the image docker-compose.yml pins) locally, or
+        DATABASE_URL in CI. The two paths differ; see the comment above.
       satisfy:
         # Repository-relative, so the checker verifies the file is here: a
         # requirement satisfied by a command that does not exist is a pointer to

@@ -30,7 +30,9 @@
 # interrupted run does not leave a worktree with no gate in it. The final
 # control re-runs the check afterwards, which is the only thing that actually
 # proves the restores worked: a script that reports five reds and leaves the
-# tree broken has proved nothing about the declaration.
+# tree broken has proved nothing about the declaration. That control compares
+# against the copies taken at the start of the run, not against `HEAD`, so a
+# worktree with uncommitted work in it is not mistaken for a damaged one.
 #
 # RUNTIME, AND WHY IT IS SLOW
 #
@@ -252,22 +254,56 @@ else
   echo "    ok: exit 0 — every breakage was reverted"
 fi
 
-# git is asked, not trusted: `bin/prime`'s executable bit and gate.yml's exact
-# bytes are what a restore has to get right, and a file that is merely present
-# is not the same file.
-note "control again: the four files are byte-identical to the start"
-if git -C "$repo_root" diff --quiet -- bin/prime gate.yml test/integration/health_test.rb 2>/dev/null; then
-  echo "    ok: no diff against HEAD in the files this script touched"
-else
-  # A new file is untracked, and `git diff` says nothing about those. Only an
-  # unexpected diff is a problem, so this is reported, not treated as a failure.
-  if git -C "$repo_root" ls-files --error-unmatch gate.yml >/dev/null 2>&1; then
-    echo "    FAIL: the tree still differs from HEAD after restore" >&2
-    git -C "$repo_root" diff --stat -- bin/prime gate.yml test/integration/health_test.rb >&2
-    failed=$((failed + 1))
-  else
-    echo "    ok: gate.yml is not tracked yet, so no diff is expected; files restored"
+# Compared against THE PRISTINE COPIES, not against HEAD, and that is a fix
+# rather than a preference. This control used to be `git diff --quiet`, which
+# cannot tell two different things apart: a restore that failed, and a file the
+# operator had legitimately edited but not yet committed. Both look like "the
+# tree differs from HEAD", so running this script on a worktree with uncommitted
+# work in it reported a false failure — measured, not hypothesised: an edit to
+# gate.yml's prose made all five cases pass and this control fail, with a diff
+# stat that was exactly the operator's own edit and nothing the script broke.
+#
+# The invariant this control is actually about is "the script put back what it
+# took out", and the thing that took them out was this script, so the thing to
+# compare against is `$saved` — a copy taken at the top of the run. `cmp` is
+# byte-exact, which is the check that matters: a file that is merely present is
+# not the same file, and `bin/prime`'s executable bit is checked separately
+# below because `cp` and `git checkout` do not agree about how to carry it.
+note "control again: the three files are byte-identical to the copies taken at the start"
+restore_drift=0
+for rel in bin/prime gate.yml test/integration/health_test.rb; do
+  if ! cmp -s "$saved/$rel" "$repo_root/$rel"; then
+    echo "    FAIL: $rel is not the file this script saved" >&2
+    restore_drift=1
   fi
+done
+if [ "$restore_drift" -eq 0 ]; then
+  echo "    ok: all three are byte-identical to the start — every breakage was reverted"
+else
+  failed=$((failed + 1))
+fi
+
+# The executable bit is its own check because it is the one property a restore
+# can lose without changing a single byte, and `bin/prime` is the gate's
+# `command` and `entrypoint` at once — a prime that is present but not runnable
+# is a gate that does not exist, and the static half would say `gate.command` is
+# fine while the prove half exits nonzero.
+if [ -x "$repo_root/bin/prime" ]; then
+  echo "    ok: bin/prime is still executable"
+else
+  echo "    FAIL: bin/prime lost its executable bit" >&2
+  failed=$((failed + 1))
+fi
+
+# Reported, never fatal: whether these files are uncommitted is the operator's
+# business, not this script's. A dirty gate.yml at the end is normal while
+# drafting a declaration, and treating it as a defect would train a reader to
+# ignore this control.
+if git -C "$repo_root" diff --quiet -- bin/prime gate.yml test/integration/health_test.rb 2>/dev/null; then
+  echo "    ok: no uncommitted diff in the files this script touched"
+else
+  echo "    note: the files this script touched carry an uncommitted diff."
+  echo "      Expected while drafting; the bytes above are what this script restored."
 fi
 
 printf '\n=== %d passed, %d failed\n' "$passed" "$failed"

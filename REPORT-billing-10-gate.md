@@ -4,10 +4,22 @@
 `worker/billing-06`) · **Not pushed.** The manager pushes after the gate is
 green.
 
-**Host:** macOS arm64, 8 cores, **load average 83–107** for the whole of this
-run. mise 2026.8.4, ruby 4.0.1 (mise shim), rails 8.1.4, PostgreSQL **18.4**,
-rubocop-rails-omakase. One suite at a time throughout; no parallel matrix, no
-background stress loop; every network-bound command wrapped in `timeout`.
+**Host:** macOS arm64, 8 cores, **load average 83–107** for the whole of the
+measuring run. mise 2026.8.4, ruby 4.0.1 (mise shim), rails 8.1.4, PostgreSQL
+**18.4**, rubocop-rails-omakase. One suite at a time throughout; no parallel
+matrix, no background stress loop; every network-bound command wrapped in
+`timeout`.
+
+**Re-verified after a host restart.** The machine this ran on was restarted
+mid-packet (it ran out of memory; nothing about the work was at fault), so every
+result below was re-measured from the committed tree on the rebooted host at a
+lighter load (31–64 rather than 83–107). **Every number came back identical** —
+93 files inspected, 763 runs, 2100 assertions, 0 skips, `gate-check` and
+`gate-check --prove` both 0 failures, and the self-test 5 passed / 0 failed. Two
+independent runs on two different loads agreeing on a floor set with no margin
+is the evidence that the floor is a fact about the repository and not about the
+hour it was measured in. One correction came out of the re-run and is folded in:
+the PostgreSQL major, which is §7's "three servers, not one" below.
 
 ---
 
@@ -218,6 +230,41 @@ that damages the tree it is testing cannot report success.
 | 5 | a `ruby` on `PATH` answering 3.4.2 | `gate.nonzero: the gate exited 127`, plus 6 × `gate.proof-missing` |
 | — | *control, after five* | exit 0 — every breakage reverted |
 
+### The control was wrong on first write, and that is the sixth finding
+
+The final control re-runs the checker *and* compares the restored files. The
+first version of that comparison used `git diff --quiet` against `HEAD`, and
+that is a defect this packet introduced and then found: **it cannot tell a
+restore that failed apart from a file the operator had legitimately edited but
+not yet committed.** Both are "the tree differs from `HEAD`".
+
+It was found by running the script against a worktree carrying an uncommitted
+edit to `gate.yml`'s own prose. All five cases passed; the control failed; and
+the diff it printed was exactly the edit and nothing the script had broken. A
+control that cries wolf on a dirty worktree trains its reader to ignore it,
+which is the same failure as a checker that is red on a laptop and green on CI.
+
+It now:
+
+- compares **`cmp`-byte-exactly against the copies taken at the start of the
+  run** — the invariant actually under test is "the script put back what it took
+  out", and the thing that took them out was the script;
+- checks **`bin/prime`'s executable bit separately**, because that is the one
+  property a restore can lose without changing a single byte, and `bin/prime`
+  is the declaration's `command` and `entrypoint` at once — a prime that is
+  present but not runnable is a gate that does not exist, and the static half
+  would still call `gate.command` fine;
+- reports a dirty `gate.yml` as a **note**, never a failure, because whether a
+  file is committed is the operator's business.
+
+**Proven able to fail, rather than assumed:** with a single byte appended to
+`bin/prime` immediately before the final comparison, the control answered
+`FAIL: bin/prime is not the file this script saved` and the script exited **1**
+with 5 passed / 1 failed. A first attempt at this sabotage was ineffective — it
+tampered *before* `restore()` ran, so the restore correctly overwrote it and the
+control was right to pass. The honest version tampers where the invariant is
+actually checked.
+
 **Case 1 is the one the format exists for**: a declaration entirely true about a
 gate that exits 0 without running anything. It is red by six independent
 findings, not by the exit code, so it cannot be talked green by editing one away.
@@ -317,21 +364,53 @@ and because a reader who copies the shape of the other seven adopters' long
    declares `[bin/rails, db:prepare]` rather than cafaye-rb's
    `[bin/prime, --fast]`, which would have been a satisfy command that does not
    satisfy.
-3. **Raise the floors when billing-09-race merges.** That branch adds two test
-   files and four more, so the honest numbers become larger than 763/93. Floors
-   never block a merge, so **nothing will go red to say so** — which is why it is
-   written here. In the merge commit, or in that branch's own commit: raise
-   `minimum` on `suite` and `lint` in `gate.yml`, **and** `BASELINE_RUNS` /
-   `BASELINE_ASSERTIONS` in `ci.yml`, together. `CHANGELOG.md` will very likely
+3. **Raise the floors when billing-09-race merges — and the numbers are now
+   known, not estimated.** An earlier draft of this item said that branch "adds
+   two test files and four more" and left the replacement numbers to be
+   measured. `worker/billing-09-race` has since landed, so the numbers are read
+   off it rather than guessed:
+
+   | | this branch | on `worker/billing-09-race` | raise to |
+   |---|---|---|---|
+   | `suite` runs | 763 | **851** (its own `BASELINE_RUNS`) | **851** |
+   | suite assertions | 2100 | **2368** (its `BASELINE_ASSERTIONS`) | — (`gate.yml` matches runs, not assertions) |
+   | `lint` files | 93 | **97** — 4 added `test/` files, no added `app/` file | **97** |
+
+   The 93 → 97 is derived from the branch's own file list: `tenant_isolation_matrix_test.rb`,
+   `secrets_do_not_leak_test.rb`, `outbox_processor_event_id_migration_test.rb`
+   and `concurrent_delivery_test.rb` are four new files rubocop will inspect,
+   and it adds no `app/` file. **Verify it by running the gate on the merge
+   result rather than trusting this arithmetic** — the number to raise is the one
+   the gate prints, and this table says what it is expected to be.
+
+   In the merge commit: raise `minimum` on `suite` (to **851**) and `lint` (to
+   **97**) in `gate.yml`, **and** `BASELINE_RUNS` / `BASELINE_ASSERTIONS` in
+   `ci.yml`, together. Floors never block a merge, so **nothing will go red to
+   say so** — which is why it is written here. `CHANGELOG.md` will very likely
    conflict at merge time; that is expected and it is the manager's to resolve.
+
+   Note the interaction with the two margin-free floors, because it is the
+   point of having two of them: this branch adds **88 runs across 4 files**, so
+   both floors move substantially and neither has slack to absorb it. A margin
+   on either one would have survived a change of this size *by being wrong*,
+   which is the reason there is none.
 
 ### Assorted measured facts worth having
 
-- **PostgreSQL major.** Local measurement ran against **18.4** (a Homebrew server
-  already on this host); `docker-compose.yml` pins **17** and CI runs **17**.
-  Nothing in the suite depends on the major, but a suite green on 18.4 has not
-  been shown green on the 17 the image ships. This is a gap in the evidence, not
-  a finding.
+- **PostgreSQL major — three servers, not one.** Measured on this host after the
+  restart: `bin/prime` connects to a **Homebrew 18.4** over the local socket
+  (`hba_file` = `/opt/homebrew/var/postgresql@18/pg_hba.conf`), while **Docker**
+  runs the compose image on 5432 *as well*, and CI runs the tag `ci.yml` pins.
+  Both are listening on 5432 at once; the socket is what the suite reaches.
+  Nothing in the suite depends on the major, and that is a property of the code
+  rather than of the pin: every ordered read is `order(created_at:, id:)` — a
+  timestamptz and a uuid — and no spec sorts a text column, so the `C` default
+  collation the alpine build brings cannot reach a result. **A suite green on
+  18.4 has still not been shown green on the image the compose file and CI
+  actually run.** That is a gap in the evidence, not a finding, and it is why
+  `gate.yml` names "the image `docker-compose.yml` pins" rather than copying a
+  tag: this host moved that tag once already, and a third copy in a comment is
+  a third thing to go stale.
 - **The database name is per checkout** — `worker_billing_10_gate_test` here,
   derived by `config/database.yml` from the directory. No proof matches it, and
   `ci.yml` overrides it with a per-run `DATABASE_URL`.
@@ -357,7 +436,7 @@ and because a reader who copies the shape of the other seven adopters' long
 | 2. Toolchain discovery is part of the gate | §3 — the defect reproduced, fixed in `bin/prime`, exit 127 naming both numbers, and case 5 asserts the message |
 | 3. `gate.yml` following the seven adopters | §2 — read `guard`, `cafaye-rb` and `core`; shape, argv-not-string, proofs with regex + group + minimum, `external`, `ci` |
 | 4. Every floor from a real run | §2 — 763 and 93, both measured; a wrong first guess would have gone red |
-| 5. Prove the gate can fail, ≥3 ways | §5 — **five**, each red and naming its finding, all reverted, re-runnable; guard's near-miss addressed head-on with two margin-free floors |
+| 5. Prove the gate can fail, ≥3 ways | §5 — **five**, each red and naming its finding, all reverted, re-runnable; guard's near-miss addressed head-on with two margin-free floors. The script's own final control was a **sixth** finding: it compared to `HEAD` and so reported a false failure on a worktree with uncommitted work, now comparing to the copies taken at the start and itself red-proved |
 | 6. Pass and skip counts separately; name the env variable | §4 — per tier, both columns, reconciled to the assertion; `CORE_PATH` and `CI` named |
 | 7. `CHANGELOG.md` + this report | both |
 | Never weaken an assertion | no case weakened one; no sleeps, no raised retries, no loosened thresholds |

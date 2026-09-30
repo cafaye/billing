@@ -68,6 +68,24 @@ All notable changes to billing are recorded here. The format follows
   reverted, and a final control that re-runs the check so a script that damages
   the tree it is testing cannot report success.
 
+  That last control was itself wrong on first write, and the fix is part of this
+  entry. It compared the restored files against `HEAD`, which cannot tell a
+  restore that **failed** apart from a file the operator had legitimately edited
+  but not yet committed — both are "the tree differs from `HEAD`", so running
+  the script on a worktree with uncommitted work reported a false failure
+  against a perfectly intact restore. Measured, not hypothesised: an edit to
+  `gate.yml`'s prose made all five cases pass and the control fail, with a diff
+  that was exactly the operator's own edit and nothing the script had broken.
+  It now compares `cmp`-byte-exactly against the copies the script took at the
+  start of the run, which is the invariant actually being tested ("the script put
+  back what it took out"), checks `bin/prime`'s executable bit separately because
+  that is the one property a restore can lose without changing a byte, and
+  reports a dirty `gate.yml` as a note rather than a failure. Proven able to
+  still fail: with one byte appended to `bin/prime` immediately before the final
+  comparison, the control answered `FAIL: bin/prime is not the file this script
+  saved` and exited 1. A check that cannot fail is not a check, and that applied
+  to the control as much as to the five cases.
+
   Measured with `gate-check --prove`: `0 failures, 3 warnings`, and the three
   warnings are `gate.requirement-unproven` for `mise`, `git` and `bundle` —
   bare-name requirements the checker deliberately does not run, which is the
