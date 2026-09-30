@@ -1,0 +1,637 @@
+require "test_helper"
+
+# Every account-scoped entry point in this service, enumerated and **derived**.
+#
+# ## Why this file exists beside `contract/tenant_isolation_matrix_test.rb`
+#
+# That file answers one question about the routes: is this operation
+# account-scoped, and is its scope recorded. It does not answer the three this
+# file answers, and the rest of the packet is built on all three:
+#
+#   * **how many** account-scoped entry points there are — not only on the HTTP
+#     surface but in the controllers, models and services underneath it;
+#   * **what kind** of access each one performs, so "read, list, update, delete"
+#     is a count a reader can check rather than a sentence in a report; and
+#   * **that the set is total** — a data access nobody classified is an entry
+#     point whose scope nobody decided, and it is live on the next deploy.
+#
+# A negative test is written per entry point, and that count only means
+# something if the number of entry points is itself pinned. So the tables below
+# are compared against the source in **both directions**: an unclassified data
+# access fails here by name, and a classified entry point whose method has gone
+# away fails the other way. Neither failure is silent, which is the whole reason
+# the tables are derived rather than maintained.
+#
+# ## Two layers, two numbers, and why they are not added together
+#
+# A **route** is a caller-facing operation on the HTTP surface: 14 of them. A
+# **data access** is one place in `app/` that reads or writes a tenant's row:
+# 33 of them, in 31 methods. The two layers overlap — a route is served by a
+# controller method that performs a data access — and they are counted separately
+# on purpose. Adding them would produce one larger number that means nothing,
+# and the two answer different questions: the route count is "how much of the
+# surface is a caller's to reach", the data-access count is "how many places have
+# to be scoped when identity's JWKS verification lands". The packet's headline is
+# the second, because that is the one that is not yet done.
+#
+# ## Why the derivation is per-method and not per-line
+#
+# The obvious key is `file:line`, and it is the wrong one: inserting a comment
+# renumbers every site below it and turns a documentation edit into a red suite.
+# The key is **`path` plus the method the access sits in**, which is the unit a
+# reader thinks in — "the `show` action of `V1::CustomersController` reads any
+# customer by its uuid" — and which survives the edits that actually happen.
+#
+# **The kind is part of the key**, because one method can do two kinds of thing
+# and `Subscriptions::Lifecycle#apply` does exactly that: it builds a row that did
+# not exist and writes to the one that did. A key of `(path, method)` alone would
+# force a choice between them and report a smaller number than the code has.
+#
+# ## What "account-scoped" means here
+#
+# A data access is account-scoped when it reads or writes a row that belongs to an
+# account. Two columns decide it: `Subscription#account_id`, and `Customer#owner_id`
+# when the owner is an `Account`. `Plan` is in the set because it is the catalogue
+# every account buys from, and because the contract matrix already treats it as
+# tenant data — the same three models, re-pinned here so neither file drifts alone.
+#
+# Seven of the 33 are **declarations** rather than executed resolutions: the two
+# `belongs_to` on `Subscription`, the five `scope`s on `Subscription` and
+# `OutboxEvent`. They are counted, because an association and a scope are both
+# queries and leaving a category out of an enumeration is how the enumeration stops
+# being one — but they are counted as declarations, so a reader who wants only the
+# places a request actually reaches a row has **26** and not 33.
+#
+# A declaration is counted only when the class declaring it holds tenant data:
+# `Customer`, `Plan`, `Subscription` (an `account_id` column) or `OutboxEvent` (an
+# `account_id` inside `data`). `IdempotencyKey` has a `scope :expired` and is not
+# in either set, because it is keyed on the request's own idempotency key and
+# touches no tenant row.
+#
+# `OutboxEvent` is **not** in the tenant-data set and is counted as writes instead,
+# for a reason worth stating: an outbox row has no `account_id` of its own. It
+# carries one inside `data`, and only because a writer put it there. Nothing in
+# this repository reads an outbox row back by account — the publisher loop does
+# not exist yet — so the brief's "outbox events" are three writes and zero reads
+# here, and that is asserted rather than left to a reader's imagination.
+class TenantAccountEntryPointMatrixTest < ActiveSupport::TestCase
+  # The kinds an access can have. `delete` is in the vocabulary and its count is
+  # asserted to be **zero**, because the alternative — leaving it out of the list
+  # — is how "a service that deletes nothing" and "a service that forgot to scope
+  # its deletes" come to read the same in a report.
+  KINDS = %w[read list write update delete].freeze
+
+  # The models whose rows belong to an account. Pinned, and asserted to be the
+  # three the contract matrix pins, so a reader can check the two files agree
+  # without opening both.
+  TENANT_MODELS = %w[Customer Plan Subscription].freeze
+
+  # The models whose rows **carry** an account without having an account column.
+  #
+  # `OutboxEvent` is the only one, and the distinction is worth stating rather
+  # than smoothing over. An outbox row's `account_id` lives inside `data`, and only
+  # because a writer put it there; the table has no `account_id` of its own, so
+  # there is nothing for a query to constrain on even today. That is exactly why
+  # the outbox answers the brief's "or outbox events" with **three writes and no
+  # read by account** — and its three declared scopes are counted here, because a
+  # scope over rows that hold every account's events is still a query over tenant
+  # data even when the column to scope it by does not exist yet.
+  PAYLOAD_TENANT_MODELS = %w[OutboxEvent].freeze
+
+  # Every `/v1` operation the router serves, keyed by `[method, router path]`,
+  # with the kind of access it performs and why it is account-scoped.
+  #
+  # Keyed in the **router's spelling** (`:id`, `:slug`), the same choice
+  # `contract/tenant_isolation_matrix_test.rb` makes and for the same reason: a
+  # table written in the OpenAPI document's spelling (`{id}`) and compared against
+  # the router would report every parameterised route as both unclassified and
+  # stale at once, and a reader could not tell which half was wrong.
+  ACCOUNT_SCOPED_ROUTES = {
+    [ "GET", "/v1/customers" ] => [ "list", "returns every customer of every account" ],
+    [ "POST", "/v1/customers" ] => [ "write", "takes `owner_type`/`owner_id` in the body" ],
+    [ "GET", "/v1/customers/:id" ] => [ "read", "resolves any customer by its uuid" ],
+    [ "PATCH", "/v1/customers/:id" ] => [ "update", "writes any customer by its uuid" ],
+
+    [ "GET", "/v1/plans" ] => [ "list", "returns the whole catalogue" ],
+    [ "POST", "/v1/plans" ] => [ "write", "writes the catalogue" ],
+    [ "GET", "/v1/plans/:slug" ] => [ "read", "reads the catalogue by handle" ],
+    [ "PATCH", "/v1/plans/:id" ] => [ "update", "writes the catalogue by uuid" ],
+
+    [ "GET", "/v1/subscriptions" ] => [ "list", "returns every subscription of every account" ],
+    [ "POST", "/v1/subscriptions" ] => [ "write", "takes a `customer_id` in the body, in any account" ],
+    [ "GET", "/v1/subscriptions/:id" ] => [ "read", "resolves any subscription by its uuid" ],
+    # The two mutating ones. Reading another account's row is a disclosure;
+    # cancelling one is a write to it, and it is the expensive direction.
+    [ "POST", "/v1/subscriptions/:id/cancel" ] => [ "update", "cancels whichever subscription the path names" ],
+    [ "POST", "/v1/subscriptions/:id/change_plan" ] => [ "update", "moves whichever subscription the path names onto another plan" ],
+    [ "GET", "/v1/subscriptions/:id/entitlements" ] => [ "read", "reads another account's entitlements" ]
+  }.freeze
+
+  # The one `/v1` operation that is served and is **not** account-scoped.
+  #
+  # Named rather than filtered out of the comparison below, because a filter
+  # would go stale silently and then exclude whatever was added at that path
+  # next. It authenticates the *processor* by signature, not a cafaye client, and
+  # it must never grow a token check: a `Bearer` on that path would be a second,
+  # weaker trust path to the same door.
+  NOT_ACCOUNT_SCOPED_ROUTES = {
+    [ "POST", "/v1/webhooks/stripe" ] =>
+      "authenticates the processor by signature, not a cafaye client, and must never grow a token check"
+  }.freeze
+
+  # Every data access in `app/`, keyed by `path`, the method it sits in, and its
+  # kind, with a statement of what it touches.
+  #
+  # The second half is not decoration: an access with no stated reason is an
+  # access nobody thought about, which is exactly how `/v1/subscriptions` came to
+  # return every row.
+  DATA_ACCESSES = {
+    # --- the /v1 surface -----------------------------------------------------
+    [ "app/controllers/v1/customers_controller.rb", "index", "list" ] => "reads every customer of every account",
+    [ "app/controllers/v1/customers_controller.rb", "create", "write" ] => "creates a customer for a named owner",
+    [ "app/controllers/v1/customers_controller.rb", "update", "update" ] => "writes any customer by its uuid",
+    [ "app/controllers/v1/customers_controller.rb", "customer_record", "read" ] => "resolves any customer by its uuid",
+    [ "app/controllers/v1/plans_controller.rb", "index", "list" ] => "reads the whole catalogue",
+    [ "app/controllers/v1/plans_controller.rb", "create", "write" ] => "creates a catalogue row",
+    [ "app/controllers/v1/plans_controller.rb", "show", "read" ] => "resolves a catalogue row by its slug",
+    [ "app/controllers/v1/plans_controller.rb", "plan_record", "read" ] => "resolves a catalogue row by its uuid",
+    [ "app/controllers/v1/plans_controller.rb", "update", "update" ] => "writes a catalogue row by its uuid",
+    [ "app/controllers/v1/subscriptions_controller.rb", "index", "list" ] => "reads every subscription of every account",
+    [ "app/controllers/v1/subscriptions_controller.rb", "subscription_record", "read" ] => "resolves any subscription by its uuid",
+    [ "app/controllers/v1/subscriptions_controller.rb", "billable_customer", "read" ] => "resolves the customer the body names, in any account",
+    [ "app/controllers/v1/subscriptions_controller.rb", "sellable_plan", "read" ] => "resolves the plan the body names",
+    [ "app/controllers/v1/subscriptions_controller.rb", "cancel", "update" ] => "asks the processor to cancel any subscription the path names",
+    [ "app/controllers/v1/subscriptions_controller.rb", "change_plan", "update" ] => "asks the processor to move any subscription the path names",
+
+    # --- the processor delivery path, where an account is resolved from an id -
+    [ "app/services/subscriptions/lifecycle.rb", "call", "read" ] => "resolves the row a delivery writes, by the processor's subscription id",
+    [ "app/services/subscriptions/lifecycle.rb", "customer", "read" ] => "resolves a customer from a delivery, by cafaye id or by Stripe id",
+    [ "app/services/subscriptions/lifecycle.rb", "plan", "read" ] => "resolves a plan from a delivery by its Stripe price id",
+    [ "app/services/subscriptions/lifecycle.rb", "apply", "write" ] => "builds the subscription row a delivery created",
+    [ "app/services/subscriptions/lifecycle.rb", "apply", "update" ] => "writes the resolved customer's account onto that row",
+
+    # --- the outbox, one writer per producer --------------------------------
+    [ "app/models/customer.rb", "publish_created", "write" ] => "writes `billing.customer.created` for the created customer",
+    [ "app/models/plan.rb", "publish_created", "write" ] => "writes `billing.plan.created`",
+    [ "app/models/plan.rb", "publish_updated", "write" ] => "writes `billing.plan.updated`",
+    [ "app/services/webhooks/ingestion.rb", "emit", "write" ] => "writes whichever event the delivery's resolved account produced",
+
+    # --- the keyset every list goes through ----------------------------------
+    [ "app/controllers/concerns/cursor_paging.rb", "apply_cursor", "list" ] => "applies a client-supplied keyset to a relation the caller chose",
+
+    # --- the two declared joins, counted because an association is a query ----
+    [ "app/models/subscription.rb", "belongs_to :customer", "read" ] => "declares the join to the account-scoped customer row",
+    [ "app/models/subscription.rb", "belongs_to :plan", "read" ] => "declares the join to the catalogue row the subscription is billed against",
+
+    # --- the declared queries, for the same reason ---------------------------
+    # Five scopes on two tenant tables. None is account-scoped *today* — they are
+    # status and publication predicates — and they are still counted, because a
+    # scope is a query and a scope added tomorrow carrying `where(account_id:` is
+    # the single most likely shape for the account scoping this packet is waiting
+    # on. Leaving the category out of the enumeration is how the enumeration stops
+    # being one.
+    [ "app/models/subscription.rb", "scope :live", "list" ] => "resolves a subscription's live rows, across accounts",
+    [ "app/models/subscription.rb", "scope :canceled", "list" ] => "resolves a subscription's canceled rows, across accounts",
+    [ "app/models/outbox_event.rb", "scope :unpublished", "list" ] => "resolves unpublished outbox rows, whose payloads carry every account's events",
+    [ "app/models/outbox_event.rb", "scope :oldest_first", "list" ] => "orders outbox rows for the publisher loop, which does not exist yet",
+    [ "app/models/outbox_event.rb", "scope :for_processor_event", "list" ] => "resolves outbox rows by a processor event id, never by an account"
+  }.freeze
+
+  # Every file under `app/` that performs **no** data access, with the reason.
+  #
+  # Not a filter: an empty table would exit 0 having checked nothing, and a new
+  # file that touches no row would join the surface without anybody saying so.
+  # Two assertions below hold this closed in both directions.
+  NO_DATA_ACCESS = {
+    "app/controllers/application_controller.rb" => "assembles the shared response concerns; it queries nothing",
+    "app/controllers/concerns/idempotent_requests.rb" => "replays a response this service already sent, keyed on the request's own idempotency key",
+    "app/controllers/concerns/problem_responses.rb" => "renders problem documents for a status a controller chose",
+    "app/controllers/concerns/request_trace_id.rb" => "stamps a trace id on a response; it queries nothing",
+    "app/controllers/errors_controller.rb" => "renders a problem document for a status Rails raised; it queries nothing",
+    "app/controllers/health_controller.rb" => "the readiness probe reads a connection, not a tenant's rows",
+    "app/controllers/v1/base_controller.rb" => "the uuid shape check on a path segment; it runs before the query, on purpose",
+    "app/controllers/webhooks/base_controller.rb" => "the webhook's shared signature seam; it queries nothing",
+    "app/controllers/webhooks/stripe_controller.rb" => "verifies the raw body and hands it to ingestion; every row it implies is ingestion's",
+    "app/jobs/application_job.rb" => "the abstract base class; it declares no query",
+    "app/lib/idempotency_key_reused.rb" => "the error a replayed key raises; it holds no query",
+    "app/lib/identifiers.rb" => "the uuid shape in one place; it reads no model",
+    "app/lib/money_params.rb" => "turns a request body into an amount; it reads no model",
+    "app/lib/parameter_error.rb" => "the error a bad query parameter raises; it holds no query",
+    "app/lib/problem.rb" => "the problem vocabulary, a frozen table of codes and no model access",
+    "app/mailers/application_mailer.rb" => "the abstract base class; it declares no query",
+    "app/models/application_record.rb" => "the abstract base class; it declares no scope",
+    "app/models/idempotency_key.rb" => "keyed on the request's own idempotency key, which is a client's, not an account's. Its `scope :expired` is a ttl and touches no tenant row, which is why a scope on a non-tenant model is not counted.",
+    "app/models/money.rb" => "the money primitive; it reads no model",
+    "app/models/processor_webhook.rb" => "the receipt model; its one write is `ingest`, addressed by the processor's event id",
+    "app/services/processor.rb" => "the processor namespace; it declares no query",
+    "app/services/processor/stripe_client.rb" => "builds and sends the three processor requests; the row each acts on was resolved by the caller",
+    "app/services/subscriptions.rb" => "the subscriptions namespace; it declares no query",
+    "app/services/subscriptions/plan_change.rb" => "compares two prices and decides timing; pure, no model access",
+    "app/services/subscriptions/state_machine.rb" => "a from-status and a to-status in, an answer out; pure, no model access",
+    "app/services/webhooks.rb" => "the webhooks namespace; it declares no query",
+    "app/services/webhooks/emission.rb" => "the value object a handler returns; it holds no query",
+    "app/services/webhooks/stripe_events.rb" => "normalizes a payload and names an emission; the row lookups it implies are the lifecycle's, classified above"
+  }.freeze
+
+  # --- the derivation --------------------------------------------------------
+
+  # A data access found in the source: the file, the method, the kind, and the
+  # expression that performed it. One scan of `app/`, so the tables above are
+  # compared against the code rather than against a list somebody has to remember
+  # to update.
+  Access = Data.define(:path, :method, :kind, :expression) do
+    # The `(path, method)` pair — the unit a reader thinks in.
+    def site = [ path, method ]
+
+    # The full key, kind included, because one method can perform two kinds.
+    def key = [ path, method, kind ]
+
+    def to_s = "#{path}##{method} (#{expression}, #{kind})"
+  end
+
+  # The expressions that perform a data access, per kind. A table rather than one
+  # large regexp, so a new shape is a new entry a reader can see.
+  #
+  # `assign_attributes` is in the list because it is a write to a row that already
+  # exists and nothing else in it says so: a `find` followed by a `save` is two
+  # accesses, and only one of them is a resolution.
+  #
+  # `scope.where` is `CursorPaging#apply_cursor` and nothing else in the
+  # repository, written out rather than matched as a bare `where` because a bare
+  # `where` would also match a hash condition on a model scope, which is not a
+  # separate entry point — it is a predicate on one already listed.
+  #
+  # `belongs_to` is counted as a **declared** join. The two in `Subscription` are
+  # the only ones, and the method name is the whole declaration because a
+  # `belongs_to` is not inside a `def`.
+  #
+  # `scope` is counted for the same reason, and is the shape account scoping is
+  # most likely to arrive in — `scope :for_account, ->(id) { where(account_id: id) }`
+  # — so a scope nobody classified has to fail here rather than becoming the first
+  # account-scoped query in the service with no entry point and no negative test.
+  #
+  # Matched on the **declaration** rather than on the body, and that is not a
+  # simplification. `scope :oldest_first, -> { order(:created_at, :id) }` has no
+  # `where` in it at all, and `scope :for_processor_event` puts its `where` on the
+  # line *after* the arrow — so a pattern looking for a body would find two of the
+  # five and miss both, in the same way, on the same line. Every scope returns a
+  # relation and every relation is a collection read, so `list` is the correct kind
+  # for all of them and no body needs reading.
+  ACCESS_EXPRESSIONS = [
+    [ "read",   /\b(?:Customer|Plan|Subscription)\.(?:find|find_by|find_by!)\(/ ],
+    [ "read",   /\bbelongs_to\s+:[a-z_]/ ],
+    [ "list",   /\b(?:Customer|Plan|Subscription)\.all\b/ ],
+    [ "list",   /\bscope\s+:[a-z_]+,\s*->/ ],
+    [ "list",   /\bscope\.where\(/ ],
+    [ "write",  /\b(?:Customer|Plan|Subscription)\.new\b/ ],
+    [ "write",  /\bOutboxEvent\.publish!/ ],
+    [ "update", /\bassign_attributes\b/ ],
+    [ "update", /\bprocessor\.(?:cancel_subscription|apply_plan_change)\(/ ]
+  ].freeze
+
+  # The patterns that only count **on a tenant model**. `scope` is one of them,
+  # and the reason is `IdempotencyKey`: it has a `scope :expired`, and counting it
+  # would put a fourth model in the tenant-data set and quietly contradict the
+  # three-model pin above — a model that touches no tenant row is not tenant data
+  # because it declares a query.
+  #
+  # So the check is on the **declaring class**, read out of the file, rather than
+  # on the file's path. A path list would have to be edited every time a model
+  # moved, and the one time somebody forgets is the one that matters.
+  TENANT_MODEL_ONLY_EXPRESSIONS = [
+    [ "read",   /\bbelongs_to\s+:[a-z_]/ ],
+    [ "list",   /\bscope\s+:[a-z_]+,\s*->/ ]
+  ].freeze
+
+  class << self
+    def accesses
+      @accesses ||= source_files.flat_map { |path| accesses_in(path) }
+    end
+
+    def source_files
+      @source_files ||= Dir[Rails.root.join("app/**/*.rb")].sort.map { |path|
+        Pathname(path).relative_path_from(Rails.root).to_s
+      }
+    end
+
+    private
+      # One pass per file, tracking the innermost `def` seen so far, so each match
+      # is attributed to the method a reader would name. A class-level
+      # `create!` lands under the class name; a `belongs_to`, which is not inside
+      # a `def`, lands under its own declaration.
+      def accesses_in(path)
+        found = []
+        method = "(file scope)"
+        source = Rails.root.join(path).read
+        patterns = patterns_for(source)
+
+        source.each_line.with_index(1) do |line, _number|
+          if (named = line.match(/^\s*def\s+(?:self\.)?([a-z_][A-Za-z0-9_]*[?!]?)/))
+            method = named[1]
+          elsif (declaration = line.match(/^\s*belongs_to\s+:([a-z_]+)/))
+            method = "belongs_to :#{declaration[1]}"
+          elsif (declaration = line.match(/^\s*scope\s+:([a-z_]+)/))
+            method = "scope :#{declaration[1]}"
+          end
+          next if line.strip.start_with?("#")
+
+          patterns.each do |kind, pattern|
+            match = pattern.match(line)
+            next unless match
+
+            found << Access.new(path, method, kind, match[0].sub(/\($/, "").strip)
+            break
+          end
+        end
+
+        found
+      end
+
+      # The patterns that apply to this file. A declaration is only counted when
+      # the class declaring it is one of the tenant models, so
+      # `IdempotencyKey#scope :expired` is not a tenant-data access and
+      # `Subscription#belongs_to :customer` is.
+      #
+      # `declaring_model` is the check, not the path: `idempotency_key.rb` declares
+      # `class IdempotencyKey < ApplicationRecord`, which is not in `TENANT_MODELS`,
+      # so its scope drops out — and `IdempotencyKey` has a comment saying in as
+      # many words that it is keyed on the client's own idempotency key and not on
+      # an account. Counting it would put a fourth model in the tenant-data set and
+      # quietly contradict the three-model pin.
+      def patterns_for(source)
+        declares_tenant_query = source.match?(/\b(?:belongs_to\s+:|scope\s+:[a-z_]+,\s*->)/)
+        return ACCESS_EXPRESSIONS if declares_tenant_query && declared_tenant_model?(source)
+
+        ACCESS_EXPRESSIONS - TENANT_MODEL_ONLY_EXPRESSIONS
+      end
+
+      def declared_tenant_model?(source)
+        (TENANT_MODELS + PAYLOAD_TENANT_MODELS).include?(declaring_model(source))
+      end
+
+      # The ApplicationRecord subclass this file declares, or nil. Read from the
+      # source rather than inferred from the path, so moving a model between
+      # directories does not change what it is counted as.
+      def declaring_model(source)
+        source[/^class\s+([A-Z][A-Za-z0-9_]*)\s*<\s*ApplicationRecord/, 1]
+      end
+  end
+
+  # --- the two directions, for the data accesses -----------------------------
+
+  # The direction that finds things. A data access in `app/` that no table claims
+  # is an entry point whose scope nobody decided, and the next person to read the
+  # diff will not notice it either.
+  test "every data access in app is an account-scoped entry point" do
+    unclassified = self.class.accesses.reject { |access| DATA_ACCESSES.key?(access.key) || NO_DATA_ACCESS.key?(access.path) }
+
+    assert_empty unclassified.map(&:to_s),
+      "these data accesses are in app/ and in no table. Decide whether each is " \
+      "account-scoped: add it to DATA_ACCESSES with its kind and what it touches, or " \
+      "name the file in NO_DATA_ACCESS with the reason it is not."
+  end
+
+  # The other direction, and the one that keeps the table from rotting. A row for
+  # a method that has gone away excludes nothing today and will exclude whatever
+  # is added at that method next, which is why a stale row fails.
+  test "every entry point this matrix classifies is one the source still has" do
+    assert_empty classified_sites - self.class.accesses.map(&:site).uniq,
+      "these entry points are classified for a method that no longer exists. A method " \
+      "that went away takes its scope classification with it."
+  end
+
+  # The third direction, and the one that catches the interesting edit: a method
+  # that already exists and has **grown an access of a kind this table does not
+  # claim for it**. `apply` building a row and then writing to it is the case the
+  # kind-in-the-key exists for; without this check, adding a `find` to a
+  # classified `list` method would be silently swallowed.
+  test "every data access's kind is one this matrix claims for that method" do
+    # `DATA_ACCESSES.keys`, not the hash itself: `group_by` over a Hash yields
+    # `[key, value]` pairs, and destructuring a three-element key out of a
+    # two-element pair silently files every row under `path = [path, method, kind]`
+    # and leaves the lookup empty — which fails every access at once and looks
+    # like a total absence of classification rather than a broken predicate.
+    claimed = DATA_ACCESSES.keys.group_by { |path, method, _kind| [ path, method ] }
+      .transform_values { |rows| rows.map { |(_path, _method, kind)| kind } }
+
+    unclaimed = self.class.accesses.reject { |access| claimed.fetch(access.site, []).include?(access.kind) }
+
+    assert_empty unclaimed.map(&:to_s),
+      "these accesses are in a method this matrix classifies, but at a kind it does not " \
+      "claim for it. A method that grew an access of another kind needs its own row."
+  end
+
+  # --- the counts the report quotes ------------------------------------------
+
+  # **33 data accesses, in 31 methods, filed under 32 keys.** All three numbers
+  # are asserted, and neither gap between them is a rounding of the one above.
+  # Two methods do two things, for two different reasons:
+  #
+  #   * `Subscriptions::Lifecycle#customer` performs **two lookups** —
+  #     `Customer.find_by(id: cafaye_customer_id)` and
+  #     `Customer.find_by(processor_customer_id:)` — under one description,
+  #     because one row can be found by either identifier and a delivery may
+  #     carry only one. So there are more accesses than keys.
+  #   * `Subscriptions::Lifecycle#apply` builds a row that did not exist **and**
+  #     writes to the one that did, so it has two keys. So there are more keys
+  #     than methods.
+  #
+  # A single number would have hidden both, and both are the shape of the code.
+  test "there are 33 account-scoped data accesses in 31 methods, filed under 32 keys" do
+    assert_equal 33, self.class.accesses.size
+    assert_equal 31, classified_sites.size
+    assert_equal 32, DATA_ACCESSES.size
+
+    assert_equal 1, self.class.accesses.size - DATA_ACCESSES.size,
+      "the gap between accesses and keys has changed. It is 1 because `Lifecycle#customer` " \
+      "does two lookups under one description; a different number means a method is doing " \
+      "something the table no longer describes."
+
+    assert_equal 1, DATA_ACCESSES.size - classified_sites.size,
+      "the gap between keys and methods has changed. It is 1 because `Lifecycle#apply` " \
+      "both creates and writes; a different number means a method is doing something the " \
+      "table no longer describes."
+  end
+
+  # The per-operation breakdown, tallied from **the source** rather than from the
+  # table, so a mislabelled row cannot make the headline agree with itself. The
+  # zero kinds are filled in explicitly because `tally` omits an absent key, and
+  # a breakdown that quietly lost `delete` is the one breakdown this file exists
+  # to keep honest.
+  test "the data-access breakdown is read 12, list 9, write 7, update 5, delete 0" do
+    assert_equal({ "read" => 12, "list" => 9, "write" => 7, "update" => 5, "delete" => 0 }, breakdown(self.class.accesses.map(&:kind)))
+  end
+
+  # **14 account-scoped routes**, derived from the router, in the same four kinds.
+  # This is the caller-facing count, and unlike the one above it does not change
+  # when a helper is extracted.
+  test "there are 14 account-scoped routes, and the router serves exactly them plus the webhook" do
+    assert_equal 14, ACCOUNT_SCOPED_ROUTES.size
+    assert_equal served_routes.to_set,
+                 (ACCOUNT_SCOPED_ROUTES.keys + NOT_ACCOUNT_SCOPED_ROUTES.keys).to_set
+  end
+
+  # The two route tables must not both claim the same operation. Where they
+  # overlap, neither half can be right.
+  test "no route is both account-scoped and not" do
+    assert_empty (ACCOUNT_SCOPED_ROUTES.keys & NOT_ACCOUNT_SCOPED_ROUTES.keys).map { |method, path| "#{method} #{path}" }
+  end
+
+  test "every route that is not account-scoped says why it is not" do
+    unexplained = NOT_ACCOUNT_SCOPED_ROUTES.select { |(_operation), reason| reason.to_s.strip.empty? }
+
+    assert_empty unexplained.keys.map { |method, path| "#{method} #{path}" },
+      "these routes are excluded with no reason"
+  end
+
+  test "the route breakdown is read 4, list 3, write 3, update 4, delete 0" do
+    assert_equal({ "read" => 4, "list" => 3, "write" => 3, "update" => 4, "delete" => 0 },
+                 breakdown(ACCOUNT_SCOPED_ROUTES.values.map(&:first)))
+  end
+
+  # The two layers side by side, so a reader has one place to check that the
+  # packet's headline is two separately-asserted numbers and not one sum that
+  # double-counts a route against the method that serves it.
+  test "the two layers are counted separately, because a route and the method that serves it overlap" do
+    assert_equal 14, ACCOUNT_SCOPED_ROUTES.size
+    assert_equal 33, self.class.accesses.size
+    refute_equal ACCOUNT_SCOPED_ROUTES.size, self.class.accesses.size,
+      "the two layers have converged, which means one of them is counting the other's rows"
+  end
+
+  # --- delete is zero, and that is a fact about the service ------------------
+
+  # Nothing in `app/` destroys or deletes a row, so there is no delete to scope
+  # and none to forget. A service that scopes its reads and forgets its deletes is
+  # the common shape, and this is the assertion that says the shape is not this
+  # one *today* — in the same commit a destroy is added, this fails and the new
+  # access has to be scoped.
+  #
+  # The route half is the same fact from the other side: the router serves no
+  # `DELETE` under `/v1` at all.
+  test "delete is zero in app, and the router serves no DELETE under /v1" do
+    destroyers = source_lines.select { |line| line.match?(/\b(?:destroy|destroy_all|delete_all)\b/) }
+
+    assert_empty destroyers,
+      "app/ now destroys a row. Destroying is a delete, it needs an account scope like " \
+      "any other access, and the breakdown in this file is now wrong: " \
+      "#{killers(destroyers).join(", ")}"
+
+    assert_empty served_routes.select { |method, _path| method == "DELETE" }.map { |_method, path| path },
+      "the router now serves a DELETE under /v1. A delete is an operation kind with its " \
+      "own scope, and it must be classified here and covered by a negative test."
+  end
+
+  # --- the claims the tables make about themselves ---------------------------
+
+  test "every account-scoped route names a kind this file knows" do
+    unknown = ACCOUNT_SCOPED_ROUTES.reject { |(_operation), (kind, _why)| KINDS.include?(kind) }
+
+    assert_empty unknown.keys.map { |method, path| "#{method} #{path}" },
+      "these routes name a kind outside #{KINDS.inspect}"
+  end
+
+  test "every account-scoped route says why it is account-scoped" do
+    unexplained = ACCOUNT_SCOPED_ROUTES.select { |(_operation), (_kind, why)| why.to_s.strip.empty? }
+
+    assert_empty unexplained.keys.map { |method, path| "#{method} #{path}" },
+      "these routes are account-scoped with no reason given. A route with no stated " \
+      "reason is a route nobody thought about."
+  end
+
+  test "every data access names a kind this file knows" do
+    unknown = DATA_ACCESSES.keys.reject { |(_path, _method, kind)| KINDS.include?(kind) }
+
+    assert_empty unknown.map { |path, method, kind| "#{path}##{method} (#{kind})" },
+      "these data accesses name a kind outside #{KINDS.inspect}"
+  end
+
+  test "every data access says what it touches" do
+    unexplained = DATA_ACCESSES.select { |(_path, _method, _kind), what| what.to_s.strip.empty? }
+
+    assert_empty unexplained.keys.map { |path, method, kind| "#{path}##{method} (#{kind})" },
+      "these data accesses have no explanation. An access with no stated reason is an " \
+      "access nobody thought about."
+  end
+
+  test "every file excluded from the scan says why it is excluded" do
+    unexplained = NO_DATA_ACCESS.select { |_path, reason| reason.to_s.strip.empty? }
+
+    assert_empty unexplained.keys, "these files are excluded with no reason"
+  end
+
+  # The exclusion list is closed in **both** directions. A new file under `app/`
+  # that performs no data access and is not named here fails, which is what makes
+  # the scan total; and a file named as performing none that grows one fails the
+  # other way, which stops the list becoming a place to hide an access.
+  test "every file in app either performs a data access or is named with a reason" do
+    performing = self.class.accesses.map(&:path).uniq
+
+    assert_empty self.class.source_files - performing - NO_DATA_ACCESS.keys,
+      "these files perform no data access and are not named in NO_DATA_ACCESS. A file " \
+      "that touches no row does not need an account scope, but it does need to be said so."
+  end
+
+  test "no file excluded from the scan performs a data access" do
+    offenders = NO_DATA_ACCESS.keys.select { |path| self.class.accesses.any? { |access| access.path == path } }
+
+    assert_empty offenders,
+      "these files are excluded as performing no data access and now perform one. Give " \
+      "the access an entry point and a scope, and drop the exclusion."
+  end
+
+  # The tenant-data set is the same three models the contract matrix pins, plus the
+  # one model that carries an account in its payload without having the column.
+  test "the models this treats as tenant data are the three account-scoped ones" do
+    assert_equal %w[Customer Plan Subscription], TENANT_MODELS
+    assert_equal(
+      { "Customer" => Customer, "Plan" => Plan, "Subscription" => Subscription },
+      TENANT_MODELS.to_h { |name| [ name, name.constantize ] }
+    )
+  end
+
+  test "the payload-carrying set is the outbox alone, and it has no account column to scope by" do
+    assert_equal %w[OutboxEvent], PAYLOAD_TENANT_MODELS
+    refute_includes OutboxEvent.column_names, "account_id",
+      "the outbox grew an `account_id` column. That is the publisher loop's decision to " \
+      "make, and it would move OutboxEvent into TENANT_MODELS and give the outbox a " \
+      "column to scope a read by — at which point this file's outbox row is out of date."
+  end
+
+  private
+    def classified_sites
+      DATA_ACCESSES.keys.map { |path, method, _kind| [ path, method ] }.uniq
+    end
+
+    # A tally with every kind present, including the ones with no rows. `tally`
+    # omits an absent key, and the omitted key is the one this file most needs to
+    # state out loud.
+    def breakdown(kinds)
+      KINDS.index_with { |kind| kinds.count(kind) }
+    end
+
+    # `(method, router path)` for every `/v1` operation, in the router's spelling.
+    def served_routes
+      @served_routes ||= Rails.application.routes.routes.flat_map { |route|
+        path = route.path.spec.to_s.sub("(.:format)", "")
+        next [] unless path.start_with?("/v1")
+
+        methods_for(route).map { |method| [ method, path ] }
+      }.uniq
+    end
+
+    # `via: :all` draws a route with no verb constraint, which answers every
+    # method. The same expansion `contract/tenant_isolation_matrix_test.rb` uses,
+    # for the same reason: one vocabulary for "what the router serves".
+    def methods_for(route)
+      route.verb.empty? ? %w[GET HEAD POST PUT PATCH DELETE OPTIONS] : route.verb.split("|")
+    end
+
+    def source_lines
+      self.class.source_files.flat_map { |path| Rails.root.join(path).read.lines }
+    end
+
+    def killers(lines)
+      lines.map { |line| line.strip[0, 80] }
+    end
+end

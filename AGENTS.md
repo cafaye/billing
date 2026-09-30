@@ -95,6 +95,61 @@ Three packets, in order.
   asserted to be non-empty, because `/v1/subscriptions` returning every row is a
   gap that arrived by nobody writing it down.
 
+- **billing-12** is tenant isolation, and it is the packet that **measured** the
+  gap billing-08 recorded. `test/tenant/` is four files and one support module,
+  `+62 runs / +230 assertions`, and **nothing in `app/` changed** — because the
+  finding is that there is no account scoping here to make load-bearing, only a
+  total absence of measurement over a surface sold as multi-tenant.
+
+  What it holds, and each number is asserted rather than described: **14
+  account-scoped routes** (read 4, list 3, write 3, update 4, delete 0) and **33
+  account-scoped data accesses** in 31 methods (read 12, list 9, write 7, update
+  5, delete 0), with **31 negative tests** over them (read 15, list 4, write 3,
+  update 8, delete 1) out of **62 tests** in the directory. The rest are 20
+  structural tripwires about the enumeration and 11 `meta:` tests about the files
+  themselves; note that the two 31s are a coincidence and mean different things —
+  one is a count of access sites in `app/`, the other of negative tests. The two
+  layers of the packet's headline are counted separately on purpose, because a
+  route and the method that serves it overlap and summing them produces one number
+  that means nothing.
+
+  Four things in it are worth knowing before you touch `app/`:
+
+  * **The enumeration is derived, not maintained.**
+    `account_entry_point_matrix_test.rb` scans `app/` for every data access,
+    resolves each to the *method* it sits in (not the line — a comment would
+    renumber every site below it), and compares the result against its table in
+    **both directions**. A query nobody classified fails by name; a classified
+    entry point whose method has gone away fails the other way. Seven of the 33
+    are **declarations** — two `belongs_to`, five `scope` — counted because an
+    association and a scope are both queries, and `scope :for_account` is the
+    shape account scoping is most likely to arrive in.
+  * **A 403 is structurally impossible here, and that is the check.**
+    `Problem::CATALOG` is a frozen table and no entry has the status 403, so there
+    is no code path to render one — the guarantee is a property of a **closed
+    set**, not of a review. A second assertion scans `app/` for `403`,
+    `forbidden` and `:unauthorized`, which catches a controller reaching past the
+    catalog. **Absence, never refusal.** The 404 half was already right and is now
+    pinned: a resource that does not exist and an id that *cannot* name one are
+    the same seven-key answer on all three uuid-addressed resources.
+  * **The gap is pinned as a tripwire that fires when it closes.** Four tests
+    assert the surface is open — a customer and a subscription readable by uuid,
+    a customer **writable** by uuid, an unscoped listing — and each is coupled to
+    a count of account-constrained queries in `app/` that is **0 today**. The day
+    scoping lands, that count moves and **all four fail** saying to rewrite them
+    as 404s.
+  * **Three cross-tenant defects were found and reported, not fixed**, because
+    each is a change to money and none can be discharged inside the packet. F1: a
+    delivery reassigns a live subscription between accounts, because
+    `Lifecycle#apply` writes `account_id: customer.owner_id` and never compares it
+    to the account already on the row. F2: `customers.processor_customer_id` is
+    not unique and `POST`/`PATCH /v1/customers` both permit it, which is what
+    makes F1 reachable through this service's own surface. F3: the same shape on
+    `plans.processor_price_id`. Each is asserted **as a finding**, so each test is
+    a tripwire that goes red **when it is fixed** — a finding test that survives
+    its own fix is a test nobody will trust next time. See
+    `REPORT-billing-12-isolation.md`.
+
 billing-05 changes a claim the earlier packets made, so it is stated plainly:
 **this service now talks to Stripe.** It did not, and saying so was true when it
 was written. A subscription is bought through a Checkout Session, cancelled by
@@ -155,12 +210,20 @@ billing/
 │   ├── models/                        # minitest, table-driven
 │   │   └── outbox_processor_event_id_migration_test.rb # reversibility, run for real
 │   ├── requests/v1/                   # the API specs
-│   └── services/                      # the lifecycle, the client, the webhook mapping
-│       └── webhooks/
-│           └── concurrent_delivery_test.rb  # the duplicate-charge race, deterministically
+│   ├── services/                      # the lifecycle, the client, the webhook mapping
+│   │   └── webhooks/
+│   │       └── concurrent_delivery_test.rb  # the duplicate-charge race, deterministically
+│   ├── support/                       # shared helpers: frozen clock, fake Stripe, two accounts
+│   │   └── two_accounts.rb            # the pair every isolation spec compares against
+│   └── tenant/                        # the tenant boundary, enumerated and held
+│       ├── account_entry_point_matrix_test.rb # every account-scoped access, derived from app/
+│       ├── cross_account_delivery_test.rb     # the boundaries that hold, against Postgres
+│       ├── cross_account_web_test.rb          # the 404 shape, the 403 audit, the recorded gap
+│       └── cross_account_findings_test.rb     # the three cross-tenant defects, as findings
 ├── .github/workflows/ci.yml           # calls kit's reusable workflow, plus the gate
 ├── CHANGELOG.md                       # every notable change, per Keep a Changelog
-└── REPORT-billing-09.md               # the race: evidence, fix, and what was not fixed
+├── REPORT-billing-09.md               # the race: evidence, fix, and what was not fixed
+└── REPORT-billing-12-isolation.md     # the tenant boundary: the count, and three findings
 ```
 
 ## Commands
@@ -462,16 +525,23 @@ Four things that are not obvious and that the file argues in full:
   deletes it, so the condition for retiring it is written into the file: kit's
   `ruby` job grows a `services`/`env` seam, **and** `rake coverage` exists here
   or kit stops running it.
-- **The suite size is held by equality, not as a floor.** `823 runs / 2299
+- **The suite size is held by equality, not as a floor.** `913 runs / 2598
   assertions / 0 skips` is the number asserted at the top of the workflow on this
   branch. master at `e63bb7a` was `763 / 2100`; the difference is billing-08's
-  hardening and billing-09's race fix, itemised in the workflow's own header so a
-  reviewer does not have to reconstruct it.
+  hardening, billing-09's race fix and billing-12's tenant isolation, itemised in
+  the workflow's own header so a reviewer does not have to reconstruct it.
   A floor would accept a suite that lost 200 tests, and the tests it would lose
   first are the money arithmetic and the webhook signatures. Adding a test turns
   CI red until
   `BASELINE_RUNS`/`BASELINE_ASSERTIONS` are raised **in the same commit** — that
   is the intended direction, and lowering one is not.
+
+  The header's own itemisation does **not** add up to its totals, and that is
+  written down in the file rather than propagated: the per-packet deltas sum to
+  147 against a claimed 150, and billing-08's claimed `45 / 99` does not match
+  its own bullets. The asserted totals are right — they are what `bin/prime`
+  prints — and it is the prose that has drifted. Raising a threshold and
+  correcting the prose about it are separate jobs.
 
 ### The tier that skips without you noticing
 
@@ -482,8 +552,8 @@ commit, same code, with `CORE_PATH` pointed at a checkout and then at nothing:
 
 | `CORE_PATH` | `test/contract` (the tier) | whole suite |
 |---|---|---|
-| a core checkout | 45 runs, 400 assertions, 0 skips | 823 runs, 2299 assertions, 0 skips |
-| pointing at nothing | 45 runs, 61 assertions, **19 skips** | 823 runs, 1956 assertions, **20 skips** |
+| a core checkout | 45 runs, 400 assertions, 0 skips | 913 runs, 2598 assertions, 0 skips |
+| pointing at nothing | 45 runs, 61 assertions, **19 skips** | 913 runs, 2255 assertions, **20 skips** |
 
 **Same run count, same exit code, and 343 assertions of contract checking simply
 not done.** A green run that did not notice would have reported "the outbox
@@ -673,7 +743,34 @@ environment, and the `pins` job fails the build if the workflow file ever gains 
   and a customer who cancels and returns has to be able to subscribe to the same
   plan again. Comparing the index's predicate to a string in the model would prove
   two texts agree, which is not the same fact; the specs insert two rows per
-  status pair and ask whether the database objects.
+  status pair and ask whether the database objects. **Both accounts in
+  `test/support/two_accounts.rb` deliberately share one plan**, because with a plan
+  each, `(account_id, plan_id)` would be satisfied by `plan_id` alone and a
+  dropped `account_id` from the index would go unnoticed.
+- **A cross-account spec must not print the other account's row.** "This write
+  changed nothing over there" is naturally written by comparing the records, and
+  on failure that dumps a whole other account's subscription, price and status
+  into CI output. `TwoAccounts#fingerprint` is a per-row `sha256` for that
+  reason: it says *byte-identical* without saying what the bytes were, and
+  `drifted_ids` names **which** ids moved. It is a hash keyed by id, not one
+  digest over a set — on a String, `before[record.id]` is a substring search,
+  `nil` for every uuid, so every row reports as drifted and the assertion is true
+  on every run including the runs it exists to catch. The HTTP specs use
+  `include?` with a sentence in the message rather than `assert_includes body,
+  sentinel`, for the same reason, and use **two** sentinels: writing a row the
+  value it already holds is a no-op, and a no-op cannot distinguish "the write
+  reached the other account" from "the write reached nobody".
+- **A data access added to `app/` is an entry point and fails the matrix by
+  name.** `test/tenant/account_entry_point_matrix_test.rb` scans `app/` and
+  compares the result against its table in both directions, so a new query does
+  not ship unclassified. The key is `path` + **method**, not line, so a comment
+  does not renumber the table — and the **kind** is part of the key, because
+  `Lifecycle#apply` both creates a row and writes to one and a
+  `(path, method)` key alone would have to pick between them and undercount. An
+  association and a `scope` are both queries and both count, **but only when the
+  declaring class holds tenant data** — which is checked on the *declaring class*
+  read out of the file, so `IdempotencyKey#scope :expired` stays out and the
+  three-model tenant-data pin stays true.
 - **A `uuid` column casts before a validation sees it.** `"not-a-uuid"` assigned to
   a `uuid` attribute becomes `nil`, so a shape validation on such a column is
   unreachable code that reads as if it were doing something. `Subscription#account_id`
@@ -716,6 +813,30 @@ environment, and the `pins` job fails the build if the workflow file ever gains 
   why a `User`-owned customer is refused by that endpoint — which account a user
   belongs to is identity's fact, and no event carrying it is in this build's
   `consumes`.
+
+  **billing-12 measured this rather than restating it**, and the counts are in
+  `test/tenant/`: 14 account-scoped routes and 33 account-scoped data accesses,
+  of which **zero carry an account scope**, against two constraints that do hold
+  (`(account_id, plan_id)` on live subscriptions, and one customer per
+  `(owner, processor)`). **Three cross-tenant defects were found on the delivery
+  path and reported, not fixed** — F1, F2 and F3 in
+  `REPORT-billing-12-isolation.md`. Read that report before adding a field to
+  `CustomerUpdate` or `PlanUpdate`: `processor_customer_id` and
+  `processor_price_id` are permitted on the client's **own** row precisely because
+  `owner` and `processor` are not, and they are the whole of F2's attack surface.
+  When scoping lands, the four `gap:` tests in `cross_account_web_test.rb` fail
+  by design — rewrite them as 404s, do not delete them.
+- **A 403 is never the answer here, and the vocabulary enforces it.**
+  `Problem::CATALOG` is a frozen table with **no entry of status 403**, so this
+  service has no code path to render one; the guarantee is a property of a closed
+  set rather than of a review, and `test/tenant/cross_account_web_test.rb` also
+  scans `app/` for `403`, `forbidden` and `:unauthorized`. **A resource the
+  caller cannot see must be indistinguishable from one that does not exist** — a
+  403 says "this exists, you may not have it", which is an enumeration oracle.
+  Absence, or a nil at the query. Do not add a 403 to this service, and do not
+  add a 404 to `/v1` to make the open surface *look* closed: without a caller
+  there is no other account, so a 404 would refuse a legitimate request and break
+  every client while pretending to be a security fix.
 - **`/v1/webhooks/stripe` is the one authenticated path, by signature.** It
   authenticates the *processor*, not a cafaye client, and it is declared in
   `openapi/v1.yaml` under the `webhooks` tag with its own `200`/`400`/`503`
@@ -808,6 +929,14 @@ environment, and the `pins` job fails the build if the workflow file ever gains 
       that covers every status fails if any of the four is missing
 - [ ] Anything published is in `cafaye.yml`, in `OutboxEvent::TYPES`, and in
       core's catalog — or the gap is written down in both places
+- [ ] A data access added to `app/` is classified in
+      `test/tenant/account_entry_point_matrix_test.rb`, with its kind and what it
+      touches — and a `scope` or association added to a tenant model is too
+- [ ] Nothing added a 403, and nothing made the open surface *look* closed with a
+      404: absence, never refusal
+- [ ] Every guard in this packet has been seen red, and the mutation is reported
+      — "I broke it on purpose and it noticed" and "I think it would notice" are
+      different claims
 - [ ] Lint and security scans are green, and nothing was disabled to get there
 - [ ] `AGENTS.md` still describes the repository as it now is
 - [ ] `CHANGELOG.md` has an entry

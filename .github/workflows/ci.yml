@@ -20,13 +20,22 @@
 #
 # THE BASELINE THIS FILE HOLDS
 #
-#   **851 runs, 2368 assertions, 0 failures, 0 errors, 0 skips** — measured on
-#   this branch, with billing-08's hardening and billing-09's race fix. The
-#   numbers below are that line, asserted.
+#   **913 runs, 2598 assertions, 0 failures, 0 errors, 0 skips** — measured on
+#   this branch, with billing-08's hardening, billing-09's race fix and
+#   billing-12's tenant-isolation packet. The numbers below are that line,
+#   asserted.
 #
 #   master at `e63bb7a` was 763 / 2100, and this packet started from there. The
 #   whole difference, so that a reviewer does not have to reconstruct it:
 #
+#   - **+62 runs, +230 assertions — billing-12's tenant isolation.** Four new
+#     files under `test/tenant/` (20 + 18 + 16 + 8 runs, 45 + 55 + 101 + 29
+#     assertions) and one new support module that contributes no tests of its own.
+#     The 20 are the derived entry-point matrix, which reads `app/` and compares
+#     the classification in both directions; the other 42 are negative tests, four
+#     of which reproduce the cross-tenant defects that packet reports rather than
+#     fixing. The packet's own count — entry points, negative tests, per-operation
+#     — is asserted in those files and in `REPORT-billing-12-isolation.md`.
 #   - **+45 runs, +99 assertions — billing-08's hardening.** The tenant-isolation
 #     matrix and the secrets-do-not-leak file are new files (19 and 10 runs);
 #     the non-object webhook bodies (9) and the money-precision cases (13) extend
@@ -156,13 +165,22 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # master at e63bb7a was 763 / 2100; this commit is billing-08's hardening and
-  # billing-09's race fix, which add 88 runs and 268 assertions. The gate asserts
-  # 849 runs / 2364 assertions / 0 failures / 0 errors / 0 skips against this, and
-  # every tier below carries its own count. Raising a number is allowed;
-  # lowering one is not.
-  BASELINE_RUNS: '851'
-  BASELINE_ASSERTIONS: '2368'
+  # master at e63bb7a was 763 / 2100; this commit is billing-08's hardening,
+  # billing-09's race fix and billing-12's tenant isolation, which together add 150
+  # runs and 498 assertions. The gate asserts 913 runs / 2598 assertions /
+  # 0 failures / 0 errors / 0 skips against this, and every tier below carries its
+  # own count. Raising a number is allowed; lowering one is not.
+  #
+  # A note on the itemisation above, so the next packet does not inherit it: the
+  # three per-packet deltas as written sum to 147, not 150, and the two numbers the
+  # header claims for billing-08 (45/99) do not match what its own bullets add up
+  # to. The asserted totals are right — they are what `bin/prime` prints — and it is
+  # the prose above that has drifted. Correcting it is a separate job from raising
+  # the threshold, and this packet only raised. The one place where the drift was
+  # corrected is the webhook step's name, because that file had to be read anyway
+  # to find out what the tier actually asserted.
+  BASELINE_RUNS: '913'
+  BASELINE_ASSERTIONS: '2598'
 
 jobs:
   # ------------------------------------------------------------------ shared
@@ -694,15 +712,22 @@ jobs:
           echo "$summary"
           echo "::notice::the contract tier ran against core at $(git -C "$CORE_PATH" rev-parse --short HEAD)"
 
-      - name: tier — the webhook tier, signatures verified for real (147 tests)
+      - name: tier — the webhook tier, signatures verified for real (162 tests)
         # **The highest-value tests in this repository.** A forged amount is
         # believed if this tier is skipped, and a payment processor does not
         # re-send a delivery it has already made, so the failure has no retry to
-        # recover from. Four files, 147 tests: the HTTP edge
+        # recover from. Five files, 162 tests: the HTTP edge
         # (`integration/stripe_webhook_test.rb`), the subscription deliveries that
-        # write (`integration/subscription_delivery_test.rb`), and the two
+        # write (`integration/subscription_delivery_test.rb`), and the three
         # service-level halves (`services/webhooks/ingestion_test.rb`,
-        # `services/webhooks/stripe_events_test.rb`).
+        # `services/webhooks/stripe_events_test.rb`,
+        # `services/webhooks/concurrent_delivery_test.rb`).
+        #
+        # The step's name said 147 and the assertion below it said 162; the
+        # assertion is the one that is right, and it is what `bin/rails test`
+        # prints on those five files. Corrected here because this packet was
+        # already editing this file and a step name nobody can verify is worse
+        # than a wrong one — it reads like a measurement.
         #
         # The file list is written out rather than globbed so that the count below
         # is a claim about these four files, and a *new* webhook test file cannot
