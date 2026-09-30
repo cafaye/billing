@@ -11,12 +11,48 @@
 # and the CI job expect a database. If something else already holds 5432, change
 # the left-hand side and point DATABASE_URL at the new port.
 #
-# Pin postgres:17, not `latest`: a major bump changes default authentication and
-# locale behaviour, and a suite that passes today must not depend on which image
-# was cached when the test ran.
+# Pin postgres:17-alpine, not `latest`: a major bump changes default
+# authentication and locale behaviour, and a suite that passes today must not
+# depend on which image was cached when the test ran.
+#
+# `-alpine` because the platform standardises on one image fleet-wide. It is the
+# tag every running database container on this machine already uses and the
+# smallest current-major variant: 291MB against 477MB for the debian build of the
+# same major. The other postgres images have been dropped from the local docker
+# cache, so the debian tag this file used to name had to be re-pulled in full on
+# the next `compose up` to start a database that already ran here 291MB at a
+# time. `.github/workflows/ci.yml` pins the same tag, and the two are pinned
+# together on purpose — a compose file and a CI service on different images is
+# exactly the drift this pin removes.
+#
+# What the smaller build actually changes, recorded rather than assumed:
+#
+#   - **musl, not glibc — and the default collation follows.** This build is
+#     Alpine 3.24 on musl 1.2.6, and `pg_database` reports `datcollate` and
+#     `datctype` of `en_US.utf8` with `datlocprovider = 'c'` on every database it
+#     creates, because that is the image's `LANG`. Measured, not assumed: the
+#     reported name is the one thing that reads like glibc, but a sort through
+#     it returns byte order — `'Apple,Banana,Zebra,_under,apple,apple2,banana,
+#     cherry'`, identical to an explicit `COLLATE "C"` and different from
+#     `en-US-x-icu`. So on alpine this database's default collation sorts as C,
+#     where a glibc-built postgres:17 with the same `LANG` sorts case- and
+#     accent-insensitively. **Nothing in this repository depends on it**: every
+#     ordered read is `order(created_at:, id:)` — a timestamptz and a uuid, in
+#     `CursorPaging#paginate` and `OutboxEvent.oldest_first` — and no spec sorts
+#     a text column. That is a property of the code, not of the pin, and it is
+#     the first thing to re-check if a future packet adds a `name` or `slug`
+#     to an ordering.
+#   - **Authentication defaults are unchanged.** `POSTGRES_HOST_AUTH_METHOD: trust`
+#     below is explicit and the entrypoint honours it identically on both builds,
+#     so moving to alpine does not weaken or change how the local database
+#     authenticates.
+#   - **The data directory is still `/var/lib/postgresql/data`.** That default
+#     moves in PostgreSQL 18; it has not moved in 17, and the volume mount below
+#     is correct for this pin. Bumping the major is when that line needs
+#     re-reading, not this one.
 services:
   db:
-    image: postgres:17
+    image: postgres:17-alpine
     # fsync=off is acceptable here and nowhere else. This volume is scratch
     # space on a laptop; durability costs seconds on every write in the suite
     # and buys nothing that a `down -v` does not throw away anyway.
