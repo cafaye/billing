@@ -437,6 +437,15 @@ environment, and the `pins` job fails the build if the workflow file ever gains 
   in the *same* worktree — they race on the same per-worker databases, and a
   per-checkout database name separates worktrees from each other, not processes
   from each other. One checkout, one suite.
+- **A worker that dies abnormally makes the suite hang, not fail.** Rails runs
+  the parallel workers over DRb and
+  `ActiveSupport::Testing::Parallelization::Server#shutdown` waits with
+  `while active_workers?; sleep 0.1; end` for each one to deregister. A worker
+  killed before it can deregister is never reaped and the parent spins in that
+  sleep at teardown — **after** printing the summary line. So a green
+  `759 runs, 0 failures` followed by nothing is that, not a pass. Nothing
+  suppresses it: the job times out and goes red, and the count guard never
+  runs. Do not "fix" it with retries; find the worker that died.
 
 ## Conventions
 

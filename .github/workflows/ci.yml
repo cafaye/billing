@@ -62,11 +62,11 @@
 #      failure mode of its own rather than a convention.
 #   6. The lockfile guard is `Gemfile.lock`, and only billing can say so.
 #
-# WHAT IS EXPECTED TO BE RED TODAY, AND WHY IT IS STILL HERE
+# WHAT IS EXPECTED TO BE RED, AND WHY THE WORKFLOW IS STILL GREEN
 #
-#   The `ruby (kit)` job is expected to be red on master, on two steps, for
-#   reasons that live in kit's file and not in this one. Both were reproduced
-#   locally in this worktree, with the commands kit's job runs:
+#   The `ruby (kit)` job fails, on two steps, for reasons that live in kit's file
+#   and not in this one. Both were reproduced against **kit's own master**, at
+#   `4fe04fd9`, whose `ruby` job is byte-for-byte the one this file calls:
 #
 #   - `test` runs a bare `bundle exec rake`, whose default task in a Rails
 #     application is `test`. kit's ruby job declares no `services:` and sets no
@@ -74,6 +74,11 @@
 #     first test:
 #       PostgreSQLAdapter#new_client: There is an issue connecting with your
 #       hostname: 127.0.0.1. (ActiveRecord::DatabaseConnectionError)
+#     No job anywhere in kit's workflow declares a service container, and a
+#     caller cannot add one: GitHub allows only `name`, `uses`, `with`,
+#     `secrets`, `strategy`, `needs`, `if`, `concurrency` and `permissions` on a
+#     job that calls a reusable workflow. This is the structural reason the gate
+#     is a companion job and not this one, and it will not change from here.
 #   - `coverage` runs `bundle exec rake coverage`. billing has no `coverage`
 #     task, and does not want one: billing's coverage gate is 100% line *and*
 #     branch on the two files in `MoneyPathsCoverageTest::MONEY_PATHS`, measured
@@ -90,9 +95,18 @@
 #     repository did and is the only reason master was green.
 #
 #   So the tests are run in `gate`, the money-path coverage gate is enforced in
-#   `gate`, and this job is left as the call kit documents. Delete it when kit's
-#   ruby job grows a `services`/`env` seam — and not before, on the strength of
-#   a green `ruby (kit)` job, because there will not be one until then.
+#   `gate`, and this job is left as the call kit documents.
+#
+#   **The two failures are absorbed by `continue-on-error: true` on the job, and
+#   the required checks are `gate`, `security` and `pins`.** That is a decision
+#   with a real cost — the shared workflow is not currently a gate for this
+#   repository, only a call — and the cost is paid knowingly rather than
+#   discovered. The condition for retiring it is checkable and is written down at
+#   the job: kit's `ruby` job grows a `services:`/`env` seam, **and**
+#   `rake coverage` exists here or kit stops running it. When both hold,
+#   `continue-on-error` goes and this job becomes a required check in the same
+#   commit. Until then it buys the guarantee that a kit fix reaches billing
+#   without a per-repository pull request, which is the thing the call is for.
 name: ci
 
 on:
@@ -123,6 +137,32 @@ jobs:
   # ------------------------------------------------------------------ shared
   ruby:
     name: ruby (kit)
+    # **The two red steps are absorbed here, deliberately, and this is the line
+    # that makes the rest of the file honest.**
+    #
+    # A job that is expected to be red and is not marked for it makes the whole
+    # workflow red, and a workflow that is always red is a workflow nobody reads:
+    # `gate` going red has to be the only red anyone can see, or it is not a
+    # signal. `continue-on-error` keeps the job *running* and keeps its failure
+    # *visible* — Actions renders it as a failed-but-allowed check with its full
+    # log — while stopping it from blocking the branch. Nothing is suppressed and
+    # nothing is skipped: the two steps still execute, they still fail, and the
+    # log still says why.
+    #
+    # The branch protection this repository needs is the inverse of the usual
+    # advice: make `gate`, `security` and `pins` required checks and leave
+    # `ruby (kit)` out of the required set. That is the whole of the mechanism,
+    # and it is why removing this line would be wrong in the other direction —
+    # without it nothing merges, so the fix becomes "delete the kit call" and the
+    # packet's deliverable goes with it.
+    #
+    # **This is the only acceptable reading of it, and it expires.** A future kit
+    # whose `ruby` job has a `services`/`env` seam can make this job green, and
+    # when it does, `continue-on-error` is a lie that costs a lane of CI minutes
+    # and hides a real regression in the shared workflow. Delete this line in the
+    # same commit that makes `ruby (kit)` green, not later. The condition to
+    # check is in WHAT IS EXPECTED TO BE RED below.
+    continue-on-error: true
     # The `uses:` is the whole job. The `.github/workflows/` in that path is not
     # decoration: GitHub resolves a cross-repository reusable workflow at
     # `{owner}/{repo}/.github/workflows/{file}@{ref}` and documents that
@@ -368,27 +408,38 @@ jobs:
           bin/rails runner "$RUNNER_TEMP/eager_load_check.rb"
           echo "::notice::config.eager_load is on and every app/ file loaded"
 
-      - name: no processor credential in this job
+      - name: no processor credential in this job's environment
         # A CI environment is a place secrets leak *from*, so the absence is
         # checked rather than promised. `STRIPE_API_KEY` would be the one that
         # could turn a test into a real request to a real processor — and
         # `Processor::StripeClient` refuses to build a real client without it, so
-        # a suite that somehow got one would be making live calls. Neither
-        # variable is set by this workflow, and the webhook signing secret comes
-        # from `test/test_helper.rb`'s own constant, per run.
+        # a suite that somehow got one would be making live calls. The webhook
+        # signing secret comes from `test/test_helper.rb`'s own constant, per run.
+        #
+        # **The job environment, and nothing set over the top of it.** The first
+        # version of this step declared `STRIPE_API_KEY: ''` and
+        # `STRIPE_WEBHOOK_SECRET: ''` in its own `env:` and then asserted they
+        # were empty — a check that cannot fail, because the step had just
+        # emptied them. It would have gone on reporting "no processor credential"
+        # after a future edit put a real key in the job's `env:`, which is
+        # exactly the edit it existed to catch. There is deliberately no `env:`
+        # key here: what is asserted is what the job actually carries.
         shell: bash
-        env:
-          STRIPE_API_KEY: ''
-          STRIPE_WEBHOOK_SECRET: ''
         run: |
           set -euo pipefail
-          for name in STRIPE_API_KEY STRIPE_WEBHOOK_SECRET; do
+          leaked=0
+          for name in STRIPE_API_KEY STRIPE_WEBHOOK_SECRET STRIPE_WEBHOOK_SECRETS; do
             if [ -n "${!name:-}" ]; then
-              echo "::error::$name is set in this job. A processor key does not belong in CI." >&2
-              exit 1
+              echo "::error::$name is set in this job. A processor key does not" >&2
+              echo "  belong in CI: a CI log is retained, searchable and often" >&2
+              echo "  public, so a key here is a published key." >&2
+              leaked=1
             fi
           done
-          echo "::notice::no processor credential in this job"
+          if [ "$leaked" != 0 ]; then
+            exit 1
+          fi
+          echo "::notice::no processor credential in this job's environment"
 
       - name: bin/prime — the gate
         # `bin/prime`, unmodified: `bundle install`, `rails db:prepare`,
@@ -406,6 +457,21 @@ jobs:
         #
         # `tee` keeps the whole log and the guards below read it; `pipefail` (from
         # `shell: bash`) keeps a red suite red through the pipe.
+        #
+        # **A green log followed by silence is a hang, not a pass.** Rails runs
+        # this suite in parallel workers over DRb, and
+        # `ActiveSupport::Testing::Parallelization::Server#shutdown` waits with
+        # `while active_workers?; sleep 0.1; end` for every worker to deregister.
+        # A worker that dies without deregistering — a segfault in a native gem,
+        # a kill, an exit path that skips the call — is never reaped, and the
+        # parent spins in that sleep at process teardown **after** the summary
+        # line has been printed. Observed in this worktree with
+        # `pg-1.6.3-arm64-darwin` segfaulting in `connect_start`, which left the
+        # suite finished, green, and un-exiting. So: if this step stops printing
+        # and the job goes red on `timeout-minutes` with `759 runs, 2087
+        # assertions, 0 failures` already in the log above it, that is this, and
+        # the badge is not green. Nothing here masks it — the step never returns,
+        # so the count guard below never runs and the job is red.
         shell: bash
         run: |
           set -euo pipefail
@@ -435,8 +501,12 @@ jobs:
           LOG: ${{ runner.temp }}/prime.log
         run: |
           set -euo pipefail
-          # minitest 6's summary line, in two halves because the literal is 111
-          # characters and this file is linted at 120. Both halves are the whole
+          # minitest 6's summary line, in two halves: the literal is 76
+          # characters, and a 76-character assignment with a comment hanging off
+          # it is a line nobody re-reads. **Nothing lints this file** — billing
+          # ships no yamllint config and no YAML job — so the split is
+          # readability, and saying otherwise here would be the kind of claim
+          # that outlives the tool it names. Both halves are the whole
           # pattern; see the tier steps for why that is said out loud.
           pattern='[0-9]+ runs, [0-9]+ assertions,'
           pattern="$pattern"' [0-9]+ failures, [0-9]+ errors, [0-9]+ skips'
@@ -515,8 +585,12 @@ jobs:
             echo "::error::the contract tier exited $status" >&2
             exit "$status"
           fi
-          # minitest 6's summary line, in two halves because the literal is 111
-          # characters and this file is linted at 120. Both halves are the whole
+          # minitest 6's summary line, in two halves: the literal is 76
+          # characters, and a 76-character assignment with a comment hanging off
+          # it is a line nobody re-reads. **Nothing lints this file** — billing
+          # ships no yamllint config and no YAML job — so the split is
+          # readability, and saying otherwise here would be the kind of claim
+          # that outlives the tool it names. Both halves are the whole
           # pattern: dropping the leading run count would shift every field
           # offset below, which is the kind of quiet change nothing notices.
           pattern='[0-9]+ runs, [0-9]+ assertions,'
@@ -568,8 +642,12 @@ jobs:
             echo "::error::the webhook tier exited $status" >&2
             exit "$status"
           fi
-          # minitest 6's summary line, in two halves because the literal is 111
-          # characters and this file is linted at 120. Both halves are the whole
+          # minitest 6's summary line, in two halves: the literal is 76
+          # characters, and a 76-character assignment with a comment hanging off
+          # it is a line nobody re-reads. **Nothing lints this file** — billing
+          # ships no yamllint config and no YAML job — so the split is
+          # readability, and saying otherwise here would be the kind of claim
+          # that outlives the tool it names. Both halves are the whole
           # pattern: dropping the leading run count would shift every field
           # offset below, which is the kind of quiet change nothing notices.
           pattern='[0-9]+ runs, [0-9]+ assertions,'
@@ -642,8 +720,12 @@ jobs:
             echo "::error::the money-path coverage gate exited $status" >&2
             exit "$status"
           fi
-          # minitest 6's summary line, in two halves because the literal is 111
-          # characters and this file is linted at 120. Both halves are the whole
+          # minitest 6's summary line, in two halves: the literal is 76
+          # characters, and a 76-character assignment with a comment hanging off
+          # it is a line nobody re-reads. **Nothing lints this file** — billing
+          # ships no yamllint config and no YAML job — so the split is
+          # readability, and saying otherwise here would be the kind of claim
+          # that outlives the tool it names. Both halves are the whole
           # pattern: dropping the leading run count would shift every field
           # offset below, which is the kind of quiet change nothing notices.
           pattern='[0-9]+ runs, [0-9]+ assertions,'
