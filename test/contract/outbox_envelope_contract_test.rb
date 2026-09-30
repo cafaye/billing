@@ -430,40 +430,13 @@ class OutboxEnvelopeContractTest < ActiveSupport::TestCase
     assert_equal OutboxEvent::TYPES.sort, envelopes.map { |envelope| envelope.fetch("type") }.uniq.sort
   end
 
-  # The HTTP document and the routes have to agree, or the contract describes an
-  # API nobody can call. Read from the document and compared to the served routes,
-  # so a path added to one and not the other fails.
-  test "every path in the OpenAPI document is served, and every served path is described" do
-    document = YAML.load_file(Rails.root.join("openapi/v1.yaml"))
-    declared = document.fetch("paths").keys
-    served = Rails.application.routes.routes.filter_map { |route|
-      path = route.path.spec.to_s
-      next unless path.start_with?("/v1")
-
-      # `:slug` and `:id` both become `{name}`, because that is the only difference
-      # between a Rails path and an OpenAPI one and it is not a difference in the
-      # endpoint.
-      path.sub("(.:format)", "").gsub(/:([a-z_]+)/) { "{#{Regexp.last_match(1)}}" }
-    }.uniq
-
-    assert_empty declared - served, "documented but not served: #{(declared - served).inspect}"
-    assert_empty served - declared, "served but not documented: #{(served - declared).inspect}"
-  end
-
-  test "the OpenAPI document's version moved, because the document did" do
-    document = YAML.load_file(Rails.root.join("openapi/v1.yaml"))
-
-    # core's sync rule: a non-breaking addition bumps only `info.version`, never the
-    # `/v1` prefix. Asserted so a future packet that adds an endpoint and forgets to
-    # bump the document's own version is caught here rather than by a reader.
-    assert_equal "1.1.0", document.fetch("info").fetch("version")
-  end
-
-  test "the manifest declares an api, and the document it points at exists" do
-    api = manifest.fetch("exposes").fetch("api")
-
-    assert_path_exists Rails.root.join(api)
-  end
+  # The HTTP document, the router and the manifest are held to each other in
+  # `test/contract/http_surface_contract_test.rb`, which does not read core and
+  # so does not sit behind the `setup` above. The three checks this file used to
+  # carry for the document — every path served, `info.version`, `exposes.api` —
+  # moved there, and the first of them was replaced rather than moved: a
+  # path-only comparison cannot see `PUT /v1/customers/{id}`, which was served
+  # and documented nowhere until that packet.
 
   private
     # --- the fixtures under test: real emissions, not hand-built envelopes ---

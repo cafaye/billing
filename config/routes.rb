@@ -13,7 +13,19 @@ Rails.application.routes.draw do
   # which means a new prefix alongside this one — never this one mutated in
   # place (core's openapi-conventions.md).
   scope "/v1", module: :v1 do
-    resources :customers, only: %i[index create show update]
+    # Spelled out rather than generated, for one reason: `resources`' `update`
+    # draws **two** routes for one action — `PATCH` and `PUT` — and this
+    # service's update is a partial update. `CustomerUpdate` in the document says
+    # every field is optional and an absent field is left alone, and it closes
+    # the object: `owner` and `processor` are the key the uniqueness rule is built
+    # on, are not updatable at all, and moving a customer is a delete and a
+    # create. There is no whole-resource replacement here to put behind a `PUT`,
+    # so the route stops being drawn. It was served and in no document; see
+    # `test/contract/http_surface_contract_test.rb` and CHANGELOG.
+    get "customers", to: "customers#index"
+    post "customers", to: "customers#create"
+    get "customers/:id", to: "customers#show"
+    patch "customers/:id", to: "customers#update"
 
     # `plans` is spelled out rather than generated, because the two lookups are
     # addressed differently on purpose: read by slug, write by id. See

@@ -54,8 +54,13 @@ Three packets, in order.
   down in `cafaye.yml` as a DECISION NEEDED — core's subscription schemas
   describe the payload billing-03b emitted, and billing-04 moved those events
   onto billing's own ids.
+- **billing-07** is the document and the router, held to each other: one test
+  that compares `(method, path)` in both directions, replaces a path-only
+  comparison that could not see a verb, and found one operation
+  (`PUT /v1/customers/{id}`) that was served and in no document. It removed that
+  route rather than documenting it. No behaviour in `app/` changed.
 
-That last one changes a claim the earlier packets made, so it is stated plainly:
+billing-05 changes a claim the earlier packets made, so it is stated plainly:
 **this service now talks to Stripe.** It did not, and saying so was true when it
 was written. A subscription is bought through a Checkout Session, cancelled by
 asking Stripe to cancel, and moved between plans by asking Stripe to move it; a
@@ -107,7 +112,8 @@ billing/
 │       │   └── lifecycle.rb           # the only writer of a subscription
 │       └── webhooks/                  # verify, store, normalize, emit — in that order
 ├── test/
-│   ├── contract/                      # the checks that read core
+│   ├── contract/                      # the checks against core, and the HTTP one
+│   │   ├── http_surface_contract_test.rb # the document and the router, by method and path
 │   ├── coverage/                      # the money-path coverage gate, and its inventory
 │   ├── integration/                   # health, and the webhook's HTTP edge
 │   ├── models/                        # minitest, table-driven
@@ -310,6 +316,13 @@ transaction that marks the delivery finished. The rules:
 ## Testing
 
 - Tests are written **first**, and shown failing before the implementation.
+- **A tripwire that has never been seen red is a check that has never been
+  tested.** Every drift check here is proven by a mutation that makes it fail and
+  by the output that says so — and the mutation is reported, because "I broke it
+  on purpose and it noticed" and "I think it would notice" are different claims.
+  The direction of the failure matters too: a comparison that stops at the first
+  of two directions hides the second behind it, and one of the two is often the
+  one that finds the bug.
 - **Clocks are injected, never read.** `travel_to(frozen_now)` and derive the
   expected string from `TestSupport::FrozenClock::NOW`. An assertion containing
   a wall-clock timestamp is a test that fails on a different day than it was
@@ -473,12 +486,46 @@ transaction that marks the delivery finished. The rules:
   vocabulary core has fixed is the vocabulary used here. If the manager disagrees
   it is one constant, `Subscriptions::Lifecycle::UPDATED_EVENT`, and a catalog
   row agreed first.
-- **Every path in `openapi/v1.yaml` is served, and every served path is
-  described.** `test/contract/` compares the two, so a path added to one and not
-  the other fails rather than describing an API nobody can call. The same test
-  holds `info.version`, because a non-breaking addition that forgets to bump the
-  document's own version leaves a reader with no way to tell "nothing moved" from
-  "the whole document was regenerated".
+- **Every `(method, path)` in `openapi/v1.yaml` is served, and every
+  `(method, path)` the router serves is in the document or named with a reason.**
+  `test/contract/http_surface_contract_test.rb` compares the two as sets, in both
+  directions, so an operation added to one and not the other fails **by name**
+  rather than describing an API nobody can call. Three things about it are not
+  incidental:
+  - **It is keyed by method as well as path.** The check it replaced compared
+    paths and filtered the router with `start_with?("/v1")`, so `resources`'
+    two verbs for one `update` — `PATCH` and `PUT` — were one path on each side
+    and it reported agreement. `PUT /v1/customers/{id}` was served, and in no
+    document.
+  - **The exclusions are named, not filtered.** Every route that is not a client
+    operation is keyed by method and path with the reason it is not one, and a
+    route that is neither declared nor excluded fails. Otherwise the list rots
+    silently and grows a `/internal` nobody argued about — and an exclusion for a
+    route that has gone away fails the other way, so a stale one cannot quietly
+    cover whatever is added at that path next.
+  - **It runs without `core`.** `test/contract/outbox_envelope_contract_test.rb`
+    skips when `core` is not on disk, and a check behind that skip is not a
+    check. The document checks live beside it because they read the document, the
+    manifest and the route set, none of which is core.
+- **Every operation has an `operationId`, and no `operationId` is used twice.**
+  A generator turns these into method names and nothing else, so a duplicate or
+  a missing one is a compile error in a customer's language, discovered by them.
+  The fifteen are pinned rather than derived, which is what makes a rename fail
+  here: the count is not asserted, the list is, so a removal and an addition are
+  different failures.
+- **An update is a `PATCH`, and there is no `PUT`.** `resources` draws both verbs
+  for one action, and a whole-resource replacement is not what any update here
+  is: `CustomerUpdate` is closed, and `owner`/`processor` are not updatable at all
+  because they are the key the uniqueness rule is built on. `config/routes.rb`
+  therefore spells the customer routes out, as it already did for plans and
+  subscriptions. Documenting the `PATCH`'s behaviour under a `PUT` would be a
+  document lying about its own semantics — which is the thing the check above
+  exists to prevent.
+- **`info.version` is pinned, not derived.** A non-breaking addition bumps only
+  `info.version`, never the `/v1` prefix; core's checklist asks for the bump if
+  anything else in the document moved, prose included. A test that read the
+  version out of the document and compared it with itself would pass every
+  document ever written.
 - Breaking a contract is a major version plus a migration note in `README.md`
   and `CHANGELOG.md`, reviewed by a human — not a patch.
 
