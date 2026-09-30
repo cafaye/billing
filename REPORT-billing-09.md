@@ -371,6 +371,12 @@ measurement rather than an assumption:
 Same run count, same exit code, and **343 assertions of contract checking silently not
 done**. That is the whole reason the gate sets `CORE_PATH` and fails on a single skip.
 
+**The `core unreadable` row was measured on this commit, not inherited.** One thing worth
+naming: `lifecycle_test.rb` is **77 runs / 137 assertions / 0 skips with or without
+`CORE_PATH`** — it does not read core, so it is unaffected, which is the point of
+`tenant_isolation_matrix_test.rb` and the envelope spec not being the only home for a
+core-reading check.
+
 `BASELINE_RUNS`/`BASELINE_ASSERTIONS` and the webhook-tier count are raised **in the commit
 that changed the tests**, as `AGENTS.md` requires — 763/2100 on master, 823/2299 in the
 first commit here, **851/2368 in this one**. The `gate` job's own summary-parsing step was
