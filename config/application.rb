@@ -28,5 +28,14 @@ module Billing
     # Middleware like session, flash, cookies can be added back manually.
     # Skip views, helpers and assets when generating a new resource.
     config.api_only = true
+
+    # Send every response Rails raises into the application's own routes
+    # (config/routes.rb maps /404, /422, /500 and /503 to ErrorsController)
+    # instead of Rails' static HTML error pages. An API whose unknown paths
+    # answer with an HTML document has one response a client cannot parse, and
+    # core's openapi-conventions.md says every non-2xx is
+    # `application/problem+json`. The probes are unaffected: they are rendered
+    # by a controller, not raised.
+    config.exceptions_app = routes
   end
 end

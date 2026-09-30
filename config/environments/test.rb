@@ -19,7 +19,19 @@ Rails.application.configure do
   config.public_file_server.headers = { "cache-control" => "public, max-age=3600" }
 
   # Show full error reports.
-  config.consider_all_requests_local = true
+  #
+  # `false` here, not the generated `true`. With it on, the debug middleware
+  # intercepts every error response and returns its own HTML page, which means
+  # the specs could not see the thing this service promises: that an unknown
+  # path and an unhandled failure are `application/problem+json` like every
+  # other non-2xx. Production already answers those through
+  # `config.exceptions_app`, and the tests now answer them the same way.
+  #
+  # This does not make a bug quiet: `show_exceptions = :rescuable` below still
+  # raises anything that is not an expected Rails error, so an exception the
+  # service did not anticipate fails the suite instead of becoming a 500 that
+  # the specs would then have to assert.
+  config.consider_all_requests_local = false
   config.cache_store = :null_store
 
   # Render exception templates for rescuable exceptions and raise for other exceptions.

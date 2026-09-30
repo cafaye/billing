@@ -2,6 +2,9 @@ ENV["RAILS_ENV"] ||= "test"
 require_relative "../config/environment"
 require "rails/test_help"
 
+# Spec helpers. Plain modules, no framework gem.
+Dir[Rails.root.join("test/support/**/*.rb")].sort.each { |file| require file }
+
 # Fake collaborators for a single test.
 #
 # minitest 6 dropped `Object#stub` (it moved to the separate minitest-mock gem,
@@ -23,6 +26,8 @@ end
 module ActiveSupport
   class TestCase
     include StubbedCollaborators
+    include TestSupport::FrozenClock
+    include TestSupport::ApiHelpers
 
     # Run tests in parallel with specified workers
     parallelize(workers: :number_of_processors)

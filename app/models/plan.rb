@@ -1,0 +1,113 @@
+# A plan: what can be bought, at what price, on what cadence.
+#
+# The only way an amount enters this model is `price=`, and it takes a `Money`.
+# `amount_cents` and `currency` are the two columns that amount is stored in,
+# and nothing else writes them: the controller parses a request into a `Money`
+# (or refuses it), the column type and a CHECK constraint refuse a negative or
+# a non-integer, and `as_json` reads it back out through `price`. There is no
+# code path where a Float carries a price (AGENTS.md, Money).
+#
+# `interval` is a plain string with an inclusion validation and a CHECK
+# constraint rather than a Rails `enum`, for the reason given on Customer: an
+# enum raises ArgumentError on an unknown value, and at an HTTP boundary that
+# is a 500 for something the client got wrong.
+class Plan < ApplicationRecord
+  INTERVALS = %w[month year one_time].freeze
+
+  # kebab-case, so a slug is always one URL segment with nothing to escape.
+  SLUG_PATTERN = /\A[a-z0-9]+(-[a-z0-9]+)*\z/
+
+  validates :name, presence: true
+  validates :slug, presence: true, uniqueness: true
+  validates :interval, presence: true
+  # `allow_nil` so that a missing interval is reported once, as a blank, rather
+  # than twice — once as a blank and once as "not one of the allowed values".
+  validates :interval, inclusion: { in: INTERVALS }, allow_nil: true
+  validates :amount_cents, numericality: { only_integer: true, greater_than_or_equal_to: 0 }
+  validates :trial_days, numericality: { only_integer: true, greater_than_or_equal_to: 0 }
+  validate :slug_is_kebab_case
+  validate :currency_is_iso_4217
+
+  before_validation :normalize_currency
+
+  # The amount, as the value object. This is the read side of the money rule:
+  # a caller that wants to do arithmetic on a price gets a `Money`, never the
+  # raw integer, so a currency cannot be dropped by accident.
+  def price
+    Money.new(amount_cents, currency)
+  end
+
+  # The write side. Refuses anything that is not a `Money`, because the whole
+  # point of the type is that a bare integer has no currency and a Float has no
+  # exact value. A caller with a raw pair must build the Money itself.
+  def price=(money)
+    unless money.is_a?(Money)
+      raise Money::InvalidAmountError, "price must be a Money, got #{money.class}"
+    end
+
+    self.amount_cents = money.minor_units
+    self.currency = money.currency
+    money
+  end
+
+  # The wire shape, and the outbox payload: one representation, so an event and
+  # a response cannot disagree about what a plan costs.
+  def as_json(*)
+    {
+      "id" => id,
+      "name" => name,
+      "slug" => slug,
+      "processor_product_id" => processor_product_id,
+      "processor_price_id" => processor_price_id,
+      "price" => price.to_h,
+      "interval" => interval,
+      "trial_days" => trial_days,
+      "active" => active,
+      "created_at" => created_at&.utc&.iso8601,
+      "updated_at" => updated_at&.utc&.iso8601
+    }
+  end
+
+  after_create :publish_created
+  after_update :publish_updated
+
+  private
+    def publish_created
+      OutboxEvent.publish!(type: "billing.plan.created", subject: id, data: as_json)
+    end
+
+    # Only when something actually changed. A PATCH that sets a field to the
+    # value it already holds is not a state change, and an event that says
+    # otherwise teaches a consumer to expect updates that carry no update.
+    def publish_updated
+      return unless saved_changes?
+
+      OutboxEvent.publish!(type: "billing.plan.updated", subject: id, data: as_json)
+    end
+
+    # Added as an explicit `:invalid_format` rather than through
+    # `validates format:`, which reports a failure as the generic `:invalid`.
+    # A slug that is "Pro Monthly" and a currency that is "dollars" are both
+    # "here is the shape we accept", and the client is told the shape.
+    def slug_is_kebab_case
+      return if slug.blank? || SLUG_PATTERN.match?(slug)
+
+      errors.add(:slug, :invalid_format, message: "must be kebab-case")
+    end
+
+    # ISO 4217 shape, not the list of live codes — the same reasoning Money
+    # gives: a hand-maintained list of 180 currencies is a liability in a
+    # payment system, and an unfamiliar code should not be refused before the
+    # catalogue lands. Upcased first, so `usd` is accepted and stored as `USD`;
+    # the column is `varchar(3)`, and a lowercase code that reached the
+    # database anyway is caught by the length and shape here.
+    def currency_is_iso_4217
+      return if currency.blank? || Money::CURRENCY_FORMAT.match?(currency)
+
+      errors.add(:currency, :invalid_format, message: "is not an ISO 4217 code")
+    end
+
+    def normalize_currency
+      self.currency = currency.to_s.strip.upcase if currency.present?
+    end
+end

@@ -5,29 +5,64 @@
 # a worker records the shape it is being built against and marks what it cannot
 # decide. See AGENTS.md.
 #
-# > DECISION NEEDED (billing-01): `exposes` is absent. Convention rule 3 says a
-# > service that serves traffic must declare it, and billing does serve traffic,
-# > so this is a known gap and not a judgement that the rule does not apply.
-# > Filling it in needs an OpenAPI 3.1 document for billing's HTTP surface, and
-# > specs are manager-owned — a worker drafting one would be publishing a
-# > contract the manager has not agreed to. core already carries the intended
-# > shape as `examples/valid/ruby-api.cafaye.yml` (openapi/openapi.yaml plus the
-# > customer/subscription/payment/usage/invoice event types), so the draft is
-# > written against that example rather than invented here. What is missing
-# > today is the OpenAPI document and the Phase 3 surface it describes; until
-# > both exist, `caf dev` and `pantry` have nothing to read for billing, which
-# > is the cost of leaving it out. The two probe endpoints (/healthz, /readyz)
-# > are deliberately not declared either: they are infrastructure, not contract
-# > surface, and guard left the same gap for the same reason.
+# > DECISION NEEDED (billing-02): `exposes` now names the three events this build
+# > publishes, in the three-segment form core v0.2 made mandatory (D1). One
+# > cross-repo obligation follows from it and cannot be discharged from this
+# > worktree, because core is read-only here:
+# >
+# > * `billing.plan.created` and `billing.customer.created` already have catalog
+# >   rows in core's docs/event-naming.md.
+# > * `billing.plan.updated` does not, and core's suite cannot catch that for
+# >   this repository: `tests/test_specs.py` asserts the catalog rule over core's
+# >   own `examples/valid/*.cafaye.yml`, and `caf contract lint` — which would
+# >   check a service's real manifest — does not exist yet. So the row is a
+# >   review obligation rather than a currently-failing test. The entity is
+# >   already catalogued and `updated` is already in core's action vocabulary, so
+# >   the row is a one-line addition to core's billing table. Until it lands,
+# >   `test/contract/outbox_envelope_contract_test.rb` carries the obligation in
+# >   code, so a *new* event published without a catalog row still fails here.
+# >
+# > Three more gaps are recorded here rather than fixed:
+# >
+# > 1. `bad_request`, `cursor_invalid` and `cursor_expired` are problem codes this
+# >    service answers with that core's reserved list does not name. 400 is absent
+# >    from the list entirely and `cursor_expired` appears only in the pagination
+# >    prose, so all three need adding before another service copies them.
+# > 2. The two probes (/healthz, /readyz) are deliberately not declared. They are
+# >    infrastructure, not contract surface, and guard left the same gap for the
+# >    same reason.
+# > 3. No payload schema exists in core for any of these three events. core's
+# >    outbox checklist asks for `data` to be validated against
+# >    `schemas/events/<service>/<entity>/<action>.schema.json` before the insert,
+# >    and core ships only two payload schemas in total. `test/contract` enforces
+# >    the rule for any event that has one, and skips the three that do not, so
+# >    the moment a schema lands this service is checked against it.
+# >
+# > `consumes` is empty and `dependencies` is empty. The customers created here
+# > reference identity's users and accounts by uuid, which is a data dependency
+# > rather than a call — this build never asks identity anything, and declaring a
+# > dependency on a service that is not called would have `caf` start it for
+# > nothing.
 name: billing
 description: Plans, subscriptions, prepaid credit, usage metering, webhooks in.
 language: ruby
-core: ^0.1.0
+core: ^0.2.0
 
-# billing subscribes to no events yet. It is a scaffold: the customers,
-# subscriptions and webhook handlers that would react to identity's user and
-# account events are Phase 3 packets, and declaring an event this build does not
-# handle would tell `caf` to wire a consumer that has nothing to do.
+exposes:
+  api: openapi/v1.yaml
+  events:
+    # Three segments, prefixed with this service's own name, which is what core's
+    # manifest conventions require of a long-form type. `customer.created` in
+    # core's catalog is the two-segment form and is a *different* type: the
+    # catalog row has to be renamed, not reused.
+    - billing.customer.created
+    - billing.plan.created
+    - billing.plan.updated
+
+# billing subscribes to no events yet. The customers and subscriptions that
+# would react to identity's user and account events are later packets, and
+# declaring an event this build does not handle would tell `caf` to wire a
+# consumer that has nothing to do.
 consumes: []
 
 # No service-level dependencies yet. Stripe is a vendor, not a cafaye service,
