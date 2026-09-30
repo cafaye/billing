@@ -88,14 +88,11 @@ module Webhooks
       Time.at(value).utc.iso8601
     end
 
-    # The same timestamp as an instant rather than a string. The lifecycle writes
-    # this to the row so a delivery that arrived late can be told from one that
-    # arrived now, and a column is not a place to parse a string.
-    def self.instant_of(value)
-      return if value.nil?
-
-      Time.at(value).utc
-    end
+    # The processor's own `created` is *not* in the normalized hash, and that is
+    # deliberate. `Webhooks::Ingestion` computes it once and hands the same instant
+    # to the handler and to the outbox row, so the event's `time` and the payload's
+    # `started_at` cannot be two readings of one field. A third copy here would be
+    # a third reading.
 
     # A money amount on the wire. `Money#to_h` is the platform's crossing shape,
     # so the normalized payload uses it verbatim rather than a key invented here
@@ -139,9 +136,7 @@ module Webhooks
         "trial" => subscription["trial_start"].present?,
         # The trial's end in the shape core's payload schema wants it: a date-time,
         # or null while trialing with no end date.
-        "trial_ends_at" => subscription["trial_start"].present? ? time_of(subscription["trial_end"]) : nil,
-        "event_created_at" => time_of(payload["created"]),
-        "event_created_instant" => instant_of(payload["created"])
+        "trial_ends_at" => subscription["trial_start"].present? ? time_of(subscription["trial_end"]) : nil
       )
     end
 

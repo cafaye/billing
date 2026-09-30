@@ -168,18 +168,19 @@ class Webhooks::StripeEventsTest < ActiveSupport::TestCase
   # change that drops one has to be a failing test, not a surprise in a
   # consumer's inbox.
   #
-  # Four keys were added in billing-04 and each is load-bearing.
-  # `cafaye_customer_id` is the link back to a cafaye customer, carried in the
-  # subscription's metadata because a customer created through `/v1` has a null
-  # `processor_customer_id` until its first subscription names one. `trial_ends_at`
-  # is the shape core's payload schema asks for. `event_created_at` and
-  # `event_created_instant` are the processor's own timestamp, which the lifecycle
-  # writes to the row so a delivery that arrived late can be told from one that
-  # arrived now.
+  # Two keys were added in billing-04 and each is load-bearing. `cafaye_customer_id`
+  # is the link back to a cafaye customer, carried in the subscription's metadata
+  # because a customer created through `/v1` has a null `processor_customer_id` until
+  # its first subscription names one. `trial_ends_at` is the shape core's payload
+  # schema asks for: a date-time, or null while trialing with no end date.
+  #
+  # The processor's own `created` is deliberately *not* here. `Webhooks::Ingestion`
+  # computes it once and hands the same instant to the handler and to the outbox row,
+  # so a second copy in the normalized hash would be a second reading of one field.
   SUBSCRIPTION_KEYS = %w[
     kind processor processor_event_id subscription_id customer_id cafaye_customer_id status
     quantity price_id unit_amount current_period_start current_period_end cancel_at_period_end
-    canceled_at trial trial_ends_at event_created_at event_created_instant
+    canceled_at trial trial_ends_at
   ]
 
   KNOWN_KEYS = {

@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_09_30_000008) do
+ActiveRecord::Schema[8.1].define(version: 2026_09_30_000009) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -66,8 +66,11 @@ ActiveRecord::Schema[8.1].define(version: 2026_09_30_000008) do
     t.datetime "updated_at", null: false
     t.jsonb "entitlements", default: {}, null: false
     t.index ["slug"], name: "index_plans_on_slug", unique: true
+    t.check_constraint "NOT entitlements ? 'features'::text OR jsonb_typeof(entitlements -> 'features'::text) = 'array'::text", name: "plans_entitlements_features_is_array"
+    t.check_constraint "NOT entitlements ? 'limits'::text OR jsonb_typeof(entitlements -> 'limits'::text) = 'object'::text", name: "plans_entitlements_limits_is_object"
     t.check_constraint "\"interval\"::text = ANY (ARRAY['month'::character varying::text, 'year'::character varying::text, 'one_time'::character varying::text])", name: "plans_interval_known"
     t.check_constraint "amount_cents >= 0", name: "plans_amount_cents_not_negative"
+    t.check_constraint "jsonb_typeof(entitlements) = 'object'::text", name: "plans_entitlements_is_object"
     t.check_constraint "trial_days >= 0", name: "plans_trial_days_not_negative"
   end
 
