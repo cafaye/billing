@@ -573,17 +573,42 @@ I would have been writing down a claim that measurement then contradicted.
 - **No code copied** from `moon/refs/` or any legacy app. Everything is written from
   scratch; the reference was behavioural only.
 - **Nothing pushed.** No force-push, no rewritten history. The two commits are additive on
-  `worker/billing-08`.
+  `worker/billing-08`. `git status` is clean and `origin` is untouched.
 - **Database cleaned up.** See below.
+- **A second agent was working this brief in this worktree at the same time.** Its
+  findings are folded in rather than duplicated — the helper fix in
+  `subscription_delivery_test.rb` (§7b) and the classification section (§7c) are its
+  work, and both were kept because both were independently verified here: the `57 / 3`
+  split in §7c is the measurement this report makes, and the two predicate tests it added
+  are red on the mutation that widens the predicate. Where the two of us had measured
+  different things, the report says which, rather than quietly keeping the more
+  convenient number.
 
 ### A note on the database, and one thing I could not control
 
 The gate ran against the **local** PostgreSQL 18 on 5432, not the `billing08-pg` container
 the previous worker used on 15408: the machine restarted mid-packet and that container did
 not come back. Same engine major for everything the schema uses (`jsonb` expression
-indexes, partial unique indexes, `gen_random_uuid()`, `CHECK` constraints), and the
-advantage is that there is no cluster or volume to leave running — only a database to drop,
-which I did.
+indexes, partial unique indexes, `gen_random_uuid()`, `CHECK` constraints).
+
+**No cluster and no volume were started by this packet**, so there is none to leave
+running. The PostgreSQL 18 on 5432 is the machine's shared local instance and is
+deliberately still up: other worktrees in this fleet are mid-run against it, and stopping
+it would have been exactly the "do not kill a process you did not start" the brief warns
+about. What this packet *did* create — `worker_billing_08_test`,
+`worker_billing_08_development`, and a private `billing09_scratch_test` used for the
+uncontaminated gate measurements in §6b — **is dropped**:
+
+```
+select datname from pg_database where datname like '%billing_08%' or datname like 'billing09%';
+ (0 rows)
+```
+
+The private scratch database is worth one sentence, because it is the concrete form of
+§6b: the whole-suite and per-tier numbers in §7 were measured on a per-packet database
+name (`BILLING_DATABASE_NAME`), not on the worktree default, precisely so a second
+`rails test` in the same worktree could not contaminate them. `config/database.yml`
+already derives a per-checkout name; this used the same seam one level further.
 
 **The suite cannot run under 8 parallel workers on this machine.** `pg-1.6.3-arm64-darwin`
 segfaults in `connect_start` while Rails creates the eight per-worker databases, which is
