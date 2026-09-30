@@ -251,13 +251,29 @@ class SubscriptionDeliveryTest < ActiveSupport::TestCase
     # which is random — and "started, then updated, then canceled" is the fact under
     # test here. The event's own `time` is the processor's timestamp and is
     # unaffected, which is the point of it being the processor's.
+    # The delivery's id travels **in** the body, because that is how it arrives:
+    # `stripe_controller.rb` hands `Ingestion` `event_id: payload["id"]` and merges
+    # the verified event's id over whatever the body claimed, so a delivery and the
+    # payload that arrived with it can never disagree about which event this is.
+    #
+    # A helper that varied the delivery's id while leaving the body's id at the
+    # fixture's was arranging a state Stripe never sends — and it **changed which
+    # refusal fired**: `Subscriptions::Lifecycle`'s stale check compares the
+    # processor's own `created` timestamp, so a re-delivery of the *same* fixture
+    # under a new id was arriving with the same timestamp as the row's, and the
+    # stale rule did not fire while `no_change_to_record` did. Once the id is moved
+    # into the body, the case is honest: the assertion below is about a fresh id
+    # reporting state already held, which is exactly the `no_change_to_record`
+    # case and not the `stale_delivery` one.
     def deliver(fixture, event_id: nil)
       body = JSON.parse(stripe_fixture(fixture))
+      resolved_id = event_id || body["id"]
+      body = body.merge("id" => resolved_id)
 
       travel_to(frozen_now + (@deliveries = @deliveries.to_i + 1)) do
         Webhooks::Ingestion.new(
           processor: :stripe,
-          event_id: event_id || body["id"],
+          event_id: resolved_id,
           type: body["type"],
           payload: body
         ).call

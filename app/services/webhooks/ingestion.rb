@@ -126,26 +126,31 @@ module Webhooks
         # event is durably published and this delivery's own work rolled back with
         # its transaction.
         #
-        # **Two different indexes can be the one that fires**, which is why this
-        # rescue is on the exception class and not on a particular constraint:
+        # **Two different routes can lose this race**, which is why the rescue is
+        # on the exception class and not on a particular constraint:
         #
         #   * `outbox_events_processor_event_id_idx` for the payment and the
         #     updated/deleted subscription events, whose payloads carry
         #     `processor_event_id`.
-        #   * `subscriptions.processor_subscription_id` for
-        #     `customer.subscription.created`, whose `billing.subscription.started`
-        #     payload **deliberately does not** carry `processor_event_id` (the
-        #     lifecycle's start payload is `core_payload` plus `started_at`, and
-        #     `lifecycle_test.rb` asserts the key's absence). The duplicate
-        #     `INSERT` into `subscriptions` is refused first, so the outbox index
-        #     never sees it.
+        #   * the `subscriptions` table for `customer.subscription.created`, whose
+        #     `billing.subscription.started` payload **deliberately does not**
+        #     carry `processor_event_id` (the lifecycle's start payload is
+        #     `core_payload` plus `started_at`, and `lifecycle_test.rb` asserts the
+        #     key's absence). The duplicate `INSERT` into `subscriptions` is
+        #     refused before the outbox is reached.
         #
-        # That second route was **measured, not assumed**: with both
-        # `subscriptions` indexes dropped, the same two deliveries produce two
-        # subscription rows and two `billing.subscription.started` events. So the
-        # duplicate-suppression property rests on two constraints, and a future
-        # change that dropped either one would reopen a duplicate charge with
-        # nothing to catch it. `concurrent_delivery_test.rb` tests both routes.
+        # That second route was **measured, not assumed**, and the measurement
+        # corrected an assumption worth recording: it is not one constraint. The
+        # model carries a uniqueness validation on `processor_subscription_id`
+        # *and* the table has a unique index over the same column, and two racing
+        # threads can be refused by either. Over 60 barrelled duplicate creations
+        # on this branch the split was 57 refused by the index and **3 by the
+        # validation**, which is why the branch below exists and why this comment
+        # does not name a single index. Dropping *every* index on `subscriptions`
+        # and re-running the same two deliveries reopens it (two subscription
+        # rows, two `billing.subscription.started` events), so the property does
+        # rest on constraints — just on more than one, none of which is
+        # individually sufficient. `concurrent_delivery_test.rb` tests both routes.
         #
         # A decision, not a failure, and the vocabulary says so: the event exists,
         # written by a request no longer in flight, and this delivery has nothing
@@ -154,11 +159,38 @@ module Webhooks
         # would put a row in front of a human for an event that is published and
         # correct.
         webhook.ignore!(DUPLICATE_REASON)
+      rescue ActiveRecord::RecordInvalid => e
+        # A uniqueness failure and a unique-index violation are **one fact** told
+        # two ways, and which of the two a losing thread hears is a scheduling
+        # accident. Classified by the *error*, not by the exception class,
+        # because a `RecordInvalid` with no uniqueness error in it is a bug in
+        # this service and belongs in front of a human — see the test beside the
+        # parking branch, which is the control for exactly that.
+        uniqueness_race?(e) ? webhook.ignore!(DUPLICATE_REASON) : park(webhook, e)
       rescue StandardError => e
+        park(webhook, e)
+      end
+
+      # Whether a validation failure is the duplicate the constraint above
+      # already records, rather than something this service got wrong.
+      #
+      # `:taken` is the error type Rails' uniqueness validation raises, so this
+      # asks the record what went wrong instead of inferring it from the class of
+      # the exception — which is the only reason this is narrow.
+      def uniqueness_race?(error)
+        record = error.record
+        record.is_a?(ActiveRecord::Base) && record.errors.any? { |problem| problem.type == :taken }
+      end
+
+      # The one path that puts a row in front of a human, so it is the one place
+      # that logs, and it logs the identifier needed to find the row and nothing
+      # about the payload: the body can carry a customer email, and a signing
+      # failure's message is not this service's to print.
+      def park(webhook, exception)
         Rails.logger.error(
-          "processor webhook #{processor} #{webhook.stripe_event_id} failed: #{e.class}: #{e.message}"
+          "processor webhook #{processor} #{webhook.stripe_event_id} failed: #{exception.class}: #{exception.message}"
         )
-        webhook.fail!(e)
+        webhook.fail!(exception)
       end
 
       # The state change's own time, not the arrival time. A row that sat

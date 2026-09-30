@@ -57,6 +57,21 @@ require "test_helper"
 # the teardown is unconditional and why it is keyed to this file's own event ids
 # rather than to a blanket truncation.
 #
+# Turning it off has a second cost, and it is the one that would have made this
+# file lie. Active Record's query cache is **on** in the test environment
+# (`connection.query_cache_enabled` is true), it is cleared between tests but
+# **not** within one, and every count in this file is issued on the main thread
+# *after* the worker threads have committed. A `SELECT COUNT(*)` taken before
+# the threads ran and repeated after them returns the first answer — measured,
+# not assumed: with the cache live, `ProcessorWebhook.count` read `0` in a test
+# whose raw SQL read one stored, finished row.
+#
+# A count that cannot see the rows it is counting is a tripwire wired to nothing,
+# and this is the one file in the repository where a green count would mean
+# nothing at all. So the barrier's block ends by dropping the cache on this
+# thread before any assertion reads anything: `Thread` boundaries do not clear
+# it, and the only honest moment to measure is after the last commit.
+#
 # ## What is asserted, and what deliberately is not
 #
 # Which thread wins is genuinely not determined, and the test does not pretend
@@ -92,8 +107,8 @@ class Webhooks::ConcurrentDeliveryTest < ActiveSupport::TestCase
   test "two simultaneous deliveries of one event id emit one event" do
     deliver_twice_at_once
 
-    assert_equal 1, OutboxEvent.count,
-      "one Stripe event id produced #{OutboxEvent.count} outbox rows. Two rows are " \
+    assert_equal 1, outbox_rows,
+      "one Stripe event id produced #{outbox_rows} outbox rows. Two rows are " \
       "two envelope ids, and core's envelope id is the dedupe key — a consumer " \
       "cannot tell the second from new information about the same charge."
   end
@@ -158,7 +173,57 @@ class Webhooks::ConcurrentDeliveryTest < ActiveSupport::TestCase
   test "two simultaneous deliveries of one event id are recorded once" do
     deliver_twice_at_once
 
-    assert_equal 1, ProcessorWebhook.count
+    assert_equal 1, delivery_rows
+  end
+
+  # --- the control for the parking branch ------------------------------------
+  #
+  # `Ingestion#emit` has a `rescue ActiveRecord::RecordInvalid` that reads the
+  # *error* rather than the exception class, so a uniqueness failure is recorded
+  # as a duplicate and everything else is parked for a human. That branch is only
+  # safe if it is narrow, and "narrow" is a claim about a predicate.
+  #
+  # **A validation failure that is not about uniqueness must still be parked.**
+  # A delivery naming a plan this service does not sell fails validation for
+  # `unknown_plan`, which is a `Subscriptions::Refused` the lifecycle raises — so
+  # the honest control is a genuine, non-racy invalid record reaching the same
+  # rescue. `ProcessorWebhook` is the simplest: `stripe_event_id` has a presence
+  # validation, and a blank one is a programming error in the caller, not a
+  # duplicate. If `uniqueness_race?` ever widened to "any `RecordInvalid`", this
+  # would be recorded as `ignored:duplicate_delivery` and a bug in this service
+  # would be filed as a race and answered 200.
+  test "a validation failure that is not a uniqueness race is still parked for a human" do
+    record = Customer.new(processor: "stripe", processor_customer_id: "cus_control")
+
+    error = assert_raises(ActiveRecord::RecordInvalid) { record.save! }
+
+    refute ingestion_says_uniqueness_race?(error),
+      "a plain validation failure was read as the duplicate a constraint already " \
+      "recorded. Widening this predicate files a bug in this service as a race and " \
+      "answers the processor 200."
+  end
+
+  # The same claim from the other side, and the reason the control above can be
+  # trusted: the predicate really does recognise a uniqueness failure, so the
+  # `RecordInvalid` branch is not simply dead code. A duplicate customer is
+  # refused by a uniqueness **validation** here and by a unique **index** in the
+  # concurrent case — one fact, two ways, which is the whole reason the branch
+  # exists.
+  test "the predicate recognises a uniqueness failure as a duplicate" do
+    # The **same owner**, because `Customer`'s rule is one customer per
+    # `(owner_type, owner_id, processor)` and not one per processor customer id —
+    # a different owner would be a different customer and would not be refused.
+    owner = SecureRandom.uuid
+    Customer.create!(owner_type: "User", owner_id: owner,
+      processor: "stripe", processor_customer_id: "cus_dup_control")
+    duplicate = Customer.new(owner_type: "User", owner_id: owner,
+      processor: "stripe", processor_customer_id: "cus_dup_control")
+
+    error = assert_raises(ActiveRecord::RecordInvalid) { ActiveRecord::Base.uncached { duplicate.save! } }
+
+    assert ingestion_says_uniqueness_race?(error),
+      "a real uniqueness failure was not recognised, so a losing delivery would be " \
+      "parked as a failure for an event that is already published"
   end
 
   # --- the other duplicate route, closed by a different index ----------------
@@ -182,10 +247,10 @@ class Webhooks::ConcurrentDeliveryTest < ActiveSupport::TestCase
 
     records = deliver_concurrently(body, event_id: "evt_1PZQaBcDeFgHiJkLmNoPqR5")
 
-    assert_equal 1, Subscription.count,
-      "#{Subscription.count} subscription rows for one processor subscription id. The " \
+    assert_equal 1, subscription_rows,
+      "#{subscription_rows} subscription rows for one processor subscription id. The " \
       "outbox index cannot catch this one: a start payload carries no processor_event_id."
-    assert_equal 1, OutboxEvent.where(event_type: "billing.subscription.started").count,
+    assert_equal 1, started_events,
       "billing.subscription.started was published twice; a consumer counting " \
       "signups would count every signup twice"
     refute records.any?(&:failed?),
@@ -195,12 +260,17 @@ class Webhooks::ConcurrentDeliveryTest < ActiveSupport::TestCase
   # The premise of the test above, asserted rather than assumed: the start payload
   # really does lack the key the outbox index is built on. If a future change gave
   # it one, this file's other half would start testing the outbox index here and
-  # the `subscriptions` constraint would quietly become untested.
-  test "a start payload carries no processor_event_id, so a different index refuses the duplicate" do
+  # the `subscriptions` table's own constraints would quietly become untested.
+  test "a start payload carries no processor_event_id, so the subscriptions table refuses the duplicate" do
     body, = subscription_fixture_rows
 
+    # The id is merged into the body, as it is in production and as
+    # `ingest_body` below does it. A delivery under an id its own payload does
+    # not carry is a state Stripe never sends, and it is the pattern that let two
+    # suites publish events claiming to be the same one.
     Webhooks::Ingestion.new(
-      processor: :stripe, event_id: "evt_started_shape", type: body["type"], payload: body
+      processor: :stripe, event_id: "evt_started_shape",
+      type: body["type"], payload: body.merge("id" => "evt_started_shape")
     ).call
 
     start = OutboxEvent.find_by(event_type: "billing.subscription.started")
@@ -220,9 +290,11 @@ class Webhooks::ConcurrentDeliveryTest < ActiveSupport::TestCase
   test "two simultaneous deliveries of two different event ids emit two events" do
     deliver_twice_at_once(event_ids: [ "evt_race_a", "evt_race_b" ])
 
-    assert_equal 2, OutboxEvent.count
+    assert_equal 2, outbox_rows
     assert_equal %w[evt_race_a evt_race_b],
-      OutboxEvent.order(:created_at, :id).pluck(:data).map { |data| data.fetch("processor_event_id") }.sort
+      ActiveRecord::Base.uncached {
+        OutboxEvent.order(:created_at, :id).pluck(:data).map { |data| data.fetch("processor_event_id") }.sort
+      }
   end
 
   # The two must be told apart, not merely counted: an index that refused
@@ -240,6 +312,43 @@ class Webhooks::ConcurrentDeliveryTest < ActiveSupport::TestCase
   end
 
   private
+    # The predicate `Ingestion#emit` uses to tell a uniqueness race from a genuine
+    # validation failure, asked of the real object.
+    #
+    # It is a private method, so it is reached with `send`. That is the price of
+    # asserting a private decision rather than its consequence: the consequence is
+    # only observable in a race, and a race that may not be scheduled is not a
+    # test. The alternative — asserting only that duplicate deliveries are never
+    # parked — passes just as well when the predicate is deleted entirely.
+    def ingestion_says_uniqueness_race?(error)
+      Webhooks::Ingestion.allocate.send(:uniqueness_race?, error)
+    end
+
+    # The counts, each read past the query cache.
+    #
+    # See the class comment: the cache is live in the test environment, it is
+    # cleared between tests but not within one, and every count here is taken on
+    # the main thread after the worker threads committed. `uncached` is per
+    # relation and per call, which is what makes it safe to write the failure
+    # message in terms of the same number the assertion used — a message that
+    # re-counts through a cache would print `1` on the one run where the answer
+    # was `2`, and this file exists to report exactly that run.
+    def outbox_rows
+      ActiveRecord::Base.uncached { OutboxEvent.count }
+    end
+
+    def delivery_rows
+      ActiveRecord::Base.uncached { ProcessorWebhook.count }
+    end
+
+    def subscription_rows
+      ActiveRecord::Base.uncached { Subscription.count }
+    end
+
+    def started_events
+      ActiveRecord::Base.uncached { OutboxEvent.where(event_type: "billing.subscription.started").count }
+    end
+
     # Runs two deliveries of the same event id at the same moment, and returns
     # each thread's own `ProcessorWebhook` record.
     #
@@ -252,7 +361,9 @@ class Webhooks::ConcurrentDeliveryTest < ActiveSupport::TestCase
       body = JSON.parse(stripe_fixture(INVOICE_PAID))
 
       holding_the_gate_open(BothArrived.new) do
-        event_ids.map { |event_id| Thread.new { ingest_body(body, event_id) } }.map(&:value)
+        records = event_ids.map { |event_id| Thread.new { ingest_body(body, event_id) } }.map(&:value)
+        forget_what_was_counted_before_the_threads_ran
+        records
       end
     end
 
@@ -302,8 +413,21 @@ class Webhooks::ConcurrentDeliveryTest < ActiveSupport::TestCase
       barrier = BothArrived.new
 
       holding_the_gate_open(barrier) do
-        2.times.map { Thread.new { ingest_body(body, event_id) } }.map(&:value)
+        records = 2.times.map { Thread.new { ingest_body(body, event_id) } }.map(&:value)
+        forget_what_was_counted_before_the_threads_ran
+        records
       end
+    end
+
+    # Drops this thread's query cache once the deliveries have committed.
+    #
+    # The barrier's threads have their own connections and their own caches;
+    # nothing a worker thread did invalidates anything this thread read earlier.
+    # Clearing here rather than in each assertion is what makes "the count after
+    # the race" a single, unambiguous moment instead of one that depends on which
+    # helper happened to be called first.
+    def forget_what_was_counted_before_the_threads_ran
+      ActiveRecord::Base.connection.clear_query_cache
     end
 
     # Replaces `ProcessorWebhook#handled?` for the duration of the block with a

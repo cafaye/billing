@@ -52,18 +52,27 @@
 # `billing.subscription.started` does not carry `processor_event_id` in its
 # payload, and deliberately so — the lifecycle's start payload is `core_payload`
 # plus `started_at`, and `test/services/subscriptions/lifecycle_test.rb` asserts
-# the absence. That event type is produced only by a write to `subscriptions`,
-# which has its **own** unique index on `processor_subscription_id`, and a
-# second concurrent `customer.subscription.created` loses there instead; the
-# outbox insert is never reached.
+# the absence. That event type is produced only by a write to `subscriptions`, so
+# a second concurrent `customer.subscription.created` is refused there instead,
+# and the outbox insert is never reached.
 #
-# So the property rests on **two** constraints rather than one, and that was
-# measured rather than argued: with both `subscriptions` indexes dropped, the
-# same two concurrent deliveries produce two subscription rows and two
-# `billing.subscription.started` events. `test/services/webhooks/
-# concurrent_delivery_test.rb` exercises both routes, and
-# `REPORT-billing-09.md` records that dropping either index reopens a duplicate
-# charge with nothing left to catch it.
+# Which refusal, though, is **not** settled by naming one index, and the
+# measurement says so. `subscriptions` carries a uniqueness *validation* on
+# `processor_subscription_id` in the model as well as a unique *index* over the
+# same column, and a losing thread is refused by whichever it reaches first:
+# over 60 barrelled duplicate creations on this branch the split was 57 index,
+# 3 validation. Neither is individually sufficient to reason about — the
+# duplicate is prevented as long as both are there, and dropping **every** index
+# on `subscriptions` reopens it (two subscription rows, two
+# `billing.subscription.started` events).
+#
+# So the property rests on more than one constraint, on a second table, and the
+# ingestion layer is written against the *exception* rather than against a named
+# index for that reason: `Webhooks::Ingestion` classifies a uniqueness failure
+# and a unique-index violation as the same decision, because which one a thread
+# hears is a scheduling accident. `test/services/webhooks/
+# concurrent_delivery_test.rb` exercises both routes, and `REPORT-billing-09.md`
+# records the measurement.
 #
 # Reversible: `add_index` in a `change` rolls back to `remove_index`, and
 # `test/models/outbox_event_test.rb` runs the `down` and the `up` for real

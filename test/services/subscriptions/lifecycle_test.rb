@@ -299,6 +299,26 @@ class Subscriptions::LifecycleTest < ActiveSupport::TestCase
     assert_equal "evt_1PZQaBcDeFgHiJkLmNoPqR2", events.order(:created_at, :id).last.data.fetch("processor_event_id")
   end
 
+  # A delivery's id and the body it carries are **one value**, because
+  # `stripe_controller.rb` hands `Ingestion` `event_id: payload["id"]`. A helper
+  # that could deliver under an id the body does not carry is arranging a state
+  # Stripe never sends — and the outbox's unique index over the payload's
+  # `processor_event_id` refuses it, which is how this was found: the loop in
+  # "every live status may be canceled" was quietly delivering four *different*
+  # event ids while every emitted payload named the same one.
+  #
+  # Asserted on the **update** only. A start's payload carries no
+  # `processor_event_id` at all, deliberately — see the test above and
+  # `concurrent_delivery_test.rb` — and asserting it here would be asserting a
+  # second, different thing.
+  test "an emitted update names the id its delivery was ingested under" do
+    apply("customer.subscription.created", event_id: "evt_provenance_start")
+    apply("customer.subscription.updated", event_id: "evt_provenance_update", quantity: 3)
+
+    assert_equal "evt_provenance_update",
+      ActiveRecord::Base.uncached { events.order(:created_at, :id).last.data.fetch("processor_event_id") }
+  end
+
   test "an update's payload says which plan the subscription is now on" do
     apply("customer.subscription.created")
     team = create_plan(price: 4900, price_id: "price_1PZQaBcDeFgHiJkLmNoPqR4")
@@ -747,6 +767,15 @@ class Subscriptions::LifecycleTest < ActiveSupport::TestCase
       # to the lifecycle as the event time. A case about ordering needs to move it
       # independently of this suite's frozen clock, which is what `apply` moves.
       body["created"] = overrides[:created] if overrides.key?(:created)
+
+      # The delivery's id travels *in* the body, because that is how it arrives:
+      # `stripe_controller.rb` hands `Ingestion` `event_id: payload["id"]`, and
+      # `Webhooks::StripeEvents.provenance` reads that same field to stamp the
+      # emitted event. A case naming a different event id without moving the body's
+      # published an event that claimed to be the fixture's — and a test delivering
+      # two of them produced two rows the outbox's unique index refuses as one
+      # event. Which is exactly what it did, until this line existed.
+      body["id"] = overrides[:event_id] if overrides.key?(:event_id)
 
       if (status = overrides[:status])
         subscription["status"] = status

@@ -59,6 +59,22 @@ Three packets, in order.
   comparison that could not see a verb, and found one operation
   (`PUT /v1/customers/{id}`) that was served and in no document. It removed that
   route rather than documenting it. No behaviour in `app/` changed.
+- **billing-09** is a **duplicate-charge race and the constraint that closes it.**
+  `Ingestion#call` was a check followed by an act, and two concurrent deliveries of
+  one event id both read `handled?` as `false`, both emitted, and one Stripe event
+  became two `billing.payment.succeeded` rows — two envelope ids, which core defines
+  as the dedupe key, so a consumer cannot tell the duplicate from new information
+  about money. A partial unique index over the outbox's `processor_event_id` makes
+  the duplicate impossible under **any** interleaving, and a lost race is recorded as
+  `ignored:duplicate_delivery` rather than parked as a failure. The regression test
+  manufactures the interleaving with a two-party barrier — no sleep anywhere — and
+  the property is shown to rest on **more than one constraint**, because a start
+  payload deliberately carries no `processor_event_id`. The packet also found three
+  test helpers delivering under an event id their own payload did not carry, which
+  the new index turned from a silent lie into a loud failure, and a ~5% flake in
+  which a losing delivery was parked as a failure because a model validation won
+  the race instead of the index. See `REPORT-billing-09.md`, which also says what
+  was not fixed.
 - **billing-08** is hardening, and it is where the *recorded* gaps stop being
   prose. `test/contract/tenant_isolation_matrix_test.rb` enumerates every `/v1`
   operation the router serves and requires each one to be classified account-scoped
@@ -130,15 +146,21 @@ billing/
 │       │   ├── plan_change.rb         # when a move takes effect
 │       │   └── lifecycle.rb           # the only writer of a subscription
 │       └── webhooks/                  # verify, store, normalize, emit — in that order
+│           └── ingestion.rb           # store, act once, and what a lost race records
 ├── test/
 │   ├── contract/                      # the checks against core, and the HTTP one
 │   │   ├── http_surface_contract_test.rb # the document and the router, by method and path
 │   ├── coverage/                      # the money-path coverage gate, and its inventory
 │   ├── integration/                   # health, and the webhook's HTTP edge
 │   ├── models/                        # minitest, table-driven
+│   │   └── outbox_processor_event_id_migration_test.rb # reversibility, run for real
 │   ├── requests/v1/                   # the API specs
 │   └── services/                      # the lifecycle, the client, the webhook mapping
-└── .github/workflows/ci.yml           # calls kit's reusable workflow, plus the gate
+│       └── webhooks/
+│           └── concurrent_delivery_test.rb  # the duplicate-charge race, deterministically
+├── .github/workflows/ci.yml           # calls kit's reusable workflow, plus the gate
+├── CHANGELOG.md                       # every notable change, per Keep a Changelog
+└── REPORT-billing-09.md               # the race: evidence, fix, and what was not fixed
 ```
 
 ## Commands
@@ -329,6 +351,57 @@ transaction that marks the delivery finished. The rules:
 - **`stripe_event_id` is UNIQUE, and that index is the correctness mechanism**,
   not a query aid. `ProcessorWebhook.ingest` turns the resulting conflict back
   into a lookup, so two concurrent deliveries of one event produce one row.
+- **The UNIQUE index on that row is not, by itself, at-most-once — and the gap
+  between the two cost this service a duplicate charge.** It makes two concurrent
+  deliveries of one event id agree about *which row* they hold; it does not make
+  them agree about the answer. `Ingestion#call` reads `handled?` and then acts,
+  and `handled?` reads a column neither thread has written yet, so under READ
+  COMMITTED both read `nil` and both emit.
+  **At-most-once therefore rests on a second constraint, in the outbox:**
+  `outbox_events_processor_event_id_idx`, a partial unique index over
+  `((data ->> 'processor_event_id'))` where that key is present. It is an index
+  over an existing column and not a new one **because the outbox column list is
+  core's contract** — core's `docs/event-outbox.md` says "the column list is the
+  contract", and the key is already in `data` because `provenance` puts the
+  processor's own id in every webhook-emitted payload.
+  A duplicate refused by that index is recorded as `ignored:duplicate_delivery`,
+  **not** as `failed:` — the event exists, written by the request that won, and
+  parking it would put a row in front of a human for a correct event.
+  And the property is **more than one constraint, and not on this table alone**:
+  a start payload deliberately carries no `processor_event_id`, so a duplicate
+  `customer.subscription.created` never reaches the outbox index — the second
+  `INSERT` into `subscriptions` is refused first. **Which** refusal is a
+  scheduling accident, not a fact to write down: `subscriptions` carries a
+  uniqueness *validation* on `processor_subscription_id` in the model and a
+  unique *index* over the same column, and either thread can be refused by
+  either. Measured on this branch over 60 barrelled duplicate creations: **57
+  refused by the index, 3 by the validation.** Neither is individually
+  sufficient to reason about — dropping either one alone still prevented the
+  duplicate, while dropping *every* index on `subscriptions` reopened it (two
+  subscription rows, two `billing.subscription.started` events). So the honest
+  statement is that the duplicate is prevented as long as the model's validation
+  and the table's index are both there, and the ingestion layer is therefore
+  written against the **exception**, not against a named constraint.
+- **A uniqueness failure and a unique-index violation are one fact, and
+  `Ingestion` classifies them as the decision they are** —
+  `ignored:duplicate_delivery`, answered 200, never `failed:`. Before this, 3
+  deliveries in 60 were parked for a human over an event that was published and
+  perfectly correct, purely because a validation won the race instead of an
+  index. The classification is on the *error* (`:taken`), not the exception
+  class, because a `RecordInvalid` with no uniqueness error in it is a bug in
+  this service and still belongs in front of a human —
+  `ingestion_test.rb` holds both directions as their own tests, so widening the
+  rescue into a blanket one fails rather than being argued about.
+- **A delivery's id and the payload that arrived with it are one value.**
+  `stripe_controller.rb` passes `event_id: payload["id"]`, and
+  `Webhooks::StripeEvents.provenance` reads that same field to stamp the emitted
+  event, so in production the two cannot disagree. A test helper that varies the
+  delivery's id while leaving the body's id at the fixture's is arranging a state
+  Stripe never sends — and the outbox index above makes it fail loudly instead of
+  publishing two events that both claim to be the same one. Three helpers did
+  this; the one-line merge is in each, and a test pins the invariant.
+  `test/services/webhooks/concurrent_delivery_test.rb` holds all of it, and
+  `AGENTS.md`'s rule on concurrency tests below is written because of it.
 - **The outbox row and the `processed_at` that marks the delivery finished are
   one commit.** If they were two, a process that died between them would leave a
   row that looks unfinished with the event already published, and the next
@@ -477,6 +550,34 @@ environment, and the `pins` job fails the build if the workflow file ever gains 
 - No sleeps, no raised retries, no loosened assertions. A flaky test is
   attributed before it is fixed: failing test → can this diff reach that
   surface → measure the baseline at a clean HEAD.
+- **A concurrency test manufactures its interleaving; it never waits for one.**
+  Two threads doing the same thing at the same time is a *probable* race, and a
+  test asserting a probable outcome is a flake generator that passes on a fast
+  machine and fails on a loaded one. The window is entered on purpose: a
+  two-party barrier (`Mutex` + `ConditionVariable`, **no timeout** — a timeout
+  here is a sleep with a nicer name, and it turns a deadlock into a flake) holds
+  both threads inside the check-then-act window until both have arrived.
+  Three things this repository has already had to learn, all of them from
+  `test/services/webhooks/concurrent_delivery_test.rb`:
+  - **A thread's commit does not invalidate the main thread's query cache.**
+    Active Record's cache is on in the test environment, cleared between tests
+    but *not within one*, and every count is taken on the main thread after the
+    workers committed. Counts came back stale — `0` for a table holding a
+    committed row. The cache is dropped once, after the last commit, and counts
+    read through `uncached`.
+  - **`prepend` cannot be undone.** A file-scope `prepend` in a test changes
+    every other test in the suite for the rest of the run; install a gate with
+    `alias_method` on the class and restore it in `ensure`.
+  - **Running a migration commits the enclosing transaction**, so a
+    reversibility test inside a transactional test class makes its own rows
+    durable and breaks unrelated tests. It gets its own file.
+- **Threads need their own connections, so the test that uses them cannot be
+  transactional** — it would assert against an empty database while the workers
+  wrote real committed rows. The cost is rows that outlive the test, so the
+  teardown clears every table the path writes, in both directions (children
+  before parents), and the list of tables is written down rather than left as a
+  blanket truncation. Two classes in this repository do this, each for a stated
+  reason.
 - The database-down path is exercised for real, not asserted about: fake the
   leased connection with `with_lease_connection` in `test/test_helper.rb`.
   minitest 6 removed `Object#stub` (it moved to the `minitest-mock` gem, which

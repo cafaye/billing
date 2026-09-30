@@ -20,7 +20,7 @@
 #
 # THE BASELINE THIS FILE HOLDS
 #
-#   **823 runs, 2299 assertions, 0 failures, 0 errors, 0 skips** — measured on
+#   **851 runs, 2368 assertions, 0 failures, 0 errors, 0 skips** — measured on
 #   this branch, with billing-08's hardening and billing-09's race fix. The
 #   numbers below are that line, asserted.
 #
@@ -34,6 +34,14 @@
 #   - **+7 runs — the stale-delivery guard.** Seven tests pinning both directions
 #     of `stale_delivery`, including the equal-timestamp case a naive `<=` gets
 #     wrong.
+#   - **+34 runs, +65 assertions — the race fix and what it uncovered.** The
+#     outbox constraint (9 in `outbox_event_test.rb`, 5 in its own migration
+#     test) and the barrelled `concurrent_delivery_test.rb` (10) are new files;
+#     billing-09 also found that three test helpers delivered under an event id
+#     their own payload did not carry, which the new unique index turned from a
+#     silent lie into a loud failure — 4 tests, and 2 more pinning that a
+#     uniqueness failure is classified as the duplicate it is rather than parked
+#     as a failure.
 #   - **−1 run — `test/probe_test.rb` deleted.** It printed diagnostics and had
 #     zero assertions, so it inflated the run count and proved nothing.
 #
@@ -58,7 +66,7 @@
 #
 #   1. A database. billing's suite cannot start without PostgreSQL: `rails test`
 #      opens a connection while maintaining the test schema, so a runner with no
-#      postgres aborts before the first test — 0 of 823, exit 1. A caller cannot
+#      postgres aborts before the first test — 0 of 851, exit 1. A caller cannot
 #      hand a reusable workflow a service container at all: GitHub allows only
 #      `name`, `uses`, `with`, `secrets`, `strategy`, `needs`, `if`, `concurrency`
 #      and `permissions` on a job that calls one, so `services:` is not reachable
@@ -149,12 +157,12 @@ concurrency:
 
 env:
   # master at e63bb7a was 763 / 2100; this commit is billing-08's hardening and
-  # billing-09's race fix, which add 60 runs and 199 assertions. The gate asserts
-  # 823 runs / 2299 assertions / 0 failures / 0 errors / 0 skips against this, and
+  # billing-09's race fix, which add 88 runs and 268 assertions. The gate asserts
+  # 849 runs / 2364 assertions / 0 failures / 0 errors / 0 skips against this, and
   # every tier below carries its own count. Raising a number is allowed;
   # lowering one is not.
-  BASELINE_RUNS: '823'
-  BASELINE_ASSERTIONS: '2299'
+  BASELINE_RUNS: '851'
+  BASELINE_ASSERTIONS: '2368'
 
 jobs:
   # ------------------------------------------------------------------ shared
@@ -603,8 +611,8 @@ jobs:
         #
         # and the whole suite, same commit, same code:
         #
-        #   core present    823 runs, 2299 assertions, 0 failures, 0 errors,  0 skips
-        #   core unreadable 823 runs, 1956 assertions, 0 failures, 0 errors, 20 skips
+        #   core present    851 runs, 2368 assertions, 0 failures, 0 errors,  0 skips
+        #   core unreadable 851 runs, 2025 assertions, 0 failures, 0 errors, 20 skips
         #
         # **Same run count, same exit code, and 343 assertions of contract
         # checking simply not done.** A green CI run that did not notice the
@@ -705,7 +713,8 @@ jobs:
             test/integration/stripe_webhook_test.rb \
             test/integration/subscription_delivery_test.rb \
             test/services/webhooks/ingestion_test.rb \
-            test/services/webhooks/stripe_events_test.rb 2>&1 | tee "$log" || status=$?
+            test/services/webhooks/stripe_events_test.rb \
+            test/services/webhooks/concurrent_delivery_test.rb 2>&1 | tee "$log" || status=$?
           if [ "$status" -ne 0 ]; then
             echo "::error::the webhook tier exited $status" >&2
             exit "$status"
@@ -729,9 +738,9 @@ jobs:
           # that ends in a comma ("failures,") and every number is bare, so the
           # numbers land in the named variables with nothing to strip.
           read -r runs _r assertions _a failures _f errors _e skips _s <<< "$summary"
-          if [ "$runs" != 147 ] || [ "$assertions" != 352 ] ||
+          if [ "$runs" != 162 ] || [ "$assertions" != 390 ] ||
              [ "$failures" != 0 ] || [ "$errors" != 0 ] || [ "$skips" != 0 ]; then
-            echo "::error::expected 147 runs, 352 assertions, 0 failures, 0 errors, 0 skips; got '$summary'." >&2
+            echo "::error::expected 162 runs, 390 assertions, 0 failures, 0 errors, 0 skips; got '$summary'." >&2
             exit 1
           fi
           echo "$summary"

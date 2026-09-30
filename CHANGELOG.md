@@ -146,6 +146,107 @@ All notable changes to billing are recorded here. The format follows
 
 ### Fixed
 
+- **One Stripe event id could produce two `billing.payment.succeeded` events.**
+  A duplicate charge, and the most expensive defect this service has found.
+  `Webhooks::Ingestion#call` is a check followed by an act — it reads
+  `ProcessorWebhook#handled?` and, on `false`, writes the cafaye event and marks
+  the delivery finished. The unique index on `processor_webhooks.stripe_event_id`
+  makes two concurrent deliveries of one event id agree about *which row* they
+  hold, and that is not the same as agreeing about the answer: `handled?` reads
+  `processed_at`, a column neither thread has written yet, because each is about
+  to write it. Under READ COMMITTED neither sees the other's uncommitted work, so
+  both read `nil`, both dispatch, and one event becomes two.
+
+  Two rows are two envelope ids, and core defines the envelope `id` as the dedupe
+  key — **a consumer deduplicating on it cannot tell the duplicate from new
+  information about somebody's money.**
+
+  The fix is a constraint rather than a better check, because a duplicate was a
+  *permitted state* of `outbox_events` and no application-level guard fixes a
+  permitted state under concurrency. `20260930000010` adds a **partial unique
+  index over the payload's `processor_event_id`**:
+
+  ```sql
+  create unique index outbox_events_processor_event_id_idx
+    on outbox_events ((data ->> 'processor_event_id'))
+    where data ->> 'processor_event_id' is not null;
+  ```
+
+  It is a functional index over an existing column rather than a new one on
+  purpose: **the outbox column list is core's contract, not local** (core's
+  `docs/event-outbox.md`: "the column list is the contract"), and the key is
+  already in `data` because `Webhooks::StripeEvents.provenance` puts the
+  processor's own id in every webhook-emitted payload. No column added, no
+  envelope attribute added. The `WHERE` clause leaves the three model-callback
+  emissions alone — they are not the product of a delivery and have no such key.
+
+  `Ingestion` gained `DUPLICATE_REASON` and a `rescue ActiveRecord::RecordNotUnique`
+  branch that records `ignored:duplicate_delivery`. Without it the loser was
+  parked as `failed:ActiveRecord::RecordNotUnique…` — a row in front of a human
+  for an event that is published and correct.
+
+  **The constraint does not close every route, and that is recorded rather than
+  left to be discovered.** `billing.subscription.started` deliberately carries no
+  `processor_event_id` (the lifecycle's start payload is `core_payload` plus
+  `started_at`, and the lifecycle spec asserts the key's absence), so a duplicate
+  `customer.subscription.created` never reaches the outbox — the second `INSERT`
+  into `subscriptions` is refused first.
+
+  **Which** refusal is a scheduling accident, and the first draft of this entry
+  got it wrong. `subscriptions` carries a uniqueness *validation* on
+  `processor_subscription_id` in the model **and** a unique *index* over the same
+  column, and either thread can be refused by either. Measured over 60 barrelled
+  duplicate creations: **57 refused by the index, 3 by the validation.** So the
+  honest statement is that the duplicate is prevented while the validation and the
+  index are both present — dropping either *alone* still prevented it, while
+  dropping *every* index on `subscriptions` reopened it outright (two subscription
+  rows, two `billing.subscription.started` events). The ingestion layer is
+  therefore written against the **exception**, not against a named constraint, and
+  this entry claims no single index.
+
+  The stale-delivery guard from this same release is **not** part of this fix and
+  does not substitute for it: both deliveries carry the same processor timestamp,
+  so both are current and both pass it. Ordering and at-most-once are different
+  guarantees. Both are kept.
+
+- **A lost race was parked as a failure about 5% of the time, and is now always
+  recorded as a decision.** `Ingestion` classifies a uniqueness *failure* and a
+  unique-index *violation* as the same fact — both mean "a concurrent delivery of
+  this event id already acted on it" — so both record
+  `ignored:duplicate_delivery` and answer 200. Before this, `rescue
+  ActiveRecord::RecordNotUnique` covered only the index: when the model's own
+  uniqueness validation won the race instead, the loser fell through to
+  `rescue StandardError` and was parked as
+  `failed:ActiveRecord::RecordInvalid: Validation failed: Processor subscription
+  has already been taken`. Measured **3 in 60** barrelled duplicate creations.
+
+  That is a row in front of a human at 3am for an event that is published and
+  perfectly correct, and it was a **5% flake in the regression test that exists
+  to catch exactly this**, which is why it was not left as a known race.
+
+  The classification is deliberately on the *error* (Rails' `:taken`) and not on
+  the exception class: a `RecordInvalid` carrying any other validation failure is
+  a bug in this service and still parks. Both directions are separate tests in
+  `ingestion_test.rb`, so widening the rescue into a blanket one fails rather
+  than being argued about. After the change, 60 of 60 barrelled duplicate
+  creations recorded `ignored:duplicate_delivery` and **zero** were parked.
+
+- **Three test helpers delivered under an event id their own payload did not
+  carry.** `stripe_controller.rb` hands `Ingestion` `event_id: payload["id"]` and
+  `Webhooks::StripeEvents.provenance` reads that same field to stamp the emitted
+  event, so in production the delivery and its body cannot disagree about which
+  event this is. `ingestion_test.rb`, `lifecycle_test.rb` and
+  `subscription_delivery_test.rb` each varied the delivery's id while leaving the
+  body's at the fixture's, so events were published claiming to be the same one.
+
+  Nothing caught it, because nothing could: the outbox was permitted to hold two
+  rows with the same provenance, and `test_every_live_status_may_be_canceled`
+  asserted "every live status may be canceled" while three of its four deliveries
+  were silently doing nothing. The new index turns it into a hard failure rather
+  than a comment, and each helper now merges the id into the body. A test in each
+  file pins the invariant, and it was seen red first —
+  `["evt_a", "evt_b"]` against `["evt_1PZQaBcDeFgHiJkLmNoPqR4"]`.
+
 - **A signed webhook body that is valid JSON but not an object was answered
   500.** An array, a bare number, a string, a boolean or `null` are all valid
   JSON over a perfectly good signature, and all of them are not an event.
@@ -208,6 +309,56 @@ All notable changes to billing are recorded here. The format follows
   is untouched.
 
 ### Added
+
+- **`test/services/webhooks/concurrent_delivery_test.rb`** — the deterministic
+  regression test for the duplicate-payment race, and the reason the fix is
+  trustworthy. **No sleep, no retry and no loosened assertion anywhere in it.**
+
+  The interleaving is *manufactured*, not hoped for: `ProcessorWebhook#handled?`
+  is the mouth of the check-then-act window, and a two-party barrier
+  (`Mutex` + `ConditionVariable`, no timeout) holds both threads in it until both
+  have arrived. Without that, "two threads, same event id" is a *probable*
+  duplicate, and a test asserting a probable outcome is a flake generator.
+  **Twelve consecutive runs, 10 runs / 24 assertions / 0 failures / 0 errors /
+  0 skips, every one** — and that stability is a *result*, not an accident: it is
+  what fixing the 3-in-60 classification flake above bought. The file is also now
+  in the `gate` job's **webhook tier**, so the regression is gated by name rather
+  than only counted in the whole suite.
+
+  Two things about it are not obvious and both were learned the hard way:
+
+  - **The gate is installed with `alias_method`, not `prepend`.** Ruby cannot
+    un-prepend a module, and a file-scope `prepend` in a test would change every
+    other test in the suite for the rest of the run. The original is restored in
+    `ensure`.
+  - **The query cache is dropped before any count is read.** Active Record's
+    query cache is on in the test environment, cleared between tests but **not
+    within one**, and every count here is taken on the main thread *after* the
+    worker threads have committed. Nothing a worker thread did invalidates
+    anything this thread read earlier, so counts came back stale — `0` for a table
+    holding a committed row, and one run reporting `4 outbox rows` where there
+    were `2`. A count that cannot see the rows it is counting is a tripwire wired
+    to nothing, and this is the one file where a green count would have meant
+    nothing at all.
+
+  It also carries the negative controls: two *different* event ids must still be
+  two events (an index over the wrong expression would refuse a subscription's
+  `started` then `updated` while looking like it worked), and the start payload
+  is asserted to carry no `processor_event_id`, so it cannot silently become the
+  thing the other half tests.
+
+- **`test/models/outbox_processor_event_id_migration_test.rb`** takes the new
+  migration **down and back up for real**. The middle step is the one that
+  matters: with the index down the duplicate is writable, and with it up it is
+  not, with nothing else in the model changed between the halves — which is what
+  shows the constraint is what refuses, rather than a model validation.
+
+  It is a separate file for a safety reason, not a taste one: **running a
+  migration commits the enclosing transaction**, so a reversibility test inside
+  `outbox_event_test.rb` made every row it had written durable and broke four
+  unrelated tests with counts one too high. Its `teardown` restores the index
+  unconditionally, because a failed assertion partway through would otherwise
+  leave the index down for the whole suite.
 
 - **`test/contract/tenant_isolation_matrix_test.rb`** enumerates every `/v1`
   operation the router serves and requires each one to be classified as

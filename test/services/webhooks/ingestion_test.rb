@@ -16,6 +16,10 @@ require "test_helper"
 # grammar have already agreed to.
 class Webhooks::IngestionTest < ActiveSupport::TestCase
   INVOICE_PAID = "invoice.paid".freeze
+  # The one type whose handler *writes* a row, and therefore the one where a
+  # concurrent duplicate has something to collide on. Named rather than inlined
+  # because the two tests below stub this exact handler.
+  SUBSCRIPTION_CREATED = "customer.subscription.created".freeze
 
   setup do
     travel_to(frozen_now)
@@ -36,6 +40,17 @@ class Webhooks::IngestionTest < ActiveSupport::TestCase
   # the fixture name as the type instead would test a type Stripe never sends.
   def ingest(fixture, payload: nil, event_id: nil, type: nil)
     body = payload || JSON.parse(stripe_fixture(fixture))
+    # The body carries the id too, because in production it is the *same* id:
+    # `stripe_controller.rb` passes `event_id: payload["id"]`, so a delivery and
+    # the payload that arrived with it can never disagree. A helper that delivered
+    # under an id the body did not carry would be arranging a state Stripe never
+    # sends, and `Webhooks::StripeEvents.provenance` — which reads `payload["id"]` —
+    # would stamp every such event with the *fixture's* id instead, so two
+    # deliveries that were genuinely two events would be published as two rows
+    # claiming to be the same one. The outbox's unique index over that key is what
+    # finally made the disagreement visible.
+    body = body.merge("id" => event_id) if event_id
+
     Webhooks::Ingestion.new(
       processor: :stripe,
       event_id: event_id || body["id"],
@@ -102,6 +117,23 @@ class Webhooks::IngestionTest < ActiveSupport::TestCase
 
     assert_equal 2, ProcessorWebhook.count
     assert_equal 2, OutboxEvent.count
+  end
+
+  # The two ids above are only two events if each event says *which* delivery it
+  # came from. Both events carrying the same `processor_event_id` is a state the
+  # database now refuses outright — and before it did, this file asserted "two
+  # events" over two rows that were indistinguishable by provenance, which is the
+  # same defect as the duplicate, one layer down and wearing a passing test.
+  #
+  # The invariant is the controller's: `stripe_controller.rb` passes
+  # `event_id: payload["id"]`, so a delivery's id and the body it carries are one
+  # value by construction.
+  test "each emitted event carries the id of the delivery it came from" do
+    ingest(INVOICE_PAID, event_id: "evt_a")
+    ingest(INVOICE_PAID, event_id: "evt_b")
+
+    assert_equal %w[evt_a evt_b],
+      OutboxEvent.order(:created_at, :id).pluck(:data).map { |data| data.fetch("processor_event_id") }.sort
   end
 
   test "an event with no handler is stored and marked processed as ignored" do
@@ -320,6 +352,54 @@ class Webhooks::IngestionTest < ActiveSupport::TestCase
         "expected a parked row, got: #{record.error.inspect}"
       assert_predicate record.processed_at, :present?
       assert_equal 0, OutboxEvent.count
+    end
+  end
+
+  # The other half of the same case, and the one that decides whether this is a
+  # *decision* or a *row in front of a human*.
+  #
+  # Two concurrent deliveries of one `customer.subscription.created` both insert a
+  # subscription, and **which** constraint refuses the loser is not deterministic:
+  # the model's uniqueness validation on `processor_subscription_id` and the
+  # unique index over the same column are two answers to one question, and either
+  # thread can be the one refused by either. Measured over 60 barrelled duplicate
+  # creations on this branch: 57 recorded `ignored:duplicate_delivery`, and **3
+  # were parked as `failed:ActiveRecord::RecordInvalid`**.
+  #
+  # All 60 were the same fact — one delivery, acted on once, never two
+  # subscriptions. A uniqueness failure *is* the duplicate the index already
+  # records, so it is classified as the decision it is. Widening this into a
+  # blanket `RecordInvalid` rescue would go the other way: the test above parks a
+  # genuinely broken mapping, and swallowing that would turn a bug into a silent
+  # no-op answered 200.
+  test "a uniqueness failure from the handler is a duplicate delivery, not a row for a human" do
+    taken = Subscription.new
+    taken.errors.add(:processor_subscription_id, :taken)
+
+    with_handler(SUBSCRIPTION_CREATED, ->(_payload, _event_time) { raise ActiveRecord::RecordInvalid, taken }) do
+      record = ingest(SUBSCRIPTION_CREATED)
+
+      assert_equal "ignored:duplicate_delivery", record.error
+      assert_predicate record, :ignored?
+      refute_predicate record, :failed?
+      assert_predicate record.processed_at, :present?
+      assert_equal 0, ActiveRecord::Base.uncached { OutboxEvent.count }
+    end
+  end
+
+  # The control, as its own test rather than as an absence: a `RecordInvalid`
+  # with no uniqueness error in it is still parked, because that is a bug in this
+  # service and nobody should have to tell it from a race by reading the
+  # exception class.
+  test "a validation failure that is not a uniqueness failure is still parked" do
+    broken = Subscription.new
+    broken.errors.add(:status, :inclusion, message: "is not included")
+
+    with_handler(SUBSCRIPTION_CREATED, ->(_payload, _event_time) { raise ActiveRecord::RecordInvalid, broken }) do
+      record = ingest(SUBSCRIPTION_CREATED)
+
+      assert record.error.start_with?("failed:ActiveRecord::RecordInvalid:"),
+        "a non-uniqueness validation failure is a bug and belongs in front of a human; got: #{record.error.inspect}"
     end
   end
 
