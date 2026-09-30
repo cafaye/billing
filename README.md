@@ -304,12 +304,14 @@ defaulted — a webhook payload is the weakest input in the system, and a defaul
 that silently fills a gap is how a customer ends up on a plan nobody charged
 them for.
 
-`billing.subscription.started` is the one event core ships a payload schema for,
-and that schema is closed with `additionalProperties: false`, so a started event
-carries exactly its eight fields and nothing else — the processor's provenance
-stays on the delivery row, where a human can find it. The other two carry the
-same eight plus the period, the cancellation intent and the processor's ids, and
-`test/contract/` fails the day core ships a schema for them.
+core now ships a payload schema for **all eight** of these types. The three
+subscription events **do not satisfy theirs**: core's D10 rewrote those schemas
+on the grounds that billing has no subscriptions table, which was true when core
+read billing-03b and stopped being true when billing-04 added one. They are
+recorded as a known issue below rather than matched, because matching core would
+mean either dropping `plan_id` and `account_id` — the two fields that make a
+subscription event actionable — or publishing a shape no consumer has agreed to.
+`test/contract/` fails the day core settles it, in either direction.
 
 **Every terminal outcome is a 200.** A replay, an event type this build has no
 mapping for, a type it deliberately ignores (`ping`; a subscription-mode
