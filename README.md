@@ -304,12 +304,14 @@ defaulted — a webhook payload is the weakest input in the system, and a defaul
 that silently fills a gap is how a customer ends up on a plan nobody charged
 them for.
 
-`billing.subscription.started` is the one event core ships a payload schema for,
-and that schema is closed with `additionalProperties: false`, so a started event
-carries exactly its eight fields and nothing else — the processor's provenance
-stays on the delivery row, where a human can find it. The other two carry the
-same eight plus the period, the cancellation intent and the processor's ids, and
-`test/contract/` fails the day core ships a schema for them.
+core now ships a payload schema for **all eight** of these types. The three
+subscription events **do not satisfy theirs**: core's D10 rewrote those schemas
+on the grounds that billing has no subscriptions table, which was true when core
+read billing-03b and stopped being true when billing-04 added one. They are
+recorded as a known issue below rather than matched, because matching core would
+mean either dropping `plan_id` and `account_id` — the two fields that make a
+subscription event actionable — or publishing a shape no consumer has agreed to.
+`test/contract/` fails the day core settles it, in either direction.
 
 **Every terminal outcome is a 200.** A replay, an event type this build has no
 mapping for, a type it deliberately ignores (`ping`; a subscription-mode
@@ -371,17 +373,27 @@ to make, not an oversight.
 - **The unique-index race is handled but untested.** A `RecordNotUnique` that
   slips past the validations is a `409`, which is right; proving it needs two
   concurrent writers, so no spec covers that line.
-- **`billing.subscription.started` matches core's payload schema except for the
-  id *format*.** The fields and their types now do: a started event is built to
-  core's eight fields and nothing else, which closed the gap recorded in
-  billing-03b. What remains is that core asks for `sub_…` / `pln_…` / `acc_…`
-  prefixed ULIDs and this service's ids are uuids, which `Plan#id` and
-  `Customer#owner_id` have been since billing-02. Changing them is a breaking
-  change to a contract several services already read, so it is a platform
-  decision. Tracked as `PENDING_ID_PATTERNS` in
-  `test/contract/outbox_envelope_contract_test.rb`, asserted in both directions —
-  core's pattern must still be the one recorded *and* our value must still miss it,
-  so the entry is removed rather than forgotten when it stops being true.
+- **core's payload schemas and the three subscription events disagree, and the
+  disagreement is recorded rather than paid for.** core-03 shipped a payload
+  schema for all eight types. `billing.customer.created` and both
+  `billing.payment.*` payloads satisfy theirs. `billing.plan.created` and
+  `billing.plan.updated` satisfy theirs except for `entitlements`, which core's
+  plan schema does not name. The three `billing.subscription.*` payloads do not:
+  core's D10 rewrote those schemas because "billing has no subscriptions table",
+  which was true of billing-03b and stopped being true when billing-04 added one,
+  so they describe the processor-normalised payload this build replaced. The
+  difference is in `PENDING_PAYLOAD_ALIGNMENT` in
+  `test/contract/outbox_envelope_contract_test.rb`, asserted in both directions,
+  and it is a DECISION NEEDED in `cafaye.yml`: core owns the second breaking
+  change its own D10 anticipates. Matching core from here would mean emitting a
+  payload no consumer has agreed to, or dropping `plan_id` and `account_id` — the
+  two fields that make a subscription event actionable.
+- **`PENDING_ID_PATTERNS` is empty.** core's D10 removed the `sub_…` / `pln_…` /
+  `acc_…` patterns from the started schema, and removed `plan_id` and
+  `account_id` as properties entirely, so there is nothing for this service's uuids
+  to fail to match. The table stays as a constant and the contract test derives
+  the gap from core's files, because a table iterated zero times would exit 0
+  having proved nothing.
 - **A subscription created directly in the processor's dashboard is not tracked.**
   It carries no cafaye customer id, so the delivery is recorded as
   `ignored:unknown_customer` and answered 200. Matching it to whoever happens to
