@@ -1,0 +1,103 @@
+{
+  "id": "evt_1PZQaBcDeFgHiJkLmNoPqR4",
+  "object": "event",
+  "api_version": "2024-06-20",
+  "created": 1791345600,
+  "livemode": false,
+  "pending_webhooks": 1,
+  "request": {
+    "id": null,
+    "idempotency_key": null
+  },
+  "type": "invoice.paid",
+  "data": {
+    "object": {
+      "id": "in_1PZQaBcDeFgHiJkLmNoPqR3",
+      "object": "invoice",
+      "account_country": "US",
+      "amount_due": 8700,
+      "amount_paid": 8700,
+      "amount_remaining": 0,
+      "attempt_count": 1,
+      "attempted": true,
+      "auto_advance": false,
+      "billing_reason": "subscription_cycle",
+      "charge": "ch_3PZQaBcDeFgHiJkLmNoPqR6",
+      "collection_method": "charge_automatically",
+      "created": 1791345600,
+      "currency": "usd",
+      "customer": "cus_R1pQKz9xLp2mN4vB6yH8jL0",
+      "customer_email": "kaka@example.com",
+      "customer_name": "Kaka Ruto",
+      "default_payment_method": null,
+      "description": null,
+      "discount": null,
+      "due_date": null,
+      "ending_balance": 0,
+      "footer": null,
+      "hosted_invoice_url": "https://invoice.stripe.com/i/acct_123/in_1PZQaBcDeFgHiJkLmNoPqR3",
+      "lines": {
+        "object": "list",
+        "data": [
+          {
+            "id": "il_1PZQaBcDeFgHiJkLmNoPqR5",
+            "object": "line_item",
+            "amount": 8700,
+            "currency": "usd",
+            "description": "3 × Pro monthly",
+            "discountable": true,
+            "livemode": false,
+            "metadata": {},
+            "period": {
+              "end": 1793505600,
+              "start": 1790827200
+            },
+            "price": {
+              "id": "price_1PZQaBcDeFgHiJkLmNoPqR2",
+              "object": "price",
+              "currency": "usd",
+              "interval": "month",
+              "unit_amount": 2900
+            },
+            "proration": false,
+            "quantity": 3,
+            "subscription": "sub_1PZQaBcDeFgHiJkLmNoPqR1"
+          }
+        ],
+        "has_more": false,
+        "url": "/v1/invoices/in_1PZQaBcDeFgHiJkLmNoPqR3/lines"
+      },
+      "livemode": false,
+      "metadata": {},
+      "next_payment_attempt": null,
+      "number": "8ZQ1-0001",
+      "paid": true,
+      "paid_out_of_band": false,
+      "payment_intent": "pi_3PZQaBcDeFgHiJkLmNoPqR4",
+      "payment_settings": {
+        "default_mandate": null,
+        "payment_method_options": null,
+        "payment_method_types": [ "card" ]
+      },
+      "period_end": 1793505600,
+      "period_start": 1790827200,
+      "post_payment_credit_notes_amount": 0,
+      "pre_payment_credit_notes_amount": 0,
+      "receipt_number": null,
+      "starting_balance": 0,
+      "statement_descriptor": null,
+      "status": "paid",
+      "status_transitions": {
+        "finalized_at": 1791345600,
+        "marked_uncollectible_at": null,
+        "paid_at": 1791345800,
+        "voided_at": null
+      },
+      "subscription": "sub_1PZQaBcDeFgHiJkLmNoPqR1",
+      "subtotal": 8700,
+      "tax": null,
+      "total": 8700,
+      "webhooks_delivered_at": 1791345800
+    }
+  }
+}

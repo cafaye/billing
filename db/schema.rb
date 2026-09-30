@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_09_30_000005) do
+ActiveRecord::Schema[8.1].define(version: 2026_09_30_000006) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -68,5 +68,19 @@ ActiveRecord::Schema[8.1].define(version: 2026_09_30_000005) do
     t.check_constraint "\"interval\"::text = ANY (ARRAY['month'::character varying, 'year'::character varying, 'one_time'::character varying]::text[])", name: "plans_interval_known"
     t.check_constraint "amount_cents >= 0", name: "plans_amount_cents_not_negative"
     t.check_constraint "trial_days >= 0", name: "plans_trial_days_not_negative"
+  end
+
+  create_table "processor_webhooks", id: :uuid, default: -> { "gen_random_uuid()" }, force: :cascade do |t|
+    t.string "processor", null: false
+    t.string "stripe_event_id", null: false
+    t.string "type", null: false
+    t.jsonb "payload", default: {}, null: false
+    t.timestamptz "processed_at"
+    t.text "error"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["processed_at"], name: "processor_webhooks_unprocessed_idx", where: "(processed_at IS NULL)"
+    t.index ["stripe_event_id"], name: "index_processor_webhooks_on_stripe_event_id", unique: true
+    t.check_constraint "processor::text = 'stripe'::text", name: "processor_webhooks_processor_known"
   end
 end

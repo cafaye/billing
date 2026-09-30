@@ -32,6 +32,15 @@ gem "image_processing", "~> 1.2"
 # Use Rack CORS for handling Cross-Origin Resource Sharing (CORS), making cross-origin Ajax possible
 # gem "rack-cors"
 
+# Stripe, the payment processor. This build uses exactly one thing from it:
+# `Stripe::Webhook.construct_event`, the signature verification for inbound
+# webhooks. There is no API client here — this service receives, it does not
+# call out to Stripe. The gem is here because the signature scheme (HMAC-SHA256
+# over `timestamp.body` with a tolerance window) is the processor's contract,
+# and re-implementing it would be a hand-rolled crypto path in the one place a
+# forged amount must never be believed.
+gem "stripe", "~> 19.6"
+
 group :development, :test do
   # See https://guides.rubyonrails.org/debugging_rails_applications.html#debugging-with-the-debug-gem
   gem "debug", platforms: %i[ mri windows ], require: "debug/prelude"

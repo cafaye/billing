@@ -1,0 +1,49 @@
+{
+  "id": "evt_1PZQaBcDeFgHiJkLmNoPqR7",
+  "object": "event",
+  "api_version": "2024-06-20",
+  "created": 1791345900,
+  "livemode": false,
+  "pending_webhooks": 1,
+  "request": {
+    "id": null,
+    "idempotency_key": null
+  },
+  "type": "checkout.session.completed",
+  "data": {
+    "object": {
+      "id": "cs_test_b1PZQaBcDeFgHiJkLmNoP",
+      "object": "checkout.session",
+      "after_expiration": null,
+      "amount_subtotal": 1500,
+      "amount_total": 1500,
+      "automatic_tax": {
+        "enabled": false,
+        "liability": null
+      },
+      "billing_address_collection": "auto",
+      "cancel_url": "https://app.cafaye.com/settings/billing/canceled",
+      "client_reference_id": "acc_01J9Z8RR7B2QK3M4N5P6Q7R8S9T",
+      "client_secret": null,
+      "consent": null,
+      "currency": "usd",
+      "customer": "cus_R1pQKz9xLp2mN4vB6yH8jL0",
+      "customer_creation": null,
+      "customer_email": "kaka@example.com",
+      "expires_at": 1791945700,
+      "invoice": null,
+      "livemode": false,
+      "locale": "auto",
+      "metadata": {},
+      "mode": "payment",
+      "payment_intent": "pi_3PZQaBcDeFgHiJkLmNoPqRd",
+      "payment_method_types": [ "card" ],
+      "payment_status": "paid",
+      "status": "complete",
+      "status_expiration": null,
+      "subscription": null,
+      "success_url": "https://app.cafaye.com/welcome",
+      "ui_mode": "hosted"
+    }
+  }
+}

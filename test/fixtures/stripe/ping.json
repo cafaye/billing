@@ -1,0 +1,16 @@
+{
+  "id": "evt_1PZQaBcDeFgHiJkLmNoPqR8",
+  "object": "event",
+  "api_version": "2024-06-20",
+  "created": 1790740000,
+  "livemode": false,
+  "pending_webhooks": 1,
+  "request": {
+    "id": null,
+    "idempotency_key": null
+  },
+  "type": "ping",
+  "data": {
+    "object": {}
+  }
+}
