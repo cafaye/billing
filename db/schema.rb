@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_09_30_000006) do
+ActiveRecord::Schema[8.1].define(version: 2026_09_30_000009) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -64,9 +64,13 @@ ActiveRecord::Schema[8.1].define(version: 2026_09_30_000006) do
     t.boolean "active", default: true, null: false
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
+    t.jsonb "entitlements", default: {}, null: false
     t.index ["slug"], name: "index_plans_on_slug", unique: true
-    t.check_constraint "\"interval\"::text = ANY (ARRAY['month'::character varying, 'year'::character varying, 'one_time'::character varying]::text[])", name: "plans_interval_known"
+    t.check_constraint "NOT entitlements ? 'features'::text OR jsonb_typeof(entitlements -> 'features'::text) = 'array'::text", name: "plans_entitlements_features_is_array"
+    t.check_constraint "NOT entitlements ? 'limits'::text OR jsonb_typeof(entitlements -> 'limits'::text) = 'object'::text", name: "plans_entitlements_limits_is_object"
+    t.check_constraint "\"interval\"::text = ANY (ARRAY['month'::character varying::text, 'year'::character varying::text, 'one_time'::character varying::text])", name: "plans_interval_known"
     t.check_constraint "amount_cents >= 0", name: "plans_amount_cents_not_negative"
+    t.check_constraint "jsonb_typeof(entitlements) = 'object'::text", name: "plans_entitlements_is_object"
     t.check_constraint "trial_days >= 0", name: "plans_trial_days_not_negative"
   end
 
@@ -83,4 +87,27 @@ ActiveRecord::Schema[8.1].define(version: 2026_09_30_000006) do
     t.index ["stripe_event_id"], name: "index_processor_webhooks_on_stripe_event_id", unique: true
     t.check_constraint "processor::text = 'stripe'::text", name: "processor_webhooks_processor_known"
   end
+
+  create_table "subscriptions", id: :uuid, default: -> { "gen_random_uuid()" }, force: :cascade do |t|
+    t.uuid "account_id", null: false
+    t.uuid "customer_id", null: false
+    t.uuid "plan_id", null: false
+    t.string "processor_subscription_id", null: false
+    t.string "status", null: false
+    t.timestamptz "current_period_start"
+    t.timestamptz "current_period_end"
+    t.boolean "cancel_at_period_end", default: false, null: false
+    t.timestamptz "canceled_at"
+    t.timestamptz "last_processor_event_at"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["account_id", "plan_id"], name: "subscriptions_live_account_plan_idx", unique: true, where: "((status)::text <> 'canceled'::text)"
+    t.index ["customer_id"], name: "index_subscriptions_on_customer_id"
+    t.index ["plan_id"], name: "index_subscriptions_on_plan_id"
+    t.index ["processor_subscription_id"], name: "index_subscriptions_on_processor_subscription_id", unique: true
+    t.check_constraint "status::text = ANY (ARRAY['trialing'::text, 'active'::text, 'past_due'::text, 'canceled'::text, 'unpaid'::text])", name: "subscriptions_status_known"
+  end
+
+  add_foreign_key "subscriptions", "customers"
+  add_foreign_key "subscriptions", "plans"
 end

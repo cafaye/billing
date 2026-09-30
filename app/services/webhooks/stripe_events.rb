@@ -88,6 +88,12 @@ module Webhooks
       Time.at(value).utc.iso8601
     end
 
+    # The processor's own `created` is *not* in the normalized hash, and that is
+    # deliberate. `Webhooks::Ingestion` computes it once and hands the same instant
+    # to the handler and to the outbox row, so the event's `time` and the payload's
+    # `started_at` cannot be two readings of one field. A third copy here would be
+    # a third reading.
+
     # A money amount on the wire. `Money#to_h` is the platform's crossing shape,
     # so the normalized payload uses it verbatim rather than a key invented here
     # — an event payload that spelled money differently from every other boundary
@@ -113,6 +119,12 @@ module Webhooks
         "kind" => "subscription",
         "subscription_id" => subscription["id"],
         "customer_id" => subscription["customer"],
+        # The link back to a cafaye customer, carried in the subscription's metadata
+        # when the subscription was bought through our Checkout session. It is absent
+        # for a subscription created directly in the processor's dashboard, and the
+        # delivery is then recorded as `unknown_customer` rather than matched to
+        # whoever happens to share an id.
+        "cafaye_customer_id" => subscription.dig("metadata", "cafaye_customer_id"),
         "status" => subscription["status"],
         "quantity" => item["quantity"],
         "price_id" => price["id"] || subscription.dig("plan", "id"),
@@ -121,7 +133,10 @@ module Webhooks
         "current_period_end" => time_of(subscription["current_period_end"]),
         "cancel_at_period_end" => subscription["cancel_at_period_end"],
         "canceled_at" => time_of(subscription["canceled_at"]),
-        "trial" => subscription["trial_start"].present?
+        "trial" => subscription["trial_start"].present?,
+        # The trial's end in the shape core's payload schema wants it: a date-time,
+        # or null while trialing with no end date.
+        "trial_ends_at" => subscription["trial_start"].present? ? time_of(subscription["trial_end"]) : nil
       )
     end
 
@@ -188,20 +203,54 @@ module Webhooks
     # The registry and the normalizers are built from one table, so a type cannot
     # be normalizable but un-emittable, or vice versa.
     NORMALIZERS = {
-      "customer.subscription.created" => method(:subscription_of),
-      "customer.subscription.updated" => method(:subscription_of),
-      "customer.subscription.deleted" => method(:subscription_of),
+      Subscriptions::Lifecycle::CREATED => method(:subscription_of),
+      Subscriptions::Lifecycle::UPDATED => method(:subscription_of),
+      Subscriptions::Lifecycle::DELETED => method(:subscription_of),
       "invoice.paid" => method(:invoice_of),
       "invoice.payment_failed" => method(:invoice_of),
       CHECKOUT_TYPE => method(:checkout_session_of)
     }.freeze
 
+    # Two kinds of handler, and the difference is what the emission *is*.
+    #
+    # A subscription event applies to a row in this service, so the event type and
+    # the subject are decided by what happened to that row and are not known until
+    # it has been written. `Subscriptions::Lifecycle` is therefore the handler: it
+    # writes the row and returns the emission for the change, inside the caller's
+    # transaction. Its refusals are `Subscriptions::Refused`, which is translated
+    # here into `Webhooks::Ignored` — the vocabulary the ingestion layer already
+    # records on a delivery row and answers 200.
+    #
+    # A payment event has no row, so its type and subject come from the normalized
+    # payload and the handler is a mapping and nothing more.
     HANDLERS = NORMALIZERS.keys.to_h do |type|
-      [ type, ->(payload) {
-        data = normalize(payload)
-        Emission.new(event_type: event_type_for(type, data), subject: subject_for(data), data: data)
-      } ]
+      handler = if Subscriptions::Lifecycle::TYPES.include?(type)
+        ->(payload, event_time) { subscription_emission(type, payload, event_time) }
+      else
+        ->(payload, _event_time) { payment_emission(type, payload) }
+      end
+
+      [ type, handler ]
     end.freeze
+
+    def self.subscription_emission(type, payload, event_time)
+      applied = Subscriptions::Lifecycle.new(data: normalize(payload), event_time: event_time).call(type)
+
+      Emission.new(event_type: applied.event_type, subject: applied.subject, data: applied.data)
+    rescue Subscriptions::Refused => e
+      # A decision this service has made, recorded with its reason and answered 200.
+      # Not a failure: an unknown customer, a plan we do not have, a delivery that
+      # arrived before the one it depends on and a repeat of a state we already hold
+      # are all conclusions, and a retry reaches the identical one.
+      raise Ignored, e.reason
+    end
+
+    def self.payment_emission(type, payload)
+      data = normalize(payload)
+
+      Emission.new(event_type: event_type_for(type, data), subject: subject_for(data), data: data)
+    end
+    private_class_method :payment_emission
 
     class << self
       # The handler for a processor event type, or nil when this build does not

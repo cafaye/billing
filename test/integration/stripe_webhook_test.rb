@@ -15,6 +15,10 @@ require "test_helper"
 # this service is, from the same one place — asserted with the shared
 # `assert_problem` helper rather than field by field.
 class StripeWebhookTest < ActionDispatch::IntegrationTest
+  setup do
+    travel_to(frozen_now)
+  end
+
   test "a signed event is accepted" do
     post_stripe_webhook(stripe_fixture("invoice.paid"))
 
@@ -190,8 +194,10 @@ class StripeWebhookTest < ActionDispatch::IntegrationTest
   test "a replayed subscription event emits one event, not two" do
     payload = stripe_fixture("customer.subscription.created")
 
-    post_stripe_webhook(payload)
-    post_stripe_webhook(payload)
+    with_resolvable_subscription do
+      post_stripe_webhook(payload)
+      post_stripe_webhook(payload)
+    end
 
     assert_equal 1, OutboxEvent.where(event_type: "billing.subscription.started").count
   end
@@ -206,33 +212,75 @@ class StripeWebhookTest < ActionDispatch::IntegrationTest
     assert_equal first_status, response.status
   end
 
-  # Stripe does not promise ordering, and a webhook endpoint that assumed it
-  # would reject a legitimate delivery. Each event is normalized on its own.
+  # Stripe does not promise ordering, and a webhook endpoint that assumed it would
+  # reject a legitimate delivery. What changed in billing-04 is not the acceptance
+  # — it is what a deletion arriving first now *does*.
+  #
+  # billing-03b normalized each event independently and published both, which left
+  # an active subscription row for something the processor said was gone. An active
+  # row grants entitlements. billing-04 keeps the deletion, as a canceled row that
+  # grants nothing, and refuses the creation that follows it.
   test "a deletion arriving before its creation is accepted" do
-    post_stripe_webhook(stripe_fixture("customer.subscription.deleted"))
-    post_stripe_webhook(stripe_fixture("customer.subscription.created"))
-
-    assert_response :ok
-    assert_equal 2, OutboxEvent.count
-  end
-
-  test "an update arriving before its creation is accepted" do
-    post_stripe_webhook(stripe_fixture("customer.subscription.updated"))
-    post_stripe_webhook(stripe_fixture("customer.subscription.created"))
+    with_resolvable_subscription do
+      post_stripe_webhook(stripe_fixture("customer.subscription.deleted"))
+      post_stripe_webhook(stripe_fixture("customer.subscription.created"))
+    end
 
     assert_response :ok
     assert_equal 2, ProcessorWebhook.where("type LIKE 'customer.subscription.%'").count
   end
 
-  test "out-of-order deliveries keep their own event times" do
-    post_stripe_webhook(stripe_fixture("customer.subscription.deleted"))
-    post_stripe_webhook(stripe_fixture("customer.subscription.created"))
+  test "a deletion arriving before its creation leaves the subscription canceled" do
+    with_resolvable_subscription do
+      post_stripe_webhook(stripe_fixture("customer.subscription.deleted"))
+      post_stripe_webhook(stripe_fixture("customer.subscription.created"))
+    end
 
-    canceled = OutboxEvent.find_by(event_type: "billing.subscription.canceled")
-    started = OutboxEvent.find_by(event_type: "billing.subscription.started")
+    assert_equal "canceled", Subscription.sole.status
+    refute_predicate Subscription.sole, :grants_entitlements?
+  end
 
-    assert_equal Time.utc(2026, 11, 14, 4, 0, 0), canceled.time
+  test "a deletion arriving before its creation is the only event, because nothing started" do
+    with_resolvable_subscription do
+      post_stripe_webhook(stripe_fixture("customer.subscription.deleted"))
+      post_stripe_webhook(stripe_fixture("customer.subscription.created"))
+    end
+
+    assert_equal [ "billing.subscription.canceled" ], subscription_event_types
+  end
+
+  test "an update arriving before its creation is accepted" do
+    with_resolvable_subscription do
+      post_stripe_webhook(stripe_fixture("customer.subscription.updated"))
+      post_stripe_webhook(stripe_fixture("customer.subscription.created"))
+    end
+
+    assert_response :ok
+    assert_equal 2, ProcessorWebhook.where("type LIKE 'customer.subscription.%'").count
+  end
+
+  test "an update arriving before its creation records why it was refused" do
+    with_resolvable_subscription do
+      post_stripe_webhook(stripe_fixture("customer.subscription.updated"))
+      post_stripe_webhook(stripe_fixture("customer.subscription.created"))
+    end
+
+    assert_equal "ignored:no_subscription_to_update", ProcessorWebhook.find_by(type: "customer.subscription.updated").error
+  end
+
+  # core: the event's `time` is when the state change happened, not when this
+  # service read about it.
+  test "each delivery keeps the time the processor reported" do
+    with_resolvable_subscription do
+      post_stripe_webhook(stripe_fixture("customer.subscription.created"))
+      travel_to 1.hour.from_now
+      post_stripe_webhook(stripe_fixture("customer.subscription.deleted"))
+    end
+
+    started, canceled = OutboxEvent.where(event_type: SUBSCRIPTION_EVENTS).order(:created_at, :id).to_a
+
     assert_equal Time.utc(2026, 9, 30, 4, 0, 0), started.time
+    assert_equal Time.utc(2026, 11, 14, 4, 0, 0), canceled.time
   end
 
   test "an unknown event type is accepted and stored" do
@@ -279,10 +327,12 @@ class StripeWebhookTest < ActionDispatch::IntegrationTest
   end
 
   test "a subscription signup states one fact once, not once per delivery channel" do
-    post_stripe_webhook(stripe_fixture("checkout.session.completed"))
-    post_stripe_webhook(stripe_fixture("customer.subscription.created"))
+    with_resolvable_subscription do
+      post_stripe_webhook(stripe_fixture("checkout.session.completed"))
+      post_stripe_webhook(stripe_fixture("customer.subscription.created"))
+    end
 
-    assert_equal [ "billing.subscription.started" ], OutboxEvent.pluck(:event_type)
+    assert_equal [ "billing.subscription.started" ], subscription_event_types
   end
 
   # A signed body that is not an event cannot be stored: a row with no event id
@@ -370,9 +420,6 @@ class StripeWebhookTest < ActionDispatch::IntegrationTest
   # `checkout.session.completed` appears twice because the mode in the payload
   # decides what the session means.
   HANDLED_TYPES = {
-    "customer.subscription.created" => "billing.subscription.started",
-    "customer.subscription.updated" => "billing.subscription.updated",
-    "customer.subscription.deleted" => "billing.subscription.canceled",
     "invoice.paid" => "billing.payment.succeeded",
     "invoice.payment_failed" => "billing.payment.failed",
     "checkout.session.completed.payment" => "billing.payment.succeeded"
@@ -385,6 +432,58 @@ class StripeWebhookTest < ActionDispatch::IntegrationTest
       assert_response :ok
       assert_equal event_type, OutboxEvent.sole.event_type
     end
+  end
+
+  # A subscription delivery has to resolve to a customer and a plan before it is
+  # acted on, so it is asserted on its own rather than in the table above: those
+  # specs assert on `OutboxEvent.sole`, and the two records this one needs publish
+  # events of their own.
+  test "customer.subscription.created emits billing.subscription.started" do
+    with_resolvable_subscription do
+      post_stripe_webhook(stripe_fixture("customer.subscription.created"))
+    end
+
+    assert_response :ok
+    assert_equal [ "billing.subscription.started" ], subscription_event_types
+  end
+
+  # The three subscription types, each following from the state the delivery put the
+  # row into. Asserted as one sequence because the point is that the *state* decides
+  # the type: a delivery is an update or a cancellation depending on what the row
+  # was, and a start or a cancellation depending on whether the row existed.
+  test "a subscription is started, updated and then canceled, in that order" do
+    with_resolvable_subscription do
+      post_stripe_webhook(stripe_fixture("customer.subscription.created"))
+      travel_to 1.hour.from_now
+      post_stripe_webhook(stripe_fixture("customer.subscription.updated"))
+      travel_to 2.hours.from_now
+      post_stripe_webhook(stripe_fixture("customer.subscription.deleted"))
+    end
+
+    assert_equal(
+      [ "billing.subscription.started", "billing.subscription.updated", "billing.subscription.canceled" ],
+      subscription_event_types
+    )
+  end
+
+  test "every subscription event is correlated on this service's own subscription" do
+    with_resolvable_subscription do
+      post_stripe_webhook(stripe_fixture("customer.subscription.created"))
+      travel_to 1.hour.from_now
+      post_stripe_webhook(stripe_fixture("customer.subscription.updated"))
+    end
+
+    assert_equal [ Subscription.sole.id ], OutboxEvent.where(event_type: SUBSCRIPTION_EVENTS).pluck(:subject).uniq
+  end
+
+  SUBSCRIPTION_EVENTS = %w[
+    billing.subscription.started
+    billing.subscription.updated
+    billing.subscription.canceled
+  ].freeze
+
+  def subscription_event_types
+    OutboxEvent.where(event_type: SUBSCRIPTION_EVENTS).order(:created_at, :id).pluck(:event_type)
   end
 
   # An event type the outbox's closed list does not hold would park every
@@ -427,5 +526,18 @@ class StripeWebhookTest < ActionDispatch::IntegrationTest
   private
     def with_stripe_secrets(*secrets)
       with_env("STRIPE_WEBHOOK_SECRETS" => secrets.join(",")) { yield }
+    end
+
+    # The cafaye customer and plan a subscription fixture resolves to.
+    #
+    # A subscription event is acted on only when it can be attached to both — this
+    # service does not bill a subscription it did not sell — so a spec that posts
+    # one has to arrange them. Called from the spec rather than from `setup`
+    # because creating a customer and a plan publishes two events of their own,
+    # and the specs about payments assert on `OutboxEvent.sole`.
+    def with_resolvable_subscription
+      create_stripe_customer
+      create_stripe_plan
+      yield
     end
 end

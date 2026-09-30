@@ -176,6 +176,7 @@ class PlanTest < ActiveSupport::TestCase
         "price" => { "amount_minor" => 1900, "currency" => "USD" },
         "interval" => "month",
         "trial_days" => 0,
+        "entitlements" => {},
         "active" => true,
         "created_at" => frozen_now.iso8601,
         "updated_at" => frozen_now.iso8601

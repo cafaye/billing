@@ -17,6 +17,11 @@ class Plan < ApplicationRecord
   # kebab-case, so a slug is always one URL segment with nothing to escape.
   SLUG_PATTERN = /\A[a-z0-9]+(-[a-z0-9]+)*\z/
 
+  # What a plan grants. An object with at most these two members, so a reader never
+  # has to ask whether a key it does not know is one it should honour: `features` is
+  # a list of things switched on, `limits` is a number for each of them.
+  ENTITLEMENT_KEYS = %w[features limits].freeze
+
   validates :name, presence: true
   validates :slug, presence: true, uniqueness: true
   validates :interval, presence: true
@@ -27,8 +32,10 @@ class Plan < ApplicationRecord
   validates :trial_days, numericality: { only_integer: true, greater_than_or_equal_to: 0 }
   validate :slug_is_kebab_case
   validate :currency_is_iso_4217
+  validate :entitlements_are_a_closed_object
 
   before_validation :normalize_currency
+  before_validation :normalize_entitlements
 
   # The amount, as the value object. This is the read side of the money rule:
   # a caller that wants to do arithmetic on a price gets a `Money`, never the
@@ -62,6 +69,7 @@ class Plan < ApplicationRecord
       "price" => price.to_h,
       "interval" => interval,
       "trial_days" => trial_days,
+      "entitlements" => entitlements,
       "active" => active,
       "created_at" => created_at&.utc&.iso8601,
       "updated_at" => updated_at&.utc&.iso8601
@@ -109,5 +117,53 @@ class Plan < ApplicationRecord
 
     def normalize_currency
       self.currency = currency.to_s.strip.upcase if currency.present?
+    end
+
+    # A nil becomes the empty object rather than staying null: the wire shape
+    # promises an object, and a null would be a second shape every reader has to
+    # handle.
+    def normalize_entitlements
+      self.entitlements = {} if entitlements.nil?
+    end
+
+    # The shape is closed here, at the only place a plan is written, rather than
+    # guessed at by each reader. `features: "dashboards"` is the case that matters:
+    # `Array("dashboards")` renders as `["dashboards"]`, so the mistake is invisible
+    # in a response and only shows up when somebody writes `features.first.end_with?`
+    # on a subscription that is granting the wrong thing.
+    #
+    # One `:invalid_format` error for the whole object rather than one per member:
+    # a client that sent `features` as a string has one mistake, and three errors
+    # saying the same thing is three things to fix.
+    def entitlements_are_a_closed_object
+      return if entitlements.nil?
+      return add_entitlements_error unless entitlements.is_a?(Hash)
+      return add_entitlements_error unless (entitlements.keys - ENTITLEMENT_KEYS).empty?
+      return if features_are_a_list_of_names? && limits_are_counts?
+
+      add_entitlements_error
+    end
+
+    def add_entitlements_error
+      errors.add(:entitlements, :invalid_format, message: "must be an object with `features` and `limits`")
+    end
+
+    def features_are_a_list_of_names?
+      features = entitlements["features"]
+      return true if features.nil?
+      return false unless features.is_a?(Array)
+
+      features.all? { |feature| feature.is_a?(String) && feature.strip.present? }
+    end
+
+    # Counts, not amounts. There is no `Money` here on purpose: a limit is how many
+    # of something, and putting it in a currency would be a category error this
+    # service has already made the mistake of avoiding everywhere else.
+    def limits_are_counts?
+      limits = entitlements["limits"]
+      return true if limits.nil?
+      return false unless limits.is_a?(Hash)
+
+      limits.values.all? { |limit| limit.is_a?(Integer) && limit >= 0 }
     end
 end

@@ -239,10 +239,34 @@ class Webhooks::IngestionTest < ActiveSupport::TestCase
   end
 
   test "a subscription signup states one fact once, not once per delivery channel" do
+    create_stripe_customer
+    create_stripe_plan
+
     ingest("checkout.session.completed")
     ingest("customer.subscription.created")
 
-    assert_equal [ "billing.subscription.started" ], OutboxEvent.pluck(:event_type)
+    assert_equal [ "billing.subscription.started" ],
+      OutboxEvent.where(event_type: "billing.subscription.started").pluck(:event_type)
+  end
+
+  # The handler is now called with the payload *and* the time the change happened,
+  # because a handler that writes domain state has to put that same instant in the
+  # event's `time` and in its payload — core's schema requires the two to be equal.
+  # Asserted here so a change to that arity is a failing test rather than an
+  # ArgumentError parked on somebody's webhook row.
+  test "a handler is given the payload and the time the change happened" do
+    seen = []
+    handler = ->(payload, event_time) do
+      seen << [ payload.fetch("id"), event_time ]
+      Webhooks::Emission.new(event_type: "billing.payment.succeeded", subject: "cus_1", data: {})
+    end
+
+    with_handler(INVOICE_PAID, handler) { ingest(INVOICE_PAID) }
+
+    # The fixture's own `created`, not the moment the suite received it — which is
+    # the whole point of handing the time to the handler.
+    created = JSON.parse(stripe_fixture(INVOICE_PAID)).fetch("created")
+    assert_equal [ [ "evt_1PZQaBcDeFgHiJkLmNoPqR4", Time.at(created).utc ] ], seen
   end
 
   # The subject is the entity the event is about, per core's envelope. There is no
@@ -289,7 +313,7 @@ class Webhooks::IngestionTest < ActiveSupport::TestCase
   test "a mapping to an event type the outbox does not list parks the row" do
     unlisted = Webhooks::Emission.new(event_type: "billing.payment.on_settled", subject: "pi_1", data: {})
 
-    with_handler(INVOICE_PAID, ->(_payload) { unlisted }) do
+    with_handler(INVOICE_PAID, ->(_payload, _event_time) { unlisted }) do
       record = ingest(INVOICE_PAID)
 
       assert record.error.start_with?("failed:ActiveRecord::RecordInvalid:"),
