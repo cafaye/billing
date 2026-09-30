@@ -1,0 +1,52 @@
+# Toolchain pins for this repository. billing is a Rails API, so the ruby pin
+# is the whole toolchain: everything else is a gem in Gemfile.lock, pinned there.
+#
+#   mise install     # install the pinned toolchain
+#   mise run prime   # the gate: bundle, prepare the database, lint, test
+#
+# The ruby version here must match .ruby-version and the ARG RUBY_VERSION in the
+# Dockerfile. Three files, one number: a worktree that primes on 4.0.1 and an
+# image built on 3.4 are two different programs wearing one repo's name.
+[tools]
+"ruby" = "4.0.1"
+"bundler" = "4.0.18"
+
+[tasks.prime]
+description = "The gate: bundle install, db:prepare, rubocop, rails test"
+run = "./bin/prime"
+
+[tasks.setup]
+description = "Dependencies and database only, no lint or tests"
+run = "./bin/prime --fast"
+
+[tasks.test]
+description = "Run the test suite"
+run = "bin/rails test"
+
+[tasks.lint]
+description = "Run the linter"
+run = "bin/rubocop --parallel"
+
+[tasks.security]
+description = "Static analysis: gem audit and Brakeman"
+run = "bin/bundler-audit check --update && bin/brakeman --no-pager --quiet --exit-on-warn"
+
+[tasks.db-prepare]
+description = "Create the database and load the schema"
+run = "bin/rails db:prepare"
+
+[tasks.console]
+description = "Rails console"
+run = "bin/rails console"
+
+[tasks.server]
+description = "Run the API on http://localhost:3000"
+run = "bin/rails server"
+
+[tasks.compose-up]
+description = "Start the local database: docker compose up -d"
+run = "docker compose up -d"
+
+[tasks.compose-down]
+description = "Stop the local database"
+run = "docker compose down"
