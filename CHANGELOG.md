@@ -6,6 +6,78 @@ All notable changes to billing are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **The outbox contract test now describes the world core shipped in core-03.**
+  core added a payload schema for all eight of this service's published types and
+  raised **D10**, a breaking spec change that removed the `sub_…` / `pln_…` /
+  `acc_…` patterns from `billing.subscription.started`. On billing master with
+  the new core, `test/contract/outbox_envelope_contract_test.rb` reported two
+  failures and three errors.
+
+  * `PENDING_ID_PATTERNS` is **empty**. D10 closed all three recorded entries from
+    the core side: `subscription_id` no longer declares a `pattern`, and
+    `plan_id` and `account_id` are no longer declared as properties at all. A
+    field core does not constrain cannot have an unclosed gap against it.
+  * The two tests that iterated that table no longer do. They **derive** the gap
+    from core's files and compare. An empty table iterated zero times exits 0
+    having checked nothing, which is the failure PLAN.md §1 forbids, so the work
+    is now over core's schemas rather than over a constant.
+  * `NO_PAYLOAD_SCHEMA_YET` is **empty**: core-03 answered all eight. It is
+    written out rather than derived, because the subtraction that used to stand in
+    for "core has a schema" would now have hidden the entries core-03 opened.
+  * The payload validator reads every keyword core declares rather than `type`
+    alone — `enum`, `const`, `pattern`, `minLength`, `minimum`, `format`, nested
+    `properties` and core's D11 `oneOf` — and **raises** on a keyword it does not
+    model. Before, it would have reported "no problem" for five constraints it
+    never read. A new drift test walks every keyword core uses and fails once, by
+    name, when a shape appears the validator does not model.
+  * `value_is_type?` understands a JSON Schema **type array**, so core's
+    `["string", "null"]` is a disjunction and not an unknown type name. Its `else`
+    still raises, and a test exercises that branch so it cannot quietly become a
+    permissive `rescue`. `integer` stays Integer-only and `number` is modelled:
+    a Float is never an amount in this service.
+  * Every emitted envelope is checked, not the first with a matching type.
+    `billing.payment.succeeded` has two shapes under D11 and the uuid tiebreaker
+    was choosing which one to verify, on every run.
+  * The corpus and the behaviour-not-text comparison survive, retargeted at the
+    two constraints where core and this service each hold a pattern of their own:
+    `Plan::SLUG_PATTERN` against core's `slug` pattern, and
+    `Money::CURRENCY_FORMAT` against core's `^[A-Z]{3}$`.
+
+  **No behaviour in `app/` changed.** The only change outside the test and the
+  manifest is one stale comment in `Subscriptions::Lifecycle#payload`, which
+  described core's pre-core-03 payload schema.
+
+### Known issues
+
+- **The three `billing.subscription.*` payloads are published in a shape core's
+  payload schemas reject.** core's D10 rewrote those schemas because "billing has
+  no subscriptions table and cannot invent ids it does not have" — true of
+  billing-03b, and not true of billing-04, which added the table and moved the
+  subscription events onto billing's own ids (`subscription_id` is
+  `Subscription#id`, which is also the envelope's subject, alongside `plan_id`,
+  `account_id`, `currency`, `started_at` and `processor_subscription_id`). core's
+  schemas are the processor-normalised shape billing-03b emitted and are closed
+  with `additionalProperties: false`.
+
+  Recorded in `PENDING_PAYLOAD_ALIGNMENT` and asserted in both directions, and
+  raised as a DECISION NEEDED in `cafaye.yml`. core's own D10 names this as the
+  second breaking change and core is read-only from a service worktree, so it is
+  core's to make. Matching core from here would mean either emitting a payload no
+  consumer has agreed to or dropping `plan_id` and `account_id`, which are the
+  two fields that make a subscription event actionable.
+- **core's `billing.plan.*` schemas do not name `entitlements`,** which
+  billing-04 added to `Plan#as_json`. Same reasoning: a missing constraint in a
+  core schema, recorded rather than worked around, because removing the field
+  from the payload is a contract change and `Plan#as_json` is also the HTTP
+  response shape.
+- **`core: ^0.2.0` is pinned to the last released spec.** core's D10 is marked
+  Breaking and is still in core's `[Unreleased]`, so there is no `0.3.0` to pin
+  to. `^0.2.0` excludes it, so the day core tags it every service in the fleet
+  has to move at once — a service whose CI resolves core would otherwise resolve
+  a different core than the one this contract test reads off disk.
+
 Billing domain v0, in three packets. **billing-02**: customers and plans — the
 schema, the models, the `/v1` API, and the transactional outbox. **billing-03b**:
 the Stripe webhook — a signed inbound event, stored once, turned into one of

@@ -371,17 +371,27 @@ to make, not an oversight.
 - **The unique-index race is handled but untested.** A `RecordNotUnique` that
   slips past the validations is a `409`, which is right; proving it needs two
   concurrent writers, so no spec covers that line.
-- **`billing.subscription.started` matches core's payload schema except for the
-  id *format*.** The fields and their types now do: a started event is built to
-  core's eight fields and nothing else, which closed the gap recorded in
-  billing-03b. What remains is that core asks for `sub_…` / `pln_…` / `acc_…`
-  prefixed ULIDs and this service's ids are uuids, which `Plan#id` and
-  `Customer#owner_id` have been since billing-02. Changing them is a breaking
-  change to a contract several services already read, so it is a platform
-  decision. Tracked as `PENDING_ID_PATTERNS` in
-  `test/contract/outbox_envelope_contract_test.rb`, asserted in both directions —
-  core's pattern must still be the one recorded *and* our value must still miss it,
-  so the entry is removed rather than forgotten when it stops being true.
+- **core's payload schemas and the three subscription events disagree, and the
+  disagreement is recorded rather than paid for.** core-03 shipped a payload
+  schema for all eight types. `billing.customer.created` and both
+  `billing.payment.*` payloads satisfy theirs. `billing.plan.created` and
+  `billing.plan.updated` satisfy theirs except for `entitlements`, which core's
+  plan schema does not name. The three `billing.subscription.*` payloads do not:
+  core's D10 rewrote those schemas because "billing has no subscriptions table",
+  which was true of billing-03b and stopped being true when billing-04 added one,
+  so they describe the processor-normalised payload this build replaced. The
+  difference is in `PENDING_PAYLOAD_ALIGNMENT` in
+  `test/contract/outbox_envelope_contract_test.rb`, asserted in both directions,
+  and it is a DECISION NEEDED in `cafaye.yml`: core owns the second breaking
+  change its own D10 anticipates. Matching core from here would mean emitting a
+  payload no consumer has agreed to, or dropping `plan_id` and `account_id` — the
+  two fields that make a subscription event actionable.
+- **`PENDING_ID_PATTERNS` is empty.** core's D10 removed the `sub_…` / `pln_…` /
+  `acc_…` patterns from the started schema, and removed `plan_id` and
+  `account_id` as properties entirely, so there is nothing for this service's uuids
+  to fail to match. The table stays as a constant and the contract test derives
+  the gap from core's files, because a table iterated zero times would exit 0
+  having proved nothing.
 - **A subscription created directly in the processor's dashboard is not tracked.**
   It carries no cafaye customer id, so the delivery is recorded as
   `ignored:unknown_customer` and answered 200. Matching it to whoever happens to

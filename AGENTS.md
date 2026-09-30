@@ -47,6 +47,13 @@ Three packets, in order.
   state machine that decides which transitions are possible, the `/v1`
   endpoints that buy a subscription and cancel one and move it between plans,
   and the three requests this service now makes *to* Stripe.
+- **billing-05** is a reconciliation and nothing else: core shipped payload
+  schemas for all eight published types and raised D10, and
+  `test/contract/outbox_envelope_contract_test.rb` was the thing that noticed.
+  No behaviour in `app/` changed except one comment. What it found is written
+  down in `cafaye.yml` as a DECISION NEEDED — core's subscription schemas
+  describe the payload billing-03b emitted, and billing-04 moved those events
+  onto billing's own ids.
 
 That last one changes a claim the earlier packets made, so it is stated plainly:
 **this service now talks to Stripe.** It did not, and saying so was true when it
@@ -322,6 +329,18 @@ transaction that marks the delivery finished. The rules:
   them, and compares **behaviour** rather than text. Comparing a `Regexp#source`
   to a pattern string looked equivalent and was not: Ruby's regexp optimiser
   reports different sources for the same pattern in different processes.
+- **A validator that skips a constraint it does not understand reports "no
+  problem" for a document it never checked.** That is the failure a contract test
+  exists to prevent, so the payload validator in `test/contract/` has a closed
+  vocabulary — `UNDERSTOOD_KEYWORDS`, `JSON_TYPES`, `UNDERSTOOD_FORMATS` — and
+  raises on anything outside it. A drift test walks every keyword core actually
+  uses and fails once, by name, when a shape appears the validator does not model.
+  Do not widen a check into a `rescue`, and do not turn the raise into a `return
+  true`: a breach reported as clean is worse than a breach reported as a crash.
+- **A recorded-debt table may never become the thing being iterated.** An empty
+  table exits 0 having checked nothing, which is a skipped test in everything but
+  name. Every table in `test/contract/` is therefore *derived* from core's files
+  and compared, so the work is over core and not over the constant.
 - Raising a threshold is allowed. Lowering one, or adding an inline lint
   disable to make a build green, is not.
 - A gap that cannot be closed in this worktree is recorded in code, not skipped
@@ -428,17 +447,26 @@ transaction that marks the delivery finished. The rules:
   and in `cafaye.yml`. A type that is not would be refused at the write, from
   inside a processor request, and answered 200 — an outage visible only in the
   processor's dashboard. `test/contract/` and the webhook specs both assert it.
-- **`billing.subscription.started` satisfies core's payload schema except for the
-  id format.** The fields and their types do: a started event is built to core's
-  eight fields and nothing else, because that schema is closed with
-  `additionalProperties: false`. What does not match is that core asks for
-  `sub_…` / `pln_…` / `acc_…` prefixed ULIDs and this service's ids are uuids,
-  which `Plan#id` and `Customer#owner_id` have been since billing-02. Changing
-  them is a breaking change to a contract several services already read, so it is
-  a platform decision. It is tracked as `PENDING_ID_PATTERNS` in the contract
-  spec and asserted in **both** directions: core's pattern must still be the one
-  recorded, and our value must still miss it, so the entry is removed rather than
-  forgotten when it stops being true.
+- **The three subscription events are published in a shape core's payload schemas
+  reject, and that is recorded rather than matched.** core-03 shipped a payload
+  schema for all eight types. For `billing.plan.*` this service now satisfies
+  them except for `entitlements`, which core's plan schema does not name. For
+  `billing.subscription.*` the disagreement is larger: core's D10 rewrote those
+  three schemas on the grounds that "billing has no subscriptions table", which
+  was true of billing-03b and stopped being true when billing-04 added one and
+  moved the events onto billing's own ids. They are recorded in
+  `PENDING_PAYLOAD_ALIGNMENT` and asserted in **both** directions, and named as a
+  DECISION NEEDED in `cafaye.yml`. Do not "fix" this by editing the payload:
+  matching core means either emitting a payload no consumer has agreed to or
+  dropping `plan_id` and `account_id`, which are the two fields that make a
+  subscription event actionable. core owns the change; see core's own D10, which
+  names it as the second breaking change.
+- **`PENDING_ID_PATTERNS` is empty, and the test that held it is derived.**
+  core's D10 removed the `sub_…` / `pln_…` / `acc_…` patterns, so a field core
+  does not constrain has no unclosed gap against it. The table may not become the
+  thing that is iterated: a table iterated zero times exits 0 having checked
+  nothing, so the contract test *derives* the gap from core's files and compares.
+  New debt goes in the table; the assertion reads core, not the table.
 - **`billing.subscription.updated`, not `.changed`.** The action vocabulary in
   core's `docs/event-naming.md` is a closed list for v0 and `changed` is not on
   it; `billing.subscription.updated` is, and it is already in core's catalog. The

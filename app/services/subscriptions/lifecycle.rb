@@ -201,18 +201,38 @@ module Subscriptions
 
       # The payload.
       #
-      # `billing.subscription.started` is the one event core ships a payload schema
-      # for, and that schema is closed with `additionalProperties: false` and names
-      # exactly eight fields. A start therefore carries those eight and nothing
-      # else, and `test/contract/` holds this list against core's actual file — the
-      # day core names a ninth, that test fails and the decision becomes explicit
-      # rather than a silently invalid event.
+      # All three carry billing's own ids — `subscription_id` is this row, and it
+      # is the envelope's subject, so a consumer joins `started`, `updated` and
+      # `canceled` on one key with no lookup table.
       #
-      # The other two have no schema yet, so they carry the same eight plus the
-      # facts a consumer has to act on them: the period, the cancellation intent, the
-      # time it took effect, and the processor's own ids. That asymmetry is
-      # deliberate and recorded, and the contract test asserts that core still ships
-      # no schema for them — so the day it does, this file is visited.
+      # **core's schemas for these three types describe a different payload, and
+      # this is recorded rather than matched.** core-03 rewrote
+      # `schemas/events/billing/subscription/started.schema.json` (D10) on the
+      # grounds that "billing has no subscriptions table and cannot invent ids it
+      # does not have" — which was true of billing-03b and stopped being true when
+      # this table landed. Its `started`, `updated` and `canceled` schemas are the
+      # processor-normalised shape, closed with `additionalProperties: false`, so
+      # the cafaye ids below are exactly the fields core refuses and the `kind`,
+      # `processor`, `processor_event_id` and `customer_id` it requires are exactly
+      # the ones absent here. core's own D10 anticipates this — "when billing grows
+      # a subscriptions table, the shape moves again … that is a second breaking
+      # change" — and that change is core's, in a repository this service may only
+      # read.
+      #
+      # So the difference is written down in `PENDING_PAYLOAD_ALIGNMENT` in
+      # `test/contract/outbox_envelope_contract_test.rb` and in `cafaye.yml`, and
+      # asserted in both directions. Matching core here instead would be one of the
+      # two ways this service can change a published contract without anyone
+      # deciding to: emit a payload no consumer has agreed to, or drop `plan_id`
+      # and `account_id`, which are the two fields that make a subscription event
+      # actionable at all. When core decides, the change lands here and in the
+      # contract test together — not by one quietly drifting from the other.
+      #
+      # The asymmetry between the three is deliberate and still holds: a start also
+      # carries `started_at`, and the other two carry the period, the cancellation
+      # intent, the time it took effect, and the processor's own ids, because those
+      # are the facts a consumer has to act on *those* events and a start has none
+      # of them yet.
       def payload(subscription, type)
         core_payload(subscription).merge(type == STARTED_EVENT ? { "started_at" => started_at } : detail_payload)
       end
