@@ -1,0 +1,44 @@
+# Local PostgreSQL for development and for the test suite. The application
+# itself is not in this file: run it on the host with `bin/rails server`, or
+# build the image with `docker build -t billing .` and run that. This stack is
+# the database it talks to.
+#
+#   docker compose up -d        # start
+#   docker compose down         # stop, keep the data
+#   docker compose down -v      # stop and throw the volume away
+#
+# The port is published on 5432 because that is where both `config/database.yml`
+# and the CI job expect a database. If something else already holds 5432, change
+# the left-hand side and point DATABASE_URL at the new port.
+#
+# Pin postgres:17, not `latest`: a major bump changes default authentication and
+# locale behaviour, and a suite that passes today must not depend on which image
+# was cached when the test ran.
+services:
+  db:
+    image: postgres:17
+    # fsync=off is acceptable here and nowhere else. This volume is scratch
+    # space on a laptop; durability costs seconds on every write in the suite
+    # and buys nothing that a `down -v` does not throw away anyway.
+    command: "-c fsync=off"
+    environment:
+      POSTGRES_USER: billing
+      POSTGRES_PASSWORD: billing
+      # Trust auth over the published port: this is a local-only database with a
+      # well-known password, and a prompt-free connection keeps `db:prepare`
+      # from ever hanging on input that nobody is there to type.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      # `depends_on: condition: service_healthy` is what makes `docker compose up`
+      # a single reliable step rather than a race against the first connection.
+      test: ["CMD", "pg_isready", "-U", "billing"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres:

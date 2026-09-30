@@ -1,0 +1,45 @@
+# cafaye.yml — the cafaye project manifest for billing.
+#
+# Conforms to core's frozen schema
+# (cafaye/core: schemas/cafaye.manifest.schema.json). Specs are manager-owned:
+# a worker records the shape it is being built against and marks what it cannot
+# decide. See AGENTS.md.
+#
+# > DECISION NEEDED (billing-01): `exposes` is absent. Convention rule 3 says a
+# > service that serves traffic must declare it, and billing does serve traffic,
+# > so this is a known gap and not a judgement that the rule does not apply.
+# > Filling it in needs an OpenAPI 3.1 document for billing's HTTP surface, and
+# > specs are manager-owned — a worker drafting one would be publishing a
+# > contract the manager has not agreed to. core already carries the intended
+# > shape as `examples/valid/ruby-api.cafaye.yml` (openapi/openapi.yaml plus the
+# > customer/subscription/payment/usage/invoice event types), so the draft is
+# > written against that example rather than invented here. What is missing
+# > today is the OpenAPI document and the Phase 3 surface it describes; until
+# > both exist, `caf dev` and `pantry` have nothing to read for billing, which
+# > is the cost of leaving it out. The two probe endpoints (/healthz, /readyz)
+# > are deliberately not declared either: they are infrastructure, not contract
+# > surface, and guard left the same gap for the same reason.
+name: billing
+description: Plans, subscriptions, prepaid credit, usage metering, webhooks in.
+language: ruby
+core: ^0.1.0
+
+# billing subscribes to no events yet. It is a scaffold: the customers,
+# subscriptions and webhook handlers that would react to identity's user and
+# account events are Phase 3 packets, and declaring an event this build does not
+# handle would tell `caf` to wire a consumer that has nothing to do.
+consumes: []
+
+# No service-level dependencies yet. Stripe is a vendor, not a cafaye service,
+# and belongs in the Gemfile rather than here (convention rule 4). identity
+# becomes a dependency when billing needs to ask who a customer is.
+dependencies: []
+
+repository:
+  url: git@github.com:cafaye/billing.git
+  defaultBranch: master
+  visibility: public
+
+owner:
+  team: billing
+  contact: billing@cafaye.com
