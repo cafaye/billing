@@ -489,6 +489,19 @@ contribute — is named in that test with the reason it is not one, and a route
 that is neither declared nor named fails. It holds the fifteen `operationId`s a
 generator turns into method names, and it runs with or without `core` beside it.
 
+**A skip here is a missing checkout, not a pass, and CI treats it as one.**
+Measured on master, same commit, twice: with `core` readable the whole suite is
+**763 runs, 2100 assertions, 0 skips**, and with it unreadable it is **763 runs,
+1757 assertions, 20 skips** — the same run count, the same exit code, green
+either way, and 343 assertions of contract checking simply not done. A second
+test reads core too (`subscription_delivery_test.rb`, against the events courier
+needs) and skips the same way. CI checks `cafaye/core` out of the repository
+itself and **fails the build on a single skipped test**.
+`.github/workflows/ci.yml` calls
+`cafaye/kit/.github/workflows/ci.reusable.yml@master` and then runs the half kit
+cannot own; `bin/prime` is the gate in both, and the suite is held at master's
+**763 runs / 2100 assertions** at `e63bb7a`.
+
 ## Layout
 
 ```

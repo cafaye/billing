@@ -119,7 +119,7 @@ billing/
 │   ├── models/                        # minitest, table-driven
 │   ├── requests/v1/                   # the API specs
 │   └── services/                      # the lifecycle, the client, the webhook mapping
-└── .github/workflows/ci.yml           # brakeman, bundler-audit, rubocop, rails test
+└── .github/workflows/ci.yml           # calls kit's reusable workflow, plus the gate
 ```
 
 ## Commands
@@ -135,7 +135,7 @@ Run these; do not improvise equivalents.
 | Run the linter | `bin/rubocop --parallel` |
 | Security scan | `bin/bundler-audit check --update` and `bin/brakeman --no-pager` |
 | Start the database | `docker compose up -d` |
-| Everything CI runs | `bin/prime`, plus the two security scans |
+| Everything CI runs | `bin/prime`, plus `bin/bundler-audit check --update` and `bin/brakeman --no-pager --quiet --exit-on-warn` (`mise run security`) |
 
 ## Money
 
@@ -313,6 +313,101 @@ transaction that marks the delivery finished. The rules:
   a DECISION in `cafaye.yml`, and changed by one line in
   `Webhooks::StripeEvents.subject_for`.
 
+## CI
+
+`.github/workflows/ci.yml` has four jobs, and **the job names are the claims** —
+a green tick over unnamed steps is a green tick over an unknown amount of work,
+and in this repository the unknown is load-bearing.
+
+| job | what it is |
+|-----|------------|
+| `ruby (kit)` | `uses: cafaye/kit/.github/workflows/ci.reusable.yml@master` with `language: ruby`. The shared half. Fails on two steps, absorbed by `continue-on-error` — see below. |
+| `gate` | THE gate. `bin/prime` against a real Postgres, every environment-gated tier forced on and counted, and `git diff --exit-code`. |
+| `security` | `brakeman` and `bundler-audit`, with no database. |
+| `pins` | One Ruby number in three files, the documented `uses:` path, and no secret in the file. No toolchain, so it fails in seconds. |
+
+Four things that are not obvious and that the file argues in full:
+
+- **`bin/prime` is the gate, in CI and locally.** Not a hand-assembled list of
+  its four steps. A shared workflow that retyped them would be a second gate, and
+  a second gate is a second thing to be wrong.
+- **A caller cannot give a reusable workflow a database.** GitHub allows only
+  `name`, `uses`, `with`, `secrets`, `strategy`, `needs`, `if`, `concurrency`
+  and `permissions` on a job that calls one, so `services:` is unreachable from
+  a caller. That, and the tier counts and the lockfile, are why the companion
+  jobs exist at all.
+- **`ruby (kit)` fails on two steps, and `continue-on-error` absorbs them.**
+  `bundle exec rake` is `rails test` and kit's `ruby` job declares no service
+  container, so it dies with `ActiveRecord::DatabaseConnectionError`; and
+  `bundle exec rake coverage` is a task this service does not have and should
+  not want, because the coverage gate here is `MoneyPathsCoverageTest` and it
+  runs inside `bin/prime`. Both errors are reproduced in the file's header.
+  The failures are visible and non-blocking, and `gate`, `security` and `pins`
+  are the required checks — a job that is expected to be red and is not marked
+  for it makes the whole workflow red, and a workflow that is always red is one
+  whose red means nothing. `continue-on-error` outlives the gap only if nobody
+  deletes it, so the condition for retiring it is written into the file: kit's
+  `ruby` job grows a `services`/`env` seam, **and** `rake coverage` exists here
+  or kit stops running it.
+- **The suite size is held by equality, not as a floor.** `763 runs / 2100
+  assertions / 0 skips` is master's number at `e63bb7a` — billing-07's split of
+  the contract tier is +4 runs / +13 assertions over billing-05's 759 / 2087,
+  and reading core's catalog through `CORE_PATH` is a further +4 assertions.
+  A floor would accept a suite that lost 200 tests, and the tests it would lose
+  first are the money arithmetic and the webhook signatures. Adding a test turns
+  CI red until
+  `BASELINE_RUNS`/`BASELINE_ASSERTIONS` are raised **in the same commit** — that
+  is the intended direction, and lowering one is not.
+
+### The tier that skips without you noticing
+
+`test/contract/outbox_envelope_contract_test.rb` reads core's real schemas and
+**skips every test in the file** when it cannot read them, printing
+`skip("core is not on disk; set CORE_PATH to …")`. On this commit, with
+`CORE_PATH` set: `19 runs, 339 assertions, 0 skips`. Pointing `CORE_PATH` at
+nothing: `19 runs, 0 assertions, 19 skips` — and the whole-suite summary line is
+identical, because 19 skips is still a green exit. The whole `test/contract`
+directory, which is the tier, is `26 runs / 358 assertions` with core present;
+the tier is named as a directory because billing-07 moved three tests into
+`http_surface_contract_test.rb`, and a file list read that relocation as a
+deletion.
+
+A second test reads core and did not say so: `subscription_delivery_test.rb`
+asserted against `Rails.root.join("..", "core")` with no seam at all, so a
+developer with the repositories side by side passed and **a CI runner raised
+`Errno::ENOENT` before asserting anything**. It reads `CORE_PATH` now, and
+`gate` sets that variable on the job rather than on one step, because a variable
+set per step is a variable the second reader does not get.
+
+So:
+
+- **locally**, a `19 skipped` in the contract tier, or a skipped test named
+  "both events courier needs have a row in core's catalog", is a missing core
+  checkout, not a pass. Put `core` next to this worktree, or set `CORE_PATH`.
+- **in CI**, `gate` checks `cafaye/core` out of the repository itself and
+  **fails the build on a single skipped test**. `cafaye/core` is public, so no
+  token is involved, and the ref is `master` rather than a pinned SHA on purpose:
+  this tier exists to catch a change in core, and a pinned ref would blind it.
+
+### The other environment-gated tier
+
+`config/environments/test.rb` sets `config.eager_load = ENV["CI"].present?`.
+GitHub Actions always exports `CI`, so the suite eager-loads the whole
+application in CI and not locally — which means "the application loads" is
+checked in CI by an *implicit* convention. `gate` sets `CI` explicitly and has a
+step that fails if `config.eager_load` is false, or if `eager_load!` loaded
+fewer files than `app/**/*.rb` contains (38 on this commit).
+
+### Secrets
+
+No processor key is in the repository, in CI configuration, or in any log. The
+suite generates its own Stripe signing secret per run
+(`StripeWebhookHelpers::WEBHOOK_SECRET` in `test/test_helper.rb`, a credential
+for nothing) and talks to `FakeStripeAPI`, never to Stripe. The `gate` job
+asserts `STRIPE_API_KEY` and `STRIPE_WEBHOOK_SECRET` are absent from the
+environment, and the `pins` job fails the build if the workflow file ever gains a
+`${{ secrets.… }}` reference, a Stripe key, a signing secret or a PEM header.
+
 ## Testing
 
 - Tests are written **first**, and shown failing before the implementation.
@@ -364,7 +459,29 @@ transaction that marks the delivery finished. The rules:
   is a credential for nothing, and asserts against the real verification path. No
   network, no stubbed verifier. The fixtures' `created` timestamps are what the
   event-time assertions are derived from, so a fixture edited without its tests
-  failing is a fixture nobody looked at.
+  failing is a fixture nobody looked at. `construct_event` appears nowhere under
+  `test/`, and the `gate` job in CI fails the build if it ever does.
+- **`rails test` runs in parallel workers, and each worker gets its own
+  database.** `test_helper.rb` calls `parallelize(workers: :number_of_processors)`,
+  so a run creates `<database>_0` … `-7` beside the base database and eight
+  workers never share one. The number of workers changes the wall clock and
+  nothing else — the same 763 tests and 2100 assertions with one worker or
+  eight, verified both ways on this packet — which is why the gate counts tests
+  and never seconds.
+  What parallel workers do **not** protect against is two `rails test` processes
+  in the *same* worktree — they race on the same per-worker databases, and a
+  per-checkout database name separates worktrees from each other, not processes
+  from each other. One checkout, one suite.
+- **A worker that dies abnormally makes the suite hang, not fail.** Rails runs
+  the parallel workers over DRb and
+  `ActiveSupport::Testing::Parallelization::Server#shutdown` waits with
+  `while active_workers?; sleep 0.1; end` for each one to deregister. A worker
+  killed before it can deregister is never reaped and the parent spins in that
+  sleep at teardown — **after** printing the summary line. So a green
+  a `763 runs, 0 failures` summary followed by nothing is that, not a pass.
+  Nothing
+  suppresses it: the job times out and goes red, and the count guard never
+  runs. Do not "fix" it with retries; find the worker that died.
 
 ## Conventions
 
