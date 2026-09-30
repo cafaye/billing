@@ -37,6 +37,22 @@ module Processor
     # identifier that was refused both travel with it.
     class RequestFailed < Error; end
 
+    class << self
+      # The client the application uses, built from the environment.
+      #
+      # A seam rather than a constant, for two reasons. The specs need a recorder
+      # instead of the network, and swapping the *object* keeps them exercising this
+      # class's own argument building rather than a parallel implementation of it —
+      # the failure mode a hand-written double invites. And the client is constructed
+      # from `ENV` rather than memoized at boot, so a key that rotates is picked up
+      # without a redeploy.
+      def current
+        @current ||= new
+      end
+
+      attr_writer :current
+    end
+
     attr_reader :api_key
 
     def initialize(api_key: nil, api: nil)

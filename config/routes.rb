@@ -22,6 +22,19 @@ Rails.application.routes.draw do
     post "plans", to: "plans#create"
     get "plans/:slug", to: "plans#show"
     patch "plans/:id", to: "plans#update"
+
+    # Spelled out rather than generated for the same reason as `plans`, and one
+    # more: three of these are sub-resources with their own verbs, and `resources`
+    # would either invent paths for them or need a second declaration that says the
+    # same thing twice. `cancel` and `change_plan` are POSTs rather than DELETEs on
+    # purpose — cancelling at the end of the period is not a deletion, and a DELETE
+    # that does not delete is a lie about the method.
+    get "subscriptions", to: "subscriptions#index"
+    post "subscriptions", to: "subscriptions#create"
+    get "subscriptions/:id", to: "subscriptions#show"
+    post "subscriptions/:id/cancel", to: "subscriptions#cancel"
+    post "subscriptions/:id/change_plan", to: "subscriptions#change_plan"
+    get "subscriptions/:id/entitlements", to: "subscriptions#entitlements"
   end
 
   # Processor webhooks. Each processor gets its own path, its own signature

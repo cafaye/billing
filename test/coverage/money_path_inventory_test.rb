@@ -36,6 +36,12 @@ class MoneyPathInventoryTest < ActiveSupport::TestCase
   # claim is still true: the file still touches money, and it still has other
   # business of its own.
   MIXED_MONEY_FILES = {
+    # Added in billing-04, and the inventory test is what put it here: the
+    # controller serializes a plan's price on every subscription read, so it touches
+    # money, and it makes no decision about an amount. Which way a plan change is
+    # priced lives in `Subscriptions::PlanChange`, which *is* gated.
+    "app/controllers/v1/subscriptions_controller.rb" =>
+      "it asks the processor to change a subscription and renders the result; the one amount it touches is a plan's price, read out and not decided",
     "app/lib/money_params.rb" =>
       "it parses a request body; the parse exists independently of the amount it returns",
     "app/models/plan.rb" =>
@@ -47,6 +53,7 @@ class MoneyPathInventoryTest < ActiveSupport::TestCase
   # What each mixed file does with money, and the proof that it is reached and
   # correct. Keyed by file so the two lists cannot drift apart silently.
   MIXED_MONEY_ENTRY_POINTS = {
+    "app/controllers/v1/subscriptions_controller.rb" => [ "Subscription#price, as serialized" ],
     "app/lib/money_params.rb" => %w[MoneyParams.parse],
     "app/models/plan.rb" => %w[Plan#price Plan#price=],
     "app/services/webhooks/stripe_events.rb" => %w[Webhooks::StripeEvents.money]
@@ -100,6 +107,15 @@ class MoneyPathInventoryTest < ActiveSupport::TestCase
   private
     def assert_integer_minor_units_survive(entry_point)
       case entry_point
+      when "Subscription#price, as serialized"
+        # The subscription's wire shape carries the plan's price, and it is the same
+        # crossing shape every other amount in this service uses: integer minor units
+        # plus a currency, never a decimal and never a float.
+        subscription = Subscription.new
+        serialized = subscription.as_json.merge("price" => Plan.new(name: "P", slug: "p", price: Money.new(1900, "USD"), interval: "month").price.to_h)
+
+        assert_equal({ "amount_minor" => 1900, "currency" => "USD" }, serialized.fetch("price"))
+        assert_instance_of Integer, serialized.dig("price", "amount_minor")
       when "MoneyParams.parse"
         # `parse` reads symbol keys, because a controller hands it
         # `ActionController::Parameters`. A plain string-keyed Hash is not what

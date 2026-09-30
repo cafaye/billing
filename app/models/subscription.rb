@@ -50,12 +50,17 @@ class Subscription < ApplicationRecord
   LIVE_STATUSES = (STATUSES - %w[canceled]).freeze
   TERMINAL_STATUSES = %w[canceled].freeze
 
-  # The statuses a plan change may be requested from. A `past_due` subscription
-  # can still be moved — the processor accepts it and the grace period runs on —
-  # but an `unpaid` one is waiting to be canceled and has no plan worth
-  # changing, so the API refuses it rather than accepting a change to a price
-  # nobody is going to pay.
-  CHANGEABLE_STATUSES = %w[trialing active past_due].freeze
+  # The statuses a caller can still ask the processor to do something about:
+  # cancelling one, or moving it to another plan.
+  #
+  # `unpaid` is excluded from both, and the reason is the same: the processor has
+  # stopped collecting and is about to cancel the subscription itself, so there is
+  # nothing left to ask. It is still `LIVE` — it still grants entitlements, because
+  # the grace period is a product decision and not this service's to take away.
+  #
+  # One set rather than two because the two actions have the same boundary, and two
+  # sets would be two lists to keep in step.
+  ACTIONABLE_STATUSES = %w[trialing active past_due].freeze
 
   # The owner types a subscription can be billed to. A `User`-owned customer
   # cannot hold one: which account a user belongs to is identity's fact and no

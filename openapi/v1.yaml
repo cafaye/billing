@@ -48,6 +48,11 @@ tags:
     description: Billing records of the users and accounts identity knows about.
   - name: plans
     description: What can be bought, at what price, on what cadence.
+  - name: subscriptions
+    description: >-
+      The plan lifecycle. Every mutating action asks the payment processor to do
+      something and returns; the subscription's own status changes only when a
+      webhook says the processor did it.
   - name: webhooks
     description: >-
       Events coming in from a payment processor. Authenticated by signature
@@ -292,6 +297,261 @@ paths:
         '422':
           $ref: '#/components/responses/ValidationFailed'
 
+  /v1/subscriptions:
+    get:
+      tags: [subscriptions]
+      operationId: listSubscriptions
+      summary: List subscriptions
+      description: >-
+        Every subscription, not one account's, because v0 has no token and so no
+        account to scope by. A recorded gap, the same one `GET /v1/customers` has,
+        and closed the same way: when authorization lands this becomes an
+        `account_id` filter read from the token and never from a query parameter.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Order'
+        - $ref: '#/components/parameters/TraceId'
+      responses:
+        '200':
+          description: A page of subscriptions, newest first.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubscriptionPage'
+        '400':
+          $ref: '#/components/responses/CursorInvalid'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+    post:
+      tags: [subscriptions]
+      operationId: createSubscriptionCheckout
+      summary: Start a subscription by creating a Checkout session
+      description: >-
+        Creates a payment processor Checkout session for one plan and returns its
+        URL. The caller sends the buyer there; the processor collects the first
+        payment and creates the subscription.
+
+        **No subscription is created by this request, and the response is not a
+        subscription.** A subscription does not exist until the payment completes,
+        and this service does not invent a row for one that does not — which is why
+        there is no `Location` header either: there is no resource to point at. The
+        row appears when `customer.subscription.created` arrives, and
+        `billing.subscription.started` is published in the same transaction as that
+        row.
+
+        `customer_id` is in the body because v0 has no token to name the account
+        with, and it is why a customer whose owner is a `User` rather than an
+        `Account` is refused: which account a user belongs to is identity's fact and
+        no event carrying it is in this build's `consumes`.
+
+        Idempotent on `Idempotency-Key`: the same key with the same body replays the
+        first response rather than creating a second Checkout session, and the same
+        key with a different body is a 409.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubscriptionCheckoutRequest'
+      responses:
+        '201':
+          description: >-
+            A Checkout session was created. Deliberately carries no `Location`:
+            nothing in this service's database was created, and a header pointing at
+            a resource that does not exist yet would be a link to a 404.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckoutSession'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '503':
+          $ref: '#/components/responses/ProcessorUnconfigured'
+
+  /v1/subscriptions/{id}:
+    parameters:
+      - $ref: '#/components/parameters/SubscriptionId'
+    get:
+      tags: [subscriptions]
+      operationId: getSubscription
+      summary: Get a subscription
+      parameters:
+        - $ref: '#/components/parameters/TraceId'
+      responses:
+        '200':
+          description: The subscription, with its plan's price in integer minor units.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Subscription'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/subscriptions/{id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/SubscriptionId'
+    post:
+      tags: [subscriptions]
+      operationId: cancelSubscription
+      summary: Cancel a subscription
+      description: >-
+        Asks the payment processor to cancel, and returns. **The subscription is not
+        canceled by this response** — its status changes when
+        `customer.subscription.deleted` arrives and `billing.subscription.canceled` is
+        published. A response claiming the cancellation had happened would be a lie
+        about a state this service does not own.
+
+        `at_period_end` is required and must be a boolean: the caller chooses, and
+        this service does not inherit a processor's default on its behalf. It is
+        refused as a 422 for a `past_due` subscription, which has no further period
+        to serve — and refusing beats quietly cancelling immediately, which is not
+        what was asked for.
+
+        A `canceled` or `unpaid` subscription is a 409: the request collides with
+        something that has already happened, or the processor has stopped collecting
+        and will cancel it itself.
+
+        No refund and no proration is requested. The credit for the unused part of a
+        period is the processor's to compute, and a refund calculated here would be a
+        figure this service did not keep.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelRequest'
+      responses:
+        '200':
+          description: The processor was asked. The subscription is as it was.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Subscription'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '503':
+          $ref: '#/components/responses/ProcessorUnconfigured'
+
+  /v1/subscriptions/{id}/change_plan:
+    parameters:
+      - $ref: '#/components/parameters/SubscriptionId'
+    post:
+      tags: [subscriptions]
+      operationId: changeSubscriptionPlan
+      summary: Move a subscription to another plan
+      description: >-
+        Asks the payment processor to move the subscription, and returns. **The local
+        plan does not change by this response** — it changes when
+        `customer.subscription.updated` arrives and `billing.subscription.updated` is
+        published.
+
+        The timing rule, which is the point of the endpoint and is decided in one
+        place:
+
+        * **A more expensive plan takes effect immediately.** The processor bills the
+          difference now (`proration_behavior: always_invoice`). The customer asked
+          for more service, and delivering it at the end of the period would mean
+          they used it for free in between.
+        * **A cheaper or equally priced plan takes effect at the end of the current
+          period**, with nothing carried forward (`proration_behavior: none`). Nobody
+          is refunded for a plan they are already leaving, and no credit is computed
+          here.
+        * **A plan on a different interval, or in a different currency, is refused.**
+          Ten dollars a month against a hundred a year is not a cheaper plan, it is a
+          different unit; comparing them would mean annualising, which is computing
+          money nobody asked for.
+
+        `plan_change` in the response states which rule applied. It is not state — the
+        subscription's own fields have not moved — and it exists so a client can tell
+        the caller that a downgrade is scheduled rather than applied.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePlanRequest'
+      responses:
+        '200':
+          description: The processor was asked, plus what was decided.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubscriptionWithPlanChange'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '503':
+          $ref: '#/components/responses/ProcessorUnconfigured'
+
+  /v1/subscriptions/{id}/entitlements:
+    parameters:
+      - $ref: '#/components/parameters/SubscriptionId'
+    get:
+      tags: [subscriptions]
+      operationId: getSubscriptionEntitlements
+      summary: What this subscription grants, right now
+      description: >-
+        The plan's features and limits, and whether this subscription is currently
+        granting them.
+
+        A `canceled` subscription grants nothing: `features` is `[]` and `limits` is
+        `{}`. A `past_due` or `unpaid` one still grants, because the processor's grace
+        period is a product decision and not this service's to take away.
+      parameters:
+        - $ref: '#/components/parameters/TraceId'
+      responses:
+        '200':
+          description: The entitlements in force.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Entitlements'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /v1/webhooks/stripe:
     post:
       tags: [webhooks]
@@ -418,6 +678,14 @@ components:
       in: path
       required: true
       description: The plan's uuid.
+      schema:
+        type: string
+        format: uuid
+    SubscriptionId:
+      name: id
+      in: path
+      required: true
+      description: The subscription's uuid.
       schema:
         type: string
         format: uuid
@@ -660,6 +928,215 @@ components:
         page:
           $ref: '#/components/schemas/Page'
 
+    SubscriptionStatus:
+      type: string
+      description: >-
+        What the payment processor says the subscription is. This service stores
+        exactly what the processor reports and does not correct it: the processor is
+        the party that bills, and a row that disagreed with it would grant
+        entitlements nobody is paying for. A status outside this set is refused by
+        the lifecycle with the delivery recorded, rather than coerced into one of
+        these.
+      enum: [trialing, active, past_due, canceled, unpaid]
+
+    Subscription:
+      type: object
+      description: >-
+        One account, on one plan, for one billing period at a time. `plan_slug` is
+        derived from the plan and never stored, so it cannot go stale; the price is
+        the plan's, in integer minor units, and is not stored here either — a
+        subscription does not have a price, it has a plan.
+      required:
+        [id, account_id, plan_id, plan_slug, customer_id, processor_subscription_id, status, price,
+         current_period_start, current_period_end, cancel_at_period_end, canceled_at, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        account_id:
+          type: string
+          format: uuid
+          description: The account being billed. identity's uuid; no foreign key.
+        plan_id:
+          type: string
+          format: uuid
+        plan_slug:
+          type: string
+          pattern: '^[a-z0-9]+(-[a-z0-9]+)*$'
+        customer_id:
+          type: string
+          format: uuid
+        processor_subscription_id:
+          type: string
+          description: >-
+            The processor's own id for this subscription. Unique here, and that index
+            is how every event about a subscription is resolved.
+          example: sub_1PZQaBcDeFgHiJkLmNoPqR1
+        status:
+          $ref: '#/components/schemas/SubscriptionStatus'
+        price:
+          $ref: '#/components/schemas/Money'
+        current_period_start:
+          type: [string, 'null']
+          format: date-time
+        current_period_end:
+          type: [string, 'null']
+          format: date-time
+        cancel_at_period_end:
+          type: boolean
+          description: >-
+            The customer asked to cancel at the end of the period. The subscription
+            is still `active`: cancellation has not taken effect, and
+            `billing.subscription.canceled` is published when it does.
+        canceled_at:
+          type: [string, 'null']
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    SubscriptionPage:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          description: Always an array, empty rather than absent.
+          items:
+            $ref: '#/components/schemas/Subscription'
+        page:
+          $ref: '#/components/schemas/Page'
+
+    SubscriptionCheckoutRequest:
+      type: object
+      required: [customer_id, plan_id]
+      additionalProperties: false
+      properties:
+        customer_id:
+          type: string
+          format: uuid
+          description: >-
+            The billing customer to charge. Must belong to an `Account`: which
+            account a user belongs to is identity's fact, and no event carrying it is
+            in this build's `consumes`.
+        plan_id:
+          type: string
+          format: uuid
+          description: A plan that is active and has a processor price.
+
+    CheckoutSession:
+      type: object
+      description: >-
+        A hosted Checkout session, and the only thing this endpoint creates. The url
+        is the processor's — one assembled here would be a link to nothing.
+      required: [checkout_session_id, checkout_url, customer_id, plan_id]
+      properties:
+        checkout_session_id:
+          type: string
+          example: cs_test_00000000000001
+        checkout_url:
+          type: string
+          format: uri
+          example: https://checkout.stripe.test/c/pay/cs_test_00000000000001
+        customer_id:
+          type: string
+          format: uuid
+        plan_id:
+          type: string
+          format: uuid
+
+    CancelRequest:
+      type: object
+      required: [at_period_end]
+      additionalProperties: false
+      properties:
+        at_period_end:
+          type: boolean
+          description: >-
+            True keeps the subscription until the end of the period it was paid for;
+            false ends it now. Required, because the caller chooses and this service
+            does not inherit a processor's default on its behalf.
+
+    ChangePlanRequest:
+      type: object
+      required: [plan_id]
+      additionalProperties: false
+      properties:
+        plan_id:
+          type: string
+          format: uuid
+          description: >-
+            The plan to move to. Must be active, have a processor price, and be
+            quoted in the same currency and on the same interval as the current plan.
+
+    PlanChangeDecision:
+      type: object
+      description: >-
+        What a plan change request decided. Not state: the subscription's own fields
+        have not moved, and they will not until the processor's webhook says so.
+      required: [plan_id, effective, proration]
+      properties:
+        plan_id:
+          type: string
+          format: uuid
+        effective:
+          type: string
+          enum: [immediately, period_end]
+          description: >-
+            `immediately` when the new plan costs more for the same interval, and the
+            processor bills the difference now. `period_end` when it costs the same or
+            less, and nothing is carried forward.
+        proration:
+          type: string
+          enum: [always_invoice, none]
+          description: >-
+            The behaviour sent to the processor. The *amount* is the processor's to
+            compute, and no figure is calculated in this service.
+
+    SubscriptionWithPlanChange:
+      allOf:
+        - $ref: '#/components/schemas/Subscription'
+        - type: object
+          required: [plan_change]
+          properties:
+            plan_change:
+              $ref: '#/components/schemas/PlanChangeDecision'
+
+    Entitlements:
+      type: object
+      description: >-
+        What the plan grants, and whether this subscription is granting it. A
+        canceled subscription grants nothing.
+      required: [subscription_id, plan_id, plan_slug, status, granted, features, limits]
+      properties:
+        subscription_id:
+          type: string
+          format: uuid
+        plan_id:
+          type: string
+          format: uuid
+        plan_slug:
+          type: string
+        status:
+          $ref: '#/components/schemas/SubscriptionStatus'
+        granted:
+          type: boolean
+          description: False for a canceled subscription; true for every other status.
+        features:
+          type: array
+          description: Always an array, empty rather than absent.
+          items:
+            type: string
+        limits:
+          type: object
+          description: Always an object, empty rather than absent.
+          additionalProperties:
+            type: integer
+            minimum: 0
+
     Page:
       type: object
       required: [next_cursor, has_more]
@@ -815,6 +1292,26 @@ components:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/Problem'
+    ProcessorUnconfigured:
+      description: >-
+        No API key is configured for the payment processor, so the request could not
+        be made. This is this service's misconfiguration and never the caller's, and
+        it is deliberately not a 4xx: telling a client its request was wrong when the
+        service cannot reach Stripe at all sends an operator looking in the wrong
+        place. The cause is logged; the body does not carry the processor's own
+        message, which is the processor's to decide who sees it.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://errors.cafaye.com/unavailable
+            title: Service unavailable
+            status: 503
+            detail: The payment processor is not configured.
+            instance: /v1/subscriptions/0198f1c2-7a41-7c3b-9d55-2f0b6a1e4c88/cancel
+            code: unavailable
+            trace_id: 0af7651916cd43dd8448eb211c80319c
     SignatureRejected:
       description: >-
         The signature did not verify, the signature header was missing, or the
