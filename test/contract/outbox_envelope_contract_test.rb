@@ -456,7 +456,7 @@ class OutboxEnvelopeContractTest < ActiveSupport::TestCase
     # core's sync rule: a non-breaking addition bumps only `info.version`, never the
     # `/v1` prefix. Asserted so a future packet that adds an endpoint and forgets to
     # bump the document's own version is caught here rather than by a reader.
-    assert_equal "1.1.0", document.fetch("info").fetch("version")
+    assert_equal "1.2.0", document.fetch("info").fetch("version")
   end
 
   test "the manifest declares an api, and the document it points at exists" do

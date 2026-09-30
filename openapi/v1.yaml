@@ -6,7 +6,7 @@
 # every response. `test/contract` checks the event side of the same contract
 # against core's envelope schema.
 #
-# Two things a reader should know before trusting this document:
+# Five things a reader should know before trusting this document:
 #
 # 1. `security` is declared but empty, and the endpoints answer without a
 #    token. Authorization is a later platform packet; until it lands this
@@ -31,20 +31,42 @@
 #    `active`. Each operation says so, and the one place that is not true —
 #    `change_plan`, which also returns the timing decision it made — explains why
 #    in the operation's own description.
+# 5. **This document and `config/routes.rb` are held to each other by method and
+#    path.** `test/contract/http_surface_contract_test.rb` fails if an operation
+#    here is not served, and fails if the router serves one that is not here — so
+#    a client generated from this document cannot call an operation this service
+#    does not serve, and this service does not serve an operation no client can
+#    know about. Every route that is deliberately *not* a client operation is
+#    named in that test with the reason it is not one, which is what makes "not
+#    described here" different from "in no document at all". The two sets are
+#    compared as sets rather than as counts: a rename and a pure addition are
+#    different failures, and a count cannot tell them apart.
 openapi: 3.1.0
 info:
   title: billing
-  # A non-breaking addition: five new paths under the same /v1 prefix, plus a new
-  # response field on the subscription resource (`price`) and a new one on the
-  # plan resource (`entitlements`). core's sync rule: a non-breaking change bumps
-  # only `info.version`.
-  version: 1.1.0
+  # 1.2.0 moved no operation. What moved is this document's account of itself:
+  # `info.description` said it "describes the v0 surface" while the version said
+  # otherwise, and the header above now states the rule that holds the document to
+  # the router. core's checklist asks for `info.version` to be bumped if anything
+  # else in the document moved, and this is that bump; the operations are
+  # unchanged, so the `/v1` prefix is untouched.
+  #
+  # 1.1.0 was the five subscription paths under the same `/v1` prefix, plus a new
+  # response field on the subscription resource (`price`) and one on the plan
+  # resource (`entitlements`).
+  version: 1.2.0
   description: >-
-    Plans, customers, subscriptions, prepaid credit, usage metering and inbound
-    payment-processor webhooks for cafaye. This document describes the v0
-    surface: customers, plans, the subscription lifecycle, and one Stripe webhook
-    endpoint. The two health probes (/healthz, /readyz) are infrastructure and are
-    deliberately not here.
+    Plans, customers, the subscription lifecycle, and one inbound
+    payment-processor webhook for cafaye. This document describes every client
+    operation this service serves, and a test holds it to that by method and
+    path: see note 5 above.
+
+    Not described here, and not missed. The health probes (/healthz, /readyz,
+    /up) are infrastructure. The /404, /422, /500 and /503 pages are where the app
+    lands when a request fails rather than operations a client calls. The
+    /rails/* routes are drawn by Rails engines. Prepaid credit, usage metering
+    and invoices are absent because they are not built yet — README, "Known
+    gaps".
   contact:
     name: billing
     email: billing@cafaye.com
