@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_09_30_000009) do
+ActiveRecord::Schema[8.1].define(version: 2026_09_30_000010) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -48,6 +48,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_09_30_000009) do
     t.timestamptz "published_at"
     t.integer "attempts", default: 0, null: false
     t.timestamptz "created_at", null: false
+    t.index "((data ->> 'processor_event_id'::text))", name: "outbox_events_processor_event_id_idx", unique: true, where: "((data ->> 'processor_event_id'::text) IS NOT NULL)"
     t.index ["created_at"], name: "outbox_events_unpublished_idx", where: "(published_at IS NULL)"
     t.index ["subject", "created_at"], name: "outbox_events_subject_created_at_idx"
   end

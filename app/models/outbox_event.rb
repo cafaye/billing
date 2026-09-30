@@ -67,6 +67,25 @@ class OutboxEvent < ApplicationRecord
   scope :unpublished, -> { where(published_at: nil) }
   scope :oldest_first, -> { order(:created_at, :id) }
 
+  # The rows written for one processor event id — the key
+  # `outbox_events_processor_event_id_idx` is unique on, and the expression here
+  # is the same one that migration builds the index over.
+  #
+  # It exists because "at most once per processor event id" is a question the
+  # ingestion layer has to be able to *ask* rather than infer from a count. A
+  # scope that had drifted from the index would report a duplicate as a fresh
+  # emission, which is the failure this whole mechanism exists to prevent — so
+  # `test/models/outbox_event_test.rb` asks the scope and the index in the same
+  # breath rather than trusting the two to be the same expression.
+  #
+  # Returns a relation, not a boolean, so a caller can use it as a relation and
+  # `exists?` on it. The three model-callback emissions have no
+  # `processor_event_id` and are not matched, exactly as the index's `WHERE`
+  # clause does not cover them.
+  scope :for_processor_event, ->(processor_event_id) {
+    where("data ->> 'processor_event_id' = ?", processor_event_id)
+  }
+
   # Writes one event. Called from `after_create`/`after_update` on the record it
   # describes, which is inside that record's transaction — so the event and the
   # change it announces commit together or not at all. The row's id is the

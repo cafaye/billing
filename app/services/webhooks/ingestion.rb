@@ -28,7 +28,45 @@ module Webhooks
   #   * **Refuse a bad input before it becomes a row.** An unknown processor, a
   #     missing event id and a missing type are programming errors, not processor
   #     behaviour, and nobody can retry them into success.
+  #
+  # ## At most once, under concurrency
+  #
+  # `call` is a check followed by an act, and the first version of that sequence
+  # was correct only when deliveries did not overlap:
+  #
+  # ```ruby
+  # webhook = ProcessorWebhook.ingest(...)
+  # return webhook if webhook.handled?   # the read
+  # dispatch(webhook)                    # ... and the write
+  # ```
+  #
+  # The unique index on `processor_webhooks.stripe_event_id` makes two concurrent
+  # deliveries of one event id agree about *which row* they hold — and agreeing
+  # about the row is not agreeing about the answer. `handled?` reads a column that
+  # neither thread has written yet, because each is about to write it. Under READ
+  # COMMITTED neither sees the other's uncommitted work, so both read `nil`, both
+  # dispatch, and one Stripe event produces two outbox rows with two envelope
+  # ids. That is a duplicate charge event, and it is the defect
+  # `test/services/webhooks/concurrent_delivery_test.rb` reproduces.
+  #
+  # The fix is not a smarter check but a constraint that makes the duplicate
+  # state *impossible*: a unique index on the outbox's processor event id
+  # (`IndexOutboxEventsOnProcessorEventId`). It holds under any interleaving,
+  # which is the property an application-level guard cannot have — a guard is only
+  # ever right about the interleavings its author imagined.
+  #
+  # The loser of that race is not an error. It is a delivery that arrived, was
+  # understood, and was deliberately not acted on because a concurrent request
+  # for the same event id already published the event — so it is recorded as
+  # `ignored:duplicate_delivery` and answered 200, alongside the other decisions
+  # this layer already records. Parking it as `failed:` would put a row in front of
+  # a human at 3am for an event that is published and correct.
   class Ingestion
+    # Recorded when a delivery lost the race to publish its own event. A
+    # decision, in the vocabulary `processor_webhooks.error` already uses, not a
+    # failure: the event exists, written by the request that won.
+    DUPLICATE_REASON = "duplicate_delivery".freeze
+
     def initialize(processor:, event_id:, type:, payload:)
       @processor = processor
       @event_id = event_id
@@ -79,6 +117,43 @@ module Webhooks
         end
       rescue Ignored => e
         webhook.ignore!(e.reason)
+      rescue ActiveRecord::RecordNotUnique
+        # A concurrent duplicate delivery, caught wherever the constraint fired.
+        #
+        # Two deliveries of one event id both read `handled?` as false, both
+        # dispatch, and one loses the insert. By the time the loser is here the
+        # winner has **committed** — the constraint is what made it wait — so the
+        # event is durably published and this delivery's own work rolled back with
+        # its transaction.
+        #
+        # **Two different indexes can be the one that fires**, which is why this
+        # rescue is on the exception class and not on a particular constraint:
+        #
+        #   * `outbox_events_processor_event_id_idx` for the payment and the
+        #     updated/deleted subscription events, whose payloads carry
+        #     `processor_event_id`.
+        #   * `subscriptions.processor_subscription_id` for
+        #     `customer.subscription.created`, whose `billing.subscription.started`
+        #     payload **deliberately does not** carry `processor_event_id` (the
+        #     lifecycle's start payload is `core_payload` plus `started_at`, and
+        #     `lifecycle_test.rb` asserts the key's absence). The duplicate
+        #     `INSERT` into `subscriptions` is refused first, so the outbox index
+        #     never sees it.
+        #
+        # That second route was **measured, not assumed**: with both
+        # `subscriptions` indexes dropped, the same two deliveries produce two
+        # subscription rows and two `billing.subscription.started` events. So the
+        # duplicate-suppression property rests on two constraints, and a future
+        # change that dropped either one would reopen a duplicate charge with
+        # nothing to catch it. `concurrent_delivery_test.rb` tests both routes.
+        #
+        # A decision, not a failure, and the vocabulary says so: the event exists,
+        # written by a request no longer in flight, and this delivery has nothing
+        # left to do. Answering anything but 200 would tell the processor to
+        # redeliver, and the redelivery would race again. Parking it as `failed:`
+        # would put a row in front of a human for an event that is published and
+        # correct.
+        webhook.ignore!(DUPLICATE_REASON)
       rescue StandardError => e
         Rails.logger.error(
           "processor webhook #{processor} #{webhook.stripe_event_id} failed: #{e.class}: #{e.message}"
