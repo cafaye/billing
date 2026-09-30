@@ -537,6 +537,105 @@ class Subscriptions::LifecycleTest < ActiveSupport::TestCase
     assert_equal Time.utc(2026, 11, 14, 4, 0, 0), canceled.time
   end
 
+  # --- monotonic delivery order ----------------------------------------------
+  #
+  # The rule this service guarantees about a *sequence* of deliveries, as opposed
+  # to the state machine's rule about a *pair*.
+  #
+  # The state machine's whole job is that `canceled` is terminal, and that covers
+  # the one case where this service knows the order for certain: a deletion that
+  # overtook its own creation. Every other pair of statuses is legal, and legal is
+  # not the same as current.
+  #
+  # So the row records the processor's own timestamp for the delivery that last
+  # wrote it — `last_processor_event_at`, written in the same statement as the
+  # state so the two cannot disagree — and a delivery that *predates* it is
+  # refused. Without that, a `customer.subscription.updated` the processor retried
+  # an hour late lands on a row it has already moved past, and the row moves back:
+  # a `past_due` subscription whose charge failed becomes `active` again, which
+  # grants entitlements for a subscription nobody is paying for. That is the one
+  # outcome the lifecycle exists to make impossible, and `last_processor_event_at`
+  # was added to prevent it and never consulted.
+  #
+  # **Strictly older.** A delivery carrying the *same* processor timestamp is not
+  # stale: the processor's timestamps are epoch seconds, so two genuinely
+  # different events routinely share one and refusing those would drop real
+  # deliveries. With no ordering information between them, last-write-wins is the
+  # honest answer, and `no_change_to_record` already absorbs the repeats.
+
+  NEWER = 1_791_432_000 # the committed `customer.subscription.updated` fixture's created
+  OLDER = 1_790_740_900 # one minute after the `created` fixture, i.e. before NEWER
+  EARLIEST = 1_790_740_800 # the committed `customer.subscription.created` fixture's created
+
+  test "a delivery older than the one that last wrote the row is refused" do
+    apply("customer.subscription.created", created: EARLIEST, event_id: "evt_order_start")
+    apply("customer.subscription.updated", event_id: "evt_order_past_due", created: NEWER, status: "past_due")
+    record = apply("customer.subscription.updated", event_id: "evt_order_stale", created: OLDER, status: "active")
+
+    assert_equal "ignored:stale_delivery", record.error
+  end
+
+  test "a delivery older than the one that last wrote the row does not move the status" do
+    apply("customer.subscription.created", created: EARLIEST, event_id: "evt_order_start")
+    apply("customer.subscription.updated", event_id: "evt_order_past_due", created: NEWER, status: "past_due")
+    apply("customer.subscription.updated", event_id: "evt_order_stale", created: OLDER, status: "active")
+
+    assert_equal "past_due", Subscription.sole.status
+  end
+
+  # The other half of the same defect: the ordering record itself used to rewind,
+  # so after one stale delivery the service could no longer say which delivery was
+  # newest, and every later comparison was against the wrong baseline.
+  test "a refused stale delivery leaves the ordering record where the newer delivery put it" do
+    apply("customer.subscription.created", created: EARLIEST, event_id: "evt_order_start")
+    apply("customer.subscription.updated", event_id: "evt_order_past_due", created: NEWER, status: "past_due")
+    apply("customer.subscription.updated", event_id: "evt_order_stale", created: OLDER, status: "active")
+
+    assert_equal Time.at(NEWER).utc, Subscription.sole.last_processor_event_at
+  end
+
+  test "a refused stale delivery emits no event" do
+    apply("customer.subscription.created", created: EARLIEST, event_id: "evt_order_start")
+    apply("customer.subscription.updated", event_id: "evt_order_past_due", created: NEWER, status: "past_due")
+    apply("customer.subscription.updated", event_id: "evt_order_stale", created: OLDER, status: "active")
+
+    assert_equal [ "billing.subscription.started", "billing.subscription.updated" ], event_types
+  end
+
+  # A stale delivery must not undo a *cancellation intent* either.
+  # `cancel_at_period_end` is the flag that decides whether a customer is still
+  # going to be billed, and a late retry carrying the pre-cancellation value would
+  # tell every downstream consumer the cancellation had been called off.
+  test "a refused stale delivery does not clear a cancellation the newer delivery recorded" do
+    apply("customer.subscription.created", created: EARLIEST, event_id: "evt_order_start")
+    apply("customer.subscription.updated", event_id: "evt_order_cancelling", created: NEWER,
+      cancel_at_period_end: true)
+    apply("customer.subscription.updated", event_id: "evt_order_stale", created: OLDER,
+      cancel_at_period_end: false)
+
+    assert_equal true, Subscription.sole.cancel_at_period_end
+  end
+
+  # The negative control, and the reason the comparison is `<` rather than `<=`.
+  test "a delivery at the same processor timestamp is not stale" do
+    apply("customer.subscription.created", created: NEWER, event_id: "evt_order_same_a")
+    record = apply("customer.subscription.updated", event_id: "evt_order_same_b", created: NEWER, quantity: 7)
+
+    assert_predicate record, :handled?
+    assert_nil record.error
+    assert_equal [ "billing.subscription.started", "billing.subscription.updated" ], event_types
+  end
+
+  # A first delivery has nothing to be stale against, so the rule cannot refuse the
+  # deletion that arrives before its own creation — the case the state machine's
+  # terminal rule already handles.
+  test "a first delivery is never stale" do
+    record = apply("customer.subscription.deleted", created: EARLIEST, event_id: "evt_order_first_deleted")
+
+    assert_predicate record, :handled?
+    assert_equal "canceled", Subscription.sole.status
+  end
+
   # --- the transaction --------------------------------------------------------
 
   # The event and the row are one commit. A process that died between two
@@ -643,6 +742,11 @@ class Subscriptions::LifecycleTest < ActiveSupport::TestCase
     def payload_for(fixture, overrides = {})
       body = JSON.parse(stripe_fixture(fixture))
       subscription = body.dig("data", "object")
+
+      # The processor's own clock, which `Webhooks::Ingestion` reads once and hands
+      # to the lifecycle as the event time. A case about ordering needs to move it
+      # independently of this suite's frozen clock, which is what `apply` moves.
+      body["created"] = overrides[:created] if overrides.key?(:created)
 
       if (status = overrides[:status])
         subscription["status"] = status

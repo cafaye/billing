@@ -71,7 +71,20 @@ module Webhooks
         # through a third-party object model. `id` and `type` come from the
         # verified event, so a payload cannot disagree with the signature that
         # covered it about which event it is.
-        payload = JSON.parse(raw_body).merge("id" => event.id, "type" => event.type)
+        payload = JSON.parse(raw_body)
+        # Not an object, so not an event — and this has to be decided here rather
+        # than by whatever the gem does with it. `Stripe::Webhook.construct_event`
+        # builds a `Stripe::Event` out of the parsed body, and an array, a bare
+        # number, a string, a boolean or `null` reach that call as something it
+        # has no accessor for, so it raises `TypeError` or `NoMethodError` rather
+        # than the `SignatureVerificationError` the loop above rescues. Uncaught,
+        # that is a 500 on an endpoint whose own status table says a 5xx never is
+        # an answer, because a 5xx teaches a processor to retry a decision that
+        # cannot change. `{}` passes here and is refused one line below for having
+        # no event id, which is the same 400 with the same detail.
+        raise MalformedEvent, "verified body is not a JSON object" unless payload.is_a?(Hash)
+
+        payload = payload.merge("id" => event.id, "type" => event.type)
         raise MalformedEvent, "verified body is not an event" if payload["id"].blank? || payload["type"].blank?
 
         payload
@@ -86,11 +99,21 @@ module Webhooks
         # way the reference processor does it. A body that verifies under none of
         # them — or under a stale timestamp, which is what the tolerance window
         # exists for — is a rejected signature and a 400.
+        #
+        # The exception list is this method's and not `create`'s, because this is
+        # where the gem is called and this is what it raises. `StandardError` is
+        # last on purpose: it catches the gem's own shape assumptions on a body it
+        # verified, and it is scoped to the verification call so it cannot swallow
+        # anything from the ingestion layer below. The loop's own
+        # `SignatureVerificationError` stays first and stays a `next`, so a secret
+        # that simply does not match is a candidate failure and not an error.
         signing_secrets.each do |candidate|
           begin
             return Stripe::Webhook.construct_event(raw_body, signature, candidate, tolerance: tolerance)
           rescue Stripe::SignatureVerificationError
             next
+          rescue StandardError => e
+            raise MalformedEvent, "#{e.class}: #{e.message}"
           end
         end
 

@@ -146,6 +146,52 @@ All notable changes to billing are recorded here. The format follows
 
 ### Fixed
 
+- **A signed webhook body that is valid JSON but not an object was answered
+  500.** An array, a bare number, a string, a boolean or `null` are all valid
+  JSON over a perfectly good signature, and all of them are not an event.
+  `Stripe::Webhook.construct_event` builds a `Stripe::Event` out of the parsed
+  body and reaches an array as something it has no accessor for, so it raised
+  `TypeError` or `NoMethodError` rather than the `SignatureVerificationError` the
+  rescue clause named — and the endpoint's own status table says a 5xx never is
+  an answer, because a 5xx teaches a processor to retry a decision that cannot
+  change. The shape is now decided in the controller, where the payload is
+  parsed, and the six shapes are asserted to answer the same 400 with the same
+  problem body as a body that is not JSON at all.
+
+  The `rescue` for the gem's own shape assumptions is **scoped to the
+  verification call** and cannot swallow anything from the ingestion layer
+  below it, and the loop's own `SignatureVerificationError` stays first and
+  stays a `next` — a secret that simply does not match is a candidate failure
+  and not an error.
+
+- **A delivery that predated the one that last wrote the subscription was
+  applied.** The state machine's rule is about a *pair* of statuses and covers
+  the one order this service knows for certain. Everything else is a *sequence*,
+  and the processor does not promise delivery order, so a
+  `customer.subscription.updated` it retried an hour late landed on a row it had
+  already moved past: a `past_due` subscription whose charge failed became
+  `active` again, which grants entitlements nobody is paying for, and a late
+  `cancel_at_period_end: false` told every downstream consumer a cancellation
+  had been called off.
+
+  `Subscriptions::Lifecycle::STALE_REASON` refuses a delivery **strictly older**
+  than `last_processor_event_at`, the processor's own timestamp for the delivery
+  that last wrote the row. Strictly, and not "not newer": those timestamps are
+  epoch seconds, two genuinely different events routinely share one, and
+  refusing those would drop real deliveries. A row with no recorded timestamp
+  has nothing to be stale against, which is the case a deletion arriving before
+  its own creation depends on. Refusals are recorded as
+  `ignored:stale_delivery` and answered 200, because a processor retrying a
+  stale delivery reaches the identical conclusion.
+
+  The seven tests pin **both** directions, because the guard's whole value is
+  that it refuses a delivery it should refuse and accepts one it should accept.
+  Two mutations were run: `<=` instead of `<` goes red on
+  `a delivery at the same processor timestamp is not stale`, which is the
+  mistake a naive implementation makes; and removing the guard call goes red on
+  five, including `Expected "past_due" Actual: "active"` and a third
+  `billing.subscription.updated` event.
+
 - **`PUT /v1/customers/{id}` was served and was in no document.** The check that
   compared the document with the router read **paths only** and filtered the
   router with `start_with?("/v1")`, so `resources`' two verbs for one `update`
@@ -160,6 +206,37 @@ All notable changes to billing are recorded here. The format follows
   plans and subscriptions. This is a narrowing of the served surface and nothing
   in `openapi/v1.yaml` declared it, so no operation changed and the `/v1` prefix
   is untouched.
+
+### Added
+
+- **`test/contract/tenant_isolation_matrix_test.rb`** enumerates every `/v1`
+  operation the router serves and requires each one to be classified as
+  account-scoped or not, in **both** directions, with a reason. Every entry is
+  `unscoped` on this commit, and that word is load-bearing: it is what makes
+  "this route touches another tenant's data" distinguishable from "this route
+  does not". It asserts the verdicts as a **set** rather than as a count, so the
+  day a route is genuinely scoped the failure names the verdict that changed
+  instead of reporting a number that moved.
+
+  It lives in `test/contract/` rather than beside the envelope spec because that
+  file skips when `core` is not on disk, and a check that hides behind a skip is
+  not a check. This one reads the router, the models and the README, none of
+  which is core.
+
+- **`test/integration/secrets_do_not_leak_test.rb`** captures real log output
+  from the **failure** paths — a processor refusal, an unconfigured signing
+  secret, a rejected signature, a parked delivery, a rendered problem body — and
+  asserts that a processor API key, a Stripe signing secret, the signature header
+  itself and a customer email are all absent. It renders the failures rather than
+  the happy path, because the failure path is where leaks live: nobody logs a
+  value on the way in and everybody logs the exception on the way out.
+
+  The file's own existence is the finding. The fleet measured it: **no
+  off-the-shelf static analyser finds a secret leaked at runtime** — zero of 268
+  Semgrep rules intersect CWE-532, gosec has no `*ast.CallExpr` case, Bandit is
+  `ast.Constant`-only. Every one of those tools finds a *constant* that looks
+  like a credential, which is not the same question. Every value in the file is
+  a literal that is a credential for nothing.
 
 ### Known issues
 

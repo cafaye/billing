@@ -59,6 +59,25 @@ Three packets, in order.
   comparison that could not see a verb, and found one operation
   (`PUT /v1/customers/{id}`) that was served and in no document. It removed that
   route rather than documenting it. No behaviour in `app/` changed.
+- **billing-08** is hardening, and it is where the *recorded* gaps stop being
+  prose. `test/contract/tenant_isolation_matrix_test.rb` enumerates every `/v1`
+  operation the router serves and requires each one to be classified account-scoped
+  or not, with a reason — so a route added tomorrow fails by name instead of
+  joining an unauthenticated surface nobody decided the scope of.
+  `test/integration/secrets_do_not_leak_test.rb` captures real log output from
+  the **failure** paths and asserts a processor key, a signing secret and a
+  customer email are absent from it, because no static analyser in the fleet
+  finds a secret leaked at runtime. The controller stopped answering **500** to a
+  signed body that is valid JSON but not an object — an array, a number, a
+  string, a boolean or `null` — where the endpoint's own status table says a 5xx
+  never is an answer. And the lifecycle's stale-delivery guard above landed here.
+
+  Two judgement calls are recorded because they are the kind that rot. The
+  tenant matrix asserts every entry is `unscoped` **as a set of the distinct
+  verdicts**, not as a count, so the day a route is genuinely scoped the failure
+  names the verdict that changed; and every entry carries a reason that is
+  asserted to be non-empty, because `/v1/subscriptions` returning every row is a
+  gap that arrived by nobody writing it down.
 
 billing-05 changes a claim the earlier packets made, so it is stated plainly:
 **this service now talks to Stripe.** It did not, and saying so was true when it
@@ -266,11 +285,32 @@ Two rules that are not obvious and that the specs exist to hold:
   `no_change_to_record` — otherwise a processor that repeats itself under a fresh
   event id produces updates that carry no update, and a consumer counting plan
   changes stops meaning anything.
+- **A delivery that predates the one that last wrote the row is refused.**
+  `stale_delivery`. The state machine's rule is about a *pair* of statuses and
+  covers the one order this service knows for certain. Everything else is a
+  *sequence*, and the processor does not promise delivery order, so a
+  `customer.subscription.updated` the processor retried an hour late lands on a
+  row it has already moved past. `last_processor_event_at` records the
+  processor's own timestamp for the delivery that last wrote the row, and a
+  delivery **strictly older** than it is refused — *strictly*, because those
+  timestamps are epoch seconds, two genuinely different events routinely share
+  one, and refusing those would drop real deliveries. A row with no recorded
+  timestamp has nothing to be stale against, which is the case a deletion
+  arriving before its own creation depends on. Without this, a `past_due`
+  subscription whose charge failed becomes `active` again, which grants
+  entitlements nobody is paying for, and a late `cancel_at_period_end: false`
+  tells every consumer a cancellation was called off.
+
+  **This is not the same guarantee as at-most-once, and neither replaces the
+  other.** `stale_delivery` refuses a delivery that arrived *late*; two
+  deliveries of *one* event id that arrive *together* are both current, both
+  pass it, and only the outbox's unique index on the processor event id
+  separates them. See "Webhooks in" below.
 
 Every refusal raises `Subscriptions::Refused`, which the webhook layer records as
 `ignored:<reason>` and answers 200. The reasons are part of the contract:
 `unknown_customer`, `unknown_plan`, `no_subscription_to_update`,
-`canceled_is_terminal`, `no_change_to_record`.
+`canceled_is_terminal`, `no_change_to_record`, `stale_delivery`.
 
 ## Webhooks in
 
@@ -349,10 +389,11 @@ Four things that are not obvious and that the file argues in full:
   deletes it, so the condition for retiring it is written into the file: kit's
   `ruby` job grows a `services`/`env` seam, **and** `rake coverage` exists here
   or kit stops running it.
-- **The suite size is held by equality, not as a floor.** `763 runs / 2100
-  assertions / 0 skips` is master's number at `e63bb7a` — billing-07's split of
-  the contract tier is +4 runs / +13 assertions over billing-05's 759 / 2087,
-  and reading core's catalog through `CORE_PATH` is a further +4 assertions.
+- **The suite size is held by equality, not as a floor.** `823 runs / 2299
+  assertions / 0 skips` is the number asserted at the top of the workflow on this
+  branch. master at `e63bb7a` was `763 / 2100`; the difference is billing-08's
+  hardening and billing-09's race fix, itemised in the workflow's own header so a
+  reviewer does not have to reconstruct it.
   A floor would accept a suite that lost 200 tests, and the tests it would lose
   first are the money arithmetic and the webhook signatures. Adding a test turns
   CI red until
@@ -363,14 +404,22 @@ Four things that are not obvious and that the file argues in full:
 
 `test/contract/outbox_envelope_contract_test.rb` reads core's real schemas and
 **skips every test in the file** when it cannot read them, printing
-`skip("core is not on disk; set CORE_PATH to …")`. On this commit, with
-`CORE_PATH` set: `19 runs, 339 assertions, 0 skips`. Pointing `CORE_PATH` at
-nothing: `19 runs, 0 assertions, 19 skips` — and the whole-suite summary line is
-identical, because 19 skips is still a green exit. The whole `test/contract`
-directory, which is the tier, is `26 runs / 358 assertions` with core present;
-the tier is named as a directory because billing-07 moved three tests into
-`http_surface_contract_test.rb`, and a file list read that relocation as a
-deletion.
+`skip("core is not on disk; set CORE_PATH to …")`. Measured on this branch, same
+commit, same code, with `CORE_PATH` pointed at a checkout and then at nothing:
+
+| `CORE_PATH` | `test/contract` (the tier) | whole suite |
+|---|---|---|
+| a core checkout | 45 runs, 400 assertions, 0 skips | 823 runs, 2299 assertions, 0 skips |
+| pointing at nothing | 45 runs, 61 assertions, **19 skips** | 823 runs, 1956 assertions, **20 skips** |
+
+**Same run count, same exit code, and 343 assertions of contract checking simply
+not done.** A green run that did not notice would have reported "the outbox
+contract holds" while having checked nothing at all. The whole `test/contract`
+directory is the tier; it is named as a directory rather than a file list because
+billing-07 moved three tests into `http_surface_contract_test.rb` and a file list
+read that relocation as a deletion — and because billing-08 added
+`tenant_isolation_matrix_test.rb`, which does not read core at all and therefore
+must not be reachable through a path that skips.
 
 A second test reads core and did not say so: `subscription_delivery_test.rb`
 asserted against `Rails.root.join("..", "core")` with no seam at all, so a
@@ -465,9 +514,9 @@ environment, and the `pins` job fails the build if the workflow file ever gains 
   database.** `test_helper.rb` calls `parallelize(workers: :number_of_processors)`,
   so a run creates `<database>_0` … `-7` beside the base database and eight
   workers never share one. The number of workers changes the wall clock and
-  nothing else — the same 763 tests and 2100 assertions with one worker or
-  eight, verified both ways on this packet — which is why the gate counts tests
-  and never seconds.
+  nothing else — the same tests and assertions with one worker or eight, verified
+  both ways on this packet — which is why the gate counts tests and never
+  seconds.
   What parallel workers do **not** protect against is two `rails test` processes
   in the *same* worktree — they race on the same per-worker databases, and a
   per-checkout database name separates worktrees from each other, not processes
@@ -478,7 +527,7 @@ environment, and the `pins` job fails the build if the workflow file ever gains 
   `while active_workers?; sleep 0.1; end` for each one to deregister. A worker
   killed before it can deregister is never reaped and the parent spins in that
   sleep at teardown — **after** printing the summary line. So a green
-  a `763 runs, 0 failures` summary followed by nothing is that, not a pass.
+  `823 runs, 0 failures` summary followed by nothing is that, not a pass.
   Nothing
   suppresses it: the job times out and goes red, and the count guard never
   runs. Do not "fix" it with retries; find the worker that died.

@@ -20,27 +20,29 @@
 #
 # THE BASELINE THIS FILE HOLDS
 #
-#   **763 runs, 2100 assertions, 0 failures, 0 errors, 0 skips** — measured on
-#   master at `e63bb7a`, with billing-07 merged. The numbers below are that line,
-#   asserted.
+#   **823 runs, 2299 assertions, 0 failures, 0 errors, 0 skips** — measured on
+#   this branch, with billing-08's hardening and billing-09's race fix. The
+#   numbers below are that line, asserted.
 #
-#   billing-05 landed at 759 / 2087 and this packet started from there. Master
-#   moved underneath it, so the baseline is master's number and not the number
-#   this branch was dispatched with. The whole difference, so that a reviewer
-#   does not have to reconstruct it:
+#   master at `e63bb7a` was 763 / 2100, and this packet started from there. The
+#   whole difference, so that a reviewer does not have to reconstruct it:
 #
-#   - **+4 runs, +13 assertions** — billing-07, merged as `e63bb7a`. It split the
-#     contract tier in two: the HTTP-surface tests moved out of
-#     `outbox_envelope_contract_test.rb` into a new
-#     `test/contract/http_surface_contract_test.rb`. The envelope file therefore
-#     has 19 tests where it had 22, and the *directory* has 26 — which is why the
-#     contract tier below is named as a directory and not as a file list. A file
-#     list is what let a relocation look like a deletion.
-#   - **+4 assertions, and no new run** — `subscription_delivery_test.rb` reads
-#     core's catalog, through a path derived from the checkout's own directory
-#     with no seam. On a CI runner, which has one checkout and no sibling, it
-#     raised before asserting anything. It reads `CORE_PATH` now, and those four
-#     assertions are counted.
+#   - **+45 runs, +99 assertions — billing-08's hardening.** The tenant-isolation
+#     matrix and the secrets-do-not-leak file are new files (19 and 10 runs);
+#     the non-object webhook bodies (9) and the money-precision cases (13) extend
+#     files that already existed.
+#   - **+7 runs — the stale-delivery guard.** Seven tests pinning both directions
+#     of `stale_delivery`, including the equal-timestamp case a naive `<=` gets
+#     wrong.
+#   - **−1 run — `test/probe_test.rb` deleted.** It printed diagnostics and had
+#     zero assertions, so it inflated the run count and proved nothing.
+#
+#   billing-07 was the packet before this one, and it split the contract tier in
+#   two: the HTTP-surface tests moved out of `outbox_envelope_contract_test.rb`
+#   into a new `test/contract/http_surface_contract_test.rb`. The envelope file
+#   therefore has 19 tests where it had 22, and the *directory* is 45 — which is
+#   why the contract tier below is named as a directory and not as a file list. A
+#   file list is what let a relocation look like a deletion.
 #
 #   They are **decrease detectors, not targets**. A green run means nothing was
 #   deleted, skipped or excluded since they were measured. Adding a test turns
@@ -56,7 +58,7 @@
 #
 #   1. A database. billing's suite cannot start without PostgreSQL: `rails test`
 #      opens a connection while maintaining the test schema, so a runner with no
-#      postgres aborts before the first test — 0 of 763, exit 1. A caller cannot
+#      postgres aborts before the first test — 0 of 823, exit 1. A caller cannot
 #      hand a reusable workflow a service container at all: GitHub allows only
 #      `name`, `uses`, `with`, `secrets`, `strategy`, `needs`, `if`, `concurrency`
 #      and `permissions` on a job that calls one, so `services:` is not reachable
@@ -146,12 +148,13 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # master at e63bb7a, with billing-07 merged and `CORE_PATH` resolving. The gate
-  # asserts 763 runs / 2100 assertions / 0 failures / 0 errors / 0 skips against
-  # this, and every tier below carries its own count. Raising a number is
-  # allowed; lowering one is not.
-  BASELINE_RUNS: '763'
-  BASELINE_ASSERTIONS: '2100'
+  # master at e63bb7a was 763 / 2100; this commit is billing-08's hardening and
+  # billing-09's race fix, which add 60 runs and 199 assertions. The gate asserts
+  # 823 runs / 2299 assertions / 0 failures / 0 errors / 0 skips against this, and
+  # every tier below carries its own count. Raising a number is allowed;
+  # lowering one is not.
+  BASELINE_RUNS: '823'
+  BASELINE_ASSERTIONS: '2299'
 
 jobs:
   # ------------------------------------------------------------------ shared
@@ -526,9 +529,9 @@ jobs:
             exit "$status"
           fi
 
-      - name: the gate ran the suite master's size, and skipped nothing
+      - name: the gate ran the suite at the asserted size, and skipped nothing
         # The load-bearing assertion in this file, and the answer to "does this CI
-        # run add up to master's 763 / 2100".
+        # run add up to the 823 / 2299 asserted at the top of it".
         #
         # A minitest summary line is read, and a line that is not there is an
         # error rather than a pass: a guard that cannot find its target is not a
@@ -585,33 +588,47 @@ jobs:
           fi
           echo "::notice::$runs runs, $assertions assertions, nothing skipped — master's baseline exactly"
 
-      - name: tier — the contract tier, against core's real schemas (26 tests)
+      - name: tier — the contract tier, against core's real schemas (45 tests)
         # **The environment-gated tier, and the reason this job exists.**
         #
         # `outbox_envelope_contract_test.rb` skips every test in the file when
         # core's schema is not readable, and says so in a message rather than
         # failing — which is correct for a developer with a standalone checkout
-        # and exactly wrong for a CI badge. Measured on master at `e63bb7a`,
-        # same commit, same code, twice:
+        # and exactly wrong for a CI badge. Measured on this branch, same commit,
+        # same code, twice, with `CORE_PATH` pointed at a core checkout and then
+        # at nothing:
         #
-        #   core present    763 runs, 2100 assertions, 0 failures, 0 errors,  0 skips
-        #   core unreadable 763 runs, 1757 assertions, 0 failures, 0 errors, 20 skips
+        #   core present    45 runs,  400 assertions, 0 failures, 0 errors,  0 skips
+        #   core unreadable 45 runs,   61 assertions, 0 failures, 0 errors, 19 skips
+        #
+        # and the whole suite, same commit, same code:
+        #
+        #   core present    823 runs, 2299 assertions, 0 failures, 0 errors,  0 skips
+        #   core unreadable 823 runs, 1956 assertions, 0 failures, 0 errors, 20 skips
         #
         # **Same run count, same exit code, and 343 assertions of contract
         # checking simply not done.** A green CI run that did not notice the
         # difference would have reported "the outbox contract holds" while having
         # checked nothing at all, which is the whole reason this job exists.
+        # (The 19 file-local skips and the 20th suite-wide one are the same
+        # phenomenon read at two scales: the twentieth is
+        # `subscription_delivery_test.rb`, which also reads core's catalog.)
         #
         # **The whole `test/contract` directory, not a file list.** billing-07
         # moved the HTTP-surface tests out of the envelope file and into
         # `http_surface_contract_test.rb`, so a step naming the one file went from
         # "22 tests" to "19 tests" with not one test lost — a relocation read as a
         # deletion. The directory is the tier; a file inside it is an
-        # implementation detail of it. 26 / 358 is the directory on master.
+        # implementation detail of it. billing-08 added
+        # `tenant_isolation_matrix_test.rb` here, which is why this is a
+        # directory count and not a file list: that file must not be skippable,
+        # and a list is how a new tier member goes unnamed. 45 / 400 on this
+        # commit, and it does not read `core` at all — that is the point of it
+        # being here.
         #
         # Run on its own so the log carries a line that can only exist if this
         # tier ran, and so a failure here is visibly about the contract rather
-        # than about 763 tests somewhere.
+        # than about 823 tests somewhere.
         #
         # `CORE_PATH` comes from the job's `env:`, where it is set for every test
         # in the repository that reads core and not only for this step — which is
@@ -655,9 +672,9 @@ jobs:
           # that ends in a comma ("failures,") and every number is bare, so the
           # numbers land in the named variables with nothing to strip.
           read -r runs _r assertions _a failures _f errors _e skips _s <<< "$summary"
-          if [ "$runs" != 26 ] || [ "$assertions" != 358 ] ||
+          if [ "$runs" != 45 ] || [ "$assertions" != 400 ] ||
              [ "$failures" != 0 ] || [ "$errors" != 0 ] || [ "$skips" != 0 ]; then
-            echo "::error::expected 26 runs, 358 assertions, 0 failures, 0 errors, 0 skips; got '$summary'." >&2
+            echo "::error::expected 45 runs, 400 assertions, 0 failures, 0 errors, 0 skips; got '$summary'." >&2
             echo "  Skips mean core was not readable, and a skipped contract test" >&2
             echo "  proves nothing (PLAN §1)." >&2
             exit 1
@@ -665,11 +682,11 @@ jobs:
           echo "$summary"
           echo "::notice::the contract tier ran against core at $(git -C "$CORE_PATH" rev-parse --short HEAD)"
 
-      - name: tier — the webhook tier, signatures verified for real (138 tests)
+      - name: tier — the webhook tier, signatures verified for real (147 tests)
         # **The highest-value tests in this repository.** A forged amount is
         # believed if this tier is skipped, and a payment processor does not
         # re-send a delivery it has already made, so the failure has no retry to
-        # recover from. Four files, 138 tests: the HTTP edge
+        # recover from. Four files, 147 tests: the HTTP edge
         # (`integration/stripe_webhook_test.rb`), the subscription deliveries that
         # write (`integration/subscription_delivery_test.rb`), and the two
         # service-level halves (`services/webhooks/ingestion_test.rb`,
@@ -712,9 +729,9 @@ jobs:
           # that ends in a comma ("failures,") and every number is bare, so the
           # numbers land in the named variables with nothing to strip.
           read -r runs _r assertions _a failures _f errors _e skips _s <<< "$summary"
-          if [ "$runs" != 138 ] || [ "$assertions" != 284 ] ||
+          if [ "$runs" != 147 ] || [ "$assertions" != 352 ] ||
              [ "$failures" != 0 ] || [ "$errors" != 0 ] || [ "$skips" != 0 ]; then
-            echo "::error::expected 138 runs, 284 assertions, 0 failures, 0 errors, 0 skips; got '$summary'." >&2
+            echo "::error::expected 147 runs, 352 assertions, 0 failures, 0 errors, 0 skips; got '$summary'." >&2
             exit 1
           fi
           echo "$summary"
@@ -835,8 +852,8 @@ jobs:
             echo "### billing CI — what ran"
             echo
             whole="${BASELINE_RUNS} runs / ${BASELINE_ASSERTIONS} assertions / 0 skipped"
-            contract="26 runs / 358 assertions / 0 skipped"
-            webhook="138 runs / 284 assertions / 0 skipped"
+            contract="45 runs / 400 assertions / 0 skipped"
+            webhook="147 runs / 352 assertions / 0 skipped"
             coverage="5 runs / 11 assertions / 0 skipped"
             echo "| tier | asserted | checked by |"
             echo "|---|---|---|"
@@ -850,8 +867,8 @@ jobs:
             echo "| brakeman / bundler-audit | 0 warnings / no advisories | security job |"
             echo
             echo "The suite numbers are decrease detectors, not targets: a green run"
-            echo "means nothing was deleted, skipped or excluded since billing-05"
-            echo "measured them. Adding a test turns this workflow red until"
+            echo "means nothing was deleted, skipped or excluded since they were"
+            echo "measured. Adding a test turns this workflow red until"
             echo "\`BASELINE_RUNS\`/\`BASELINE_ASSERTIONS\` are raised in the same commit."
             echo
             echo "core read for the contract tier: \`$(git -C "$CORE_PATH" rev-parse HEAD)\` (master)."
@@ -936,7 +953,7 @@ jobs:
     # Its own job, and the reason is triageability: every check here needs no
     # toolchain, no database and no bundle, so a wrong version number or a leaked
     # credential is red in seconds under a tick that says `pins`, instead of
-    # buried under a 763-test run that would have failed later anyway.
+    # buried under an 823-test run that would have failed later anyway.
     steps:
       - uses: actions/checkout@v7
 

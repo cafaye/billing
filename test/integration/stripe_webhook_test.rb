@@ -347,6 +347,69 @@ class StripeWebhookTest < ActionDispatch::IntegrationTest
     assert_equal 0, ProcessorWebhook.count
   end
 
+  # A body that parses as JSON but is **not an object** — an array, a bare number,
+  # a string, a boolean, or `null`. Every one of those is valid JSON over a valid
+  # signature, and every one of them is not an event.
+  #
+  # The endpoint's own contract says a body that is not an event is a 400 and a
+  # 5xx is never an answer: "a 5xx teaches a processor to retry a decision this
+  # service has already made, and would hide a parked row behind a timeout." The
+  # verification call raises `TypeError`/`NoMethodError` on these rather than the
+  # gem's `SignatureVerificationError`, and the `rescue` clause in `create` names
+  # only the latter — so the answer was a 500, which is exactly the retry loop the
+  # status table exists to prevent. It is also the one input on this endpoint that
+  # an integration test could not see as a 500, because the suite sets
+  # `show_exceptions = :rescuable` and raises instead; the assertion below is the
+  # one that would catch it either way.
+  SIGNED_NON_OBJECTS = {
+    "an array" => "[1,2,3]",
+    "an empty array" => "[]",
+    "a number" => "5",
+    "a string" => '"a string"',
+    "a boolean" => "true",
+    "null" => "null"
+  }.freeze
+
+  SIGNED_NON_OBJECTS.each do |shape, body|
+    test "a signed body that is #{shape} is rejected rather than raising" do
+      post_stripe_webhook(body)
+
+      assert_response :bad_request
+      assert_equal 0, ProcessorWebhook.count
+      assert_equal 0, OutboxEvent.count
+    end
+  end
+
+  # The distinguishing claim, stated on its own: every one of those answers the
+  # same 400 as a body that is not JSON at all, rather than a mix of 400 and 500.
+  # A test that asserted only the status would pass if one of them were still a
+  # 500 rendered as a problem body, so the body is checked too.
+  test "every signed body that is not an object answers with this service's problem body" do
+    SIGNED_NON_OBJECTS.each_value do |body|
+      post_stripe_webhook(body)
+
+      assert_problem "bad_request"
+    end
+  end
+
+  # The detail has to distinguish this from a signature failure, because "your
+  # signature is bad" and "those bytes are not an event" send an operator to two
+  # entirely different places and the response is the only thing they have. The
+  # signature over this body *did* verify, which is the whole point.
+  test "a signed body that is not an object does not claim the signature was invalid" do
+    post_stripe_webhook("[1,2,3]")
+
+    assert_equal "The verified body is not a Stripe event.", json_body["detail"]
+  end
+
+  test "a signed body that is not an object is answered with the same status as one that is not JSON" do
+    post_stripe_webhook("[1,2,3]")
+    non_object_status = response.status
+    post_stripe_webhook("this is not json, but it is signed")
+
+    assert_equal non_object_status, response.status
+  end
+
   test "a signed body with no event type is rejected" do
     post_stripe_webhook({ "id" => "evt_untyped", "data" => { "object" => {} } }.to_json)
 

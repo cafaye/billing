@@ -45,7 +45,28 @@ module Subscriptions
   # machine's terminal rule, so the subscription is never started and never grants
   # anything. A subscriber that was created and canceled inside one delivery window
   # ends up recorded as canceled, which is the truth.
+  #
+  # ## A delivery that predates the row is refused
+  #
+  # The terminal rule is about a *pair* of statuses, and it covers the one case
+  # where this service knows the order for certain. Everything else is a
+  # *sequence*: the processor does not promise delivery order, so a delivery can
+  # arrive after a later one, and legality on its own would happily apply it. A
+  # `past_due` subscription whose charge failed becomes `active` again, which
+  # grants entitlements nobody is paying for — and a stale `cancel_at_period_end:
+  # false` tells every downstream consumer a cancellation was called off.
+  #
+  # So the row remembers the processor's own timestamp for the delivery that last
+  # wrote it, and a delivery strictly older than that is refused. `Refused` is the
+  # right shape here: it is a decision this service made, the delivery row records
+  # the reason, and the endpoint answers 200, because a processor that retries a
+  # stale delivery reaches the identical conclusion.
   class Lifecycle
+    # The reason a delivery is refused for arriving out of order. One word, like
+    # the rest of them, because it is recorded on `processor_webhooks.error` where
+    # the next reader is a human with a subscription id and nothing else.
+    STALE_REASON = "stale_delivery".freeze
+
     # The three processor types this lifecycle acts on, and the cafaye event each
     # of them can become. The same three the outbox and the manifest declare, so a
     # type cannot be emitted that core's catalog does not list.
@@ -104,12 +125,34 @@ module Subscriptions
       # arrives.
       raise Refused, "no_subscription_to_update" if subscription.nil? && type == UPDATED
 
+      # Then the one rule about arrival order rather than about status. Every pair
+      # the machine allows is a pair the processor may deliver in either order, and
+      # applying the older one last would move the row backwards.
+      raise Refused, STALE_REASON if stale?(subscription)
+
       from = subscription&.status
       apply(subscription, from, transition)
     end
 
     private
       attr_reader :data, :event_time
+
+      # Whether this delivery predates the one that last wrote the row.
+      #
+      # **Strictly older**, not "not newer". The processor's timestamps are epoch
+      # seconds, so two genuinely different events routinely share one, and
+      # refusing those would drop real deliveries. With no ordering information
+      # between them the honest answer is last-write-wins, and `no_change_to_record`
+      # already absorbs the repeats that would otherwise double-apply.
+      #
+      # A row with no `last_processor_event_at` is a row no delivery has written
+      # yet, so it has nothing to be stale against. That is the case the deletion
+      # arriving before its own creation depends on.
+      def stale?(subscription)
+        return false if subscription.nil? || subscription.last_processor_event_at.nil?
+
+        event_time < subscription.last_processor_event_at
+      end
 
       def processor_subscription_id
         data["subscription_id"]
