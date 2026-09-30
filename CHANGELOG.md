@@ -6,7 +6,118 @@ All notable changes to billing are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Tenant isolation, enumerated and held: 14 account-scoped routes and 33
+  account-scoped data accesses, with 31 negative tests over them.**
+  `test/tenant/` is four new files and one new support module, `+62 runs /
+  +230 assertions`, and it changes **nothing in `app/`**. The service has no
+  tenant-isolation defect introduced by this packet because it introduces no
+  behaviour at all; what it does is make the shape of the gap total, measured,
+  and asserted, so that the day account scoping lands there is a list to work
+  through rather than a hole to discover.
+
+  **The enumeration is derived, not maintained.** `test/tenant/account_entry_point_matrix_test.rb`
+  scans `app/` for every data access, resolves each to the method it sits in, and
+  compares the result against its table in **both directions**: a query nobody
+  classified fails by name, and a classified entry point whose method has gone
+  away fails the other way. The numbers are the packet's headline and each is
+  asserted —
+
+  | | |
+  |---|---|
+  | **Account-scoped routes** | **14** — read 4, list 3, write 3, update 4, delete 0 |
+  | **Account-scoped data accesses** | **33** in 31 methods, under 32 keys — read 12, list 9, write 7, update 5, delete 0 |
+  | **Tests added under `test/tenant/`** | **62** — 31 negative, 20 structural tripwires, 11 bookkeeping |
+  | **Negative tests, by operation** | **31** — read 15, list 4, write 3, update 8, delete 1 |
+  | **`403` responses found on an invisible resource** | **0** |
+  | **`403` responses added** | **0** |
+  | **Cross-tenant defects found and reported, not fixed** | **3** |
+
+  The 62 is the whole directory and the 31 is the cross-account part of it; the
+  rest is 20 structural tripwires about the enumeration and 11 tests about the
+  test files themselves (`meta:`), and each of those three numbers is asserted by
+  the file it belongs to. Note the two 31s are a coincidence and mean different
+  things — one counts access sites in `app/`, the other counts negative tests.
+
+  **Delete is zero, and that is a fact rather than a gap in the table.** Nothing
+  in `app/` destroys a row and the router serves no `DELETE` under `/v1`, so there
+  is no delete to scope — the shape darkroom-09 called "scopes its reads and
+  forgets its deletes" is *not* this one. Both halves are asserted: adding a
+  `destroy` fails two tests, and adding a `DELETE` route fails a third.
+
+  **`403` could not be an enumeration oracle here, and that is now structural
+  rather than a promise.** `Problem::CATALOG` is a frozen table and no entry in it
+  has the status 403, so this service has no way to emit one; a controller that
+  named one anyway would be caught by a second assertion that reads `app/`. The
+  brief's rule — absence, never refusal — is enforced in both directions and both
+  are proven by mutation.
+
+  **The 404 shape was already right, and is now pinned.** A resource that does not
+  exist and an identifier that *cannot* name one are the same answer, byte for
+  byte: `V1::BaseController#uuid_param!` decides before the query, and
+  `render_not_found` renders one fixed sentence. The three uuid-addressed
+  resources each assert it, plus the plan slug path. `instance` echoes the
+  caller's own request path, which discloses nothing the caller did not send; the
+  assertion is on the whole key set precisely so a second, more specific `detail`
+  — the shape of a real oracle — fails here.
+
+  **Three cross-tenant defects, reported rather than fixed, because each is a
+  change to money and none can be discharged inside this packet.** They are
+  asserted as findings in `test/tenant/cross_account_findings_test.rb`, so each is
+  a tripwire that fires **when it is fixed**:
+
+  - **F1 — a delivery reassigns a live subscription between accounts.**
+    `Subscriptions::Lifecycle#apply` writes `account_id: customer.owner_id` onto
+    the row it is updating and never compares it to the account already there, so
+    a second delivery resolving a different customer moves a live subscription
+    from one account to another and publishes the move as
+    `billing.subscription.updated`. The existing guard,
+    `Subscription#account_is_the_customers_owner`, still passes: the new account
+    does belong to the new customer. What it cannot see is that the account
+    *changed*.
+  - **F2 — `customers.processor_customer_id` is not unique, and the API lets a
+    caller set it.** `POST`/`PATCH /v1/customers` both permit the column on a
+    client's *own* row, and `Lifecycle#customer` resolves it with `find_by`, so
+    two accounts can answer to one `cus_` id and the lookup has no `ORDER BY` to
+    break the tie. This is what makes F1 reachable through this service's own
+    surface rather than only through a processor dashboard.
+  - **F3 — `plans.processor_price_id` is not unique**, the same shape one table
+    over, so a subscription is billed against whichever plan claimed the price id.
+
+  All three are counted and named in the findings file and written up in
+  `REPORT-billing-12-isolation.md` with the fix each one needs.
+
+  **Fifteen mutations, every one of which turns a test red**, reported in the
+  report rather than claimed. The set includes the three fixes: landing F1's guard,
+  F2's uniqueness rule or F3's turns the corresponding finding red with a message
+  saying to delete it and replace it. That direction is the one that matters — a
+  finding test that survives its own fix is a test nobody will trust the next
+  time.
+
+  `test/support/two_accounts.rb` holds the two accounts every spec compares
+  against, with `cus_FAKE…` / `sub_FAKE…` / `price_FAKE…` / `evt_FAKE…` ids so a
+  fixture cannot be mistaken for a captured production value. Its
+  `#fingerprint` exists because the cross-account specs must be able to say "this
+  row did not change" **without printing the row**: a `sha256` per row answers
+  that, and `drifted_ids` then names which ids moved rather than what they held.
+
+  No change to `bin/prime`, `docker-compose.yml` or any other gate input.
+
 ### Changed
+
+- **CI's asserted suite size is raised to 913 runs / 2598 assertions.** Adding a
+  test turns the `gate` job red until `BASELINE_RUNS`/`BASELINE_ASSERTIONS` are
+  raised in the same commit, which is the intended direction; the header's
+  per-packet itemisation gains the `+62 / +230` line for this packet. Two
+  pre-existing drifts in that header are **noted, not corrected** — the three
+  per-packet deltas sum to 147 rather than 150, and billing-08's claimed 45/99
+  does not match its own bullets — because correcting a threshold and correcting
+  the prose about it are separate jobs and this one raised. The one exception is
+  the webhook tier's step name, which said 147 while the assertion directly below
+  it (and `bin/rails test` on those five files) says 162; the assertion is right
+  and the name was corrected, because a step name that reads like a measurement
+  and is not one is worse than a wrong one.
 
 - **One postgres image across the platform: `postgres:17` → `postgres:17-alpine`.**
   `docker-compose.yml` and the `gate` job's `services:` block both named
