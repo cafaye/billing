@@ -49,6 +49,65 @@ All notable changes to billing are recorded here. The format follows
   manifest is one stale comment in `Subscriptions::Lifecycle#payload`, which
   described core's pre-core-03 payload schema.
 
+- **The HTTP document and the router are now held to each other by method *and*
+  path, in both directions.** `test/contract/http_surface_contract_test.rb`
+  replaces a path-only comparison that could not see a verb. It reads the
+  document, the manifest and the route set — nothing from `core` — so it runs on a
+  checkout that has no `core` beside it, which the spec it replaced did not
+  (that one sits behind a `setup` that skips).
+
+  * Every `(method, path)` in `openapi/v1.yaml` is served, and every
+    `(method, path)` the router serves is either in the document or named on an
+    exclusion list with the reason it is not a client operation. A route that is
+    neither fails, so the list cannot grow an endpoint nobody argued about; an
+    exclusion for a route that has gone away fails the other way, so a stale one
+    cannot quietly cover whatever is added at that path next.
+  * The exclusions are keyed by method **and** path and replace a
+    `start_with?("/v1")` filter, which excluded the probes, the `exceptions_app`
+    targets and every Rails engine route *incidentally* and could not see a verb
+    on a `/v1` path.
+  * Every operation is required to have an `operationId` and no `operationId`
+    may be used twice, and the fifteen are pinned — a generator turns these into
+    method names, so a duplicate or a rename is a compile error in a customer's
+    language.
+  * A route drawn `via: :all` has no verb constraint at all, so it is excluded
+    under each of the seven methods rather than under a verb that is not a
+    method, and a test reads that back out of the router.
+
+  The `info.version` pin and the `exposes.api` manifest check moved to the same
+  file, because they read the document rather than core. Both are unchanged: the
+  version is still a pin and not a value derived from the document. The document
+  is now read with `safe_load_file`, as the manifest beside it already was.
+
+- **`info.description` now describes the document that exists.** It said the
+  document "describes the v0 surface" while `info.version` read 1.1.0, and it
+  promised prepaid credit, usage metering and invoices, which are not built. It
+  describes the operations that are here and names what is deliberately not —
+  the probes, the `exceptions_app` targets, the Rails engine routes, the
+  features still to come — so *absent* and *forgotten* read differently. The
+  header gains note 5, which states the rule above.
+
+  `info.version` moves 1.1.0 → **1.2.0** for this: no operation moved, so the
+  `/v1` prefix is untouched, and core's checklist asks for the bump if anything
+  else in the document did — prose included.
+
+### Fixed
+
+- **`PUT /v1/customers/{id}` was served and was in no document.** The check that
+  compared the document with the router read **paths only** and filtered the
+  router with `start_with?("/v1")`, so `resources`' two verbs for one `update`
+  were one path on each side and it reported agreement.
+
+  The route is removed rather than documented. `V1::CustomersController#update`
+  is a partial update — `CustomerUpdate` has every field optional and is closed,
+  and `owner`/`processor` are not updatable because they are the key the
+  uniqueness rule is built on — so a `PUT` describing it would be a document
+  claiming a whole-resource replacement this service does not implement.
+  `config/routes.rb` now spells the customer routes out, as it already did for
+  plans and subscriptions. This is a narrowing of the served surface and nothing
+  in `openapi/v1.yaml` declared it, so no operation changed and the `/v1` prefix
+  is untouched.
+
 ### Known issues
 
 - **The three `billing.subscription.*` payloads are published in a shape core's

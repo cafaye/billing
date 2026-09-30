@@ -145,6 +145,13 @@ The plans asymmetry is deliberate: a slug can be changed by the very request
 being made, and a mutable handle is not a safe thing to address a mutation by.
 Each endpoint answers 404 for the other's identifier.
 
+**The table is the whole surface, and a test says so.** `PUT /v1/customers/:id`
+is not in it and is not served: an update here is a partial update — every field
+optional, `owner` and `processor` not updatable at all — so there is no
+whole-resource replacement behind a `PUT` to describe. `test/contract/http_surface_contract_test.rb`
+compares the document and `config/routes.rb` as sets of `(method, path)` in both
+directions, so an operation in one and not the other fails by name.
+
 **None of the subscription endpoints decides a subscription's state.** `POST
 /v1/subscriptions` writes nothing — a subscription does not exist until the
 payment completes, and a row for one that does not would be a sixth status
@@ -471,6 +478,17 @@ the patterns this service validates with accept exactly the strings core's do,
 and checks that `cafaye.yml` and the code agree about which events exist. It
 skips, loudly, when `core` is not on disk; set `CORE_PATH` to point it elsewhere.
 
+Beside it, `test/contract/http_surface_contract_test.rb` checks the *other* half
+of the contract, and reads nothing but this repository: it compares
+`openapi/v1.yaml` and `config/routes.rb` as sets of `(method, path)`, in both
+directions, so a client generated from the document cannot call an operation the
+service does not serve and the service does not serve one the document does not
+declare. Every route that is deliberately not a client operation — the probes,
+the `exceptions_app` targets, the ActionCable mount, the routes Rails engines
+contribute — is named in that test with the reason it is not one, and a route
+that is neither declared nor named fails. It holds the fifteen `operationId`s a
+generator turns into method names, and it runs with or without `core` beside it.
+
 ## Layout
 
 ```
@@ -490,7 +508,7 @@ app/services/processor/              the three requests this service makes
 app/lib/problem.rb                   the one error shape
 app/lib/money_params.rb              the only place a request becomes an amount
 openapi/v1.yaml                      the HTTP contract
-test/contract/                       the checks against core
+test/contract/                       the checks against core, and the HTTP one
 cafaye.yml                           the manifest
 ```
 
