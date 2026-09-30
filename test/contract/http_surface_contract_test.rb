@@ -44,28 +44,31 @@ class HttpSurfaceContractTest < ActiveSupport::TestCase
 
   HEALTH_PROBE = "Infrastructure, not contract surface: not in `cafaye.yml`'s " \
     "`exposes`, no query parameters, no auth, and an uptime monitor is the only " \
-    "reader (config/routes.rb:2-4, AGENTS.md \"Contracts\")."
+    "reader. `config/routes.rb` says so beside the declaration."
 
-  RAILS_HEALTH = "Rails' built-in health route (config/routes.rb:10), kept by the " \
-    "framework rather than drawn by hand, and infrastructure for the same reason."
+  RAILS_HEALTH = "Rails' built-in health route, kept by the framework rather than " \
+    "drawn by hand in `config/routes.rb`, and infrastructure for the same reason."
 
-  EXCEPTION_PAGE = "`config.exceptions_app` targets (config/routes.rb:58-61). Not a " \
-    "client operation: this is where the app **lands** when Rails raised rather " \
-    "than one a controller rendered, so a 404 on an unknown path and a 500 on an " \
-    "unhandled bug are problem+json too. Drawn `via: :all`, so every method."
+  EXCEPTION_PAGE = "`config.exceptions_app` targets, declared at the bottom of " \
+    "`config/routes.rb`. Not a client operation: this is where the app **lands** " \
+    "when Rails raised rather than one a controller rendered, so a 404 on an " \
+    "unknown path and a 500 on an unhandled bug are problem+json too. Drawn " \
+    "`via: :all`, so every method."
 
   ACTION_CABLE = "ActionCable's mount, drawn by the railtie rather than by " \
     "`config/routes.rb`. A WebSocket endpoint, not an HTTP operation."
 
-  ENGINE_ROUTES = "Drawn by a Rails engine that is installed in this bundle, not by " \
-    "`config/routes.rb`. billing has no ActionMailbox ingress and attaches no " \
-    "Active Storage blob, so none of these is a cafaye operation and none is " \
-    "described here. They are listed rather than filtered by prefix because a " \
-    "route that appears without somebody adding it and writing down why is the " \
-    "failure this file exists to catch."
+  ENGINE_ROUTES = "Drawn by a Rails engine that is loaded into the bundle, not by " \
+    "`config/routes.rb`. This service has no ActionMailbox and no Active Storage " \
+    "table in `db/schema.rb` and uses neither, so none of these is a cafaye " \
+    "operation and none is described here. They are listed rather than filtered by " \
+    "prefix because a route that appears without somebody adding it and writing " \
+    "down why is the failure this file exists to catch."
 
   # Every `(method, path)` the router serves that is not a client operation, with
-  # the reason it is not one. Three groups, three different reasons.
+  # the reason it is not one: the two probes and Rails' own health route, the four
+  # `exceptions_app` targets, the ActionCable mount, and the routes Rails engines
+  # contribute.
   #
   # There is no prefix filter and no "anything under /v1 is contract surface"
   # shortcut, because a prefix cannot see a method: `start_with?("/v1")` is what
