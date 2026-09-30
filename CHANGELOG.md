@@ -24,22 +24,40 @@ All notable changes to billing are recorded here. The format follows
 
   | `CORE_PATH` | result |
   |---|---|
-  | `../core` (a developer with the repositories side by side) | 22 runs, 345 assertions, 0 skips |
-  | a path that does not exist (every CI checkout) | 22 runs, 0 assertions, **22 skips** |
+  | `CORE_PATH` set to a core checkout | 19 runs, 339 assertions, 0 skips |
+  | `CORE_PATH` pointing at nothing | 19 runs, 0 assertions, **19 skips** |
 
   and the whole-suite summary line reads the same in both cases. So CI checks
   `cafaye/core` out of the repository itself — public, `schemas` and `docs`
   only, at `master` rather than a pinned SHA, because a pinned ref would blind
   the one guard that exists to catch a change in core — and **fails the build on
-  a single skipped test**. A suite that reports `0 assertions; 22 skipped` has
+  a single skipped test**. A suite that reports `0 assertions; 19 skipped` has
   verified nothing, and a green badge is a claim.
 
+  A **second** test read core and did not say so.
+  `test/integration/subscription_delivery_test.rb` asserted against
+  `Rails.root.join("..", "core")` with no seam at all, so it passed on a
+  developer machine with the repositories side by side and raised
+  `Errno::ENOENT` on a CI runner, which has one checkout and no sibling — the
+  gate would have been red on its first run. It reads `CORE_PATH` now, and
+  `gate` sets that variable on the job rather than on one step.
+
   The gate also pins the suite by **equality** against master's
-  `759 runs / 2087 assertions / 0 failures / 0 errors / 0 skips`, and asserts
-  three tiers by name and count — the contract tier (22), the webhook tier (138)
-  and the money-path coverage gate (5). These are decrease detectors, not
-  targets: adding a test turns CI red until the number is raised in the same
+  `763 runs / 2100 assertions / 0 failures / 0 errors / 0 skips` at `e63bb7a`,
+  and asserts three tiers by name and count — the whole `test/contract`
+  directory (26), the webhook tier (138) and the money-path coverage gate (5).
+  The contract tier is named as a directory, not as a file list, because
+  billing-07 moved three of its tests into `http_surface_contract_test.rb` and a
+  file list read that relocation as a deletion. These are decrease detectors,
+  not targets: adding a test turns CI red until the number is raised in the same
   commit, which is the intended direction.
+
+  The `ruby (kit)` job fails on two steps — kit's `ruby` job declares no
+  service container, so `bundle exec rake` cannot reach a database, and it runs
+  `rake coverage`, which this service deliberately does not have — and
+  `continue-on-error` absorbs them. `gate`, `security` and `pins` are the
+  required checks; the condition for retiring `continue-on-error` is written
+  into the workflow.
 
   **No behaviour in `app/` changed.**
 

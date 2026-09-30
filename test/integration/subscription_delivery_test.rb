@@ -166,8 +166,36 @@ class SubscriptionDeliveryTest < ActiveSupport::TestCase
     assert_empty COURIER_LISTENS_FOR - OutboxEvent::TYPES
   end
 
+  # The second environment-gated tier in this repository, and it was the worse
+  # of the two because it did not say so.
+  #
+  # `core`'s catalog is read from a path derived from the checkout's own
+  # directory, so this test passed on a developer machine that has the cafaye
+  # repositories side by side and **errored on a CI runner**, which has one
+  # checkout and no sibling:
+  #
+  #   Errno::ENOENT: No such file or directory @ rb_sysopen -
+  #     <parent-of-checkout>/core/docs/event-naming.md
+  #
+  # The hardcoded path was the defect, not the failure. `outbox_envelope_
+  # contract_test.rb` has read core through `CORE_PATH` since billing-02 and
+  # falls back to the sibling directory for exactly this reason, so the seam
+  # already existed and this file simply was not using it — which is how a
+  # repository ends up with one core-reading tier that CI can run and another
+  # that CI can only crash on.
+  #
+  # The skip is deliberate and narrow, and it is the shape PLAN §1 asks for: the
+  # condition is stated in the test rather than implied by a missing file, and
+  # CI sets `CORE_PATH` and **fails the build on any skipped test at all**, so
+  # this line cannot be reached green in CI.
   test "both events courier needs have a row in core's catalog" do
-    catalog = File.read(Rails.root.join("..", "core", "docs", "event-naming.md"))
+    core_catalog = ENV["CORE_PATH"].presence&.then { |p| File.join(p, "docs", "event-naming.md") } ||
+      Rails.root.join("..", "core", "docs", "event-naming.md")
+    catalog = begin
+      File.read(core_catalog)
+    rescue Errno::ENOENT, Errno::ENOTDIR
+      skip("core is not on disk at #{core_catalog}; set CORE_PATH to a core checkout")
+    end
     billing_section = catalog[/^### billing.*?(?=^### |\z)/m].to_s
 
     COURIER_LISTENS_FOR.each do |event_type|
