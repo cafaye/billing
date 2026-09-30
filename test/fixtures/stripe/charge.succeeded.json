@@ -1,0 +1,42 @@
+{
+  "id": "evt_1PZQaBcDeFgHiJkLmNoPqR9",
+  "object": "event",
+  "api_version": "2024-06-20",
+  "created": 1791345700,
+  "livemode": false,
+  "pending_webhooks": 1,
+  "request": {
+    "id": null,
+    "idempotency_key": null
+  },
+  "type": "charge.succeeded",
+  "data": {
+    "object": {
+      "id": "ch_3PZQaBcDeFgHiJkLmNoPqR6",
+      "object": "charge",
+      "amount": 8700,
+      "amount_captured": 8700,
+      "amount_refunded": 0,
+      "balance_transaction": "txn_1PZQaBcDeFgHiJkLmNoPqRe",
+      "billing_details": {
+        "address": null,
+        "email": "kaka@example.com",
+        "name": "Kaka Ruto"
+      },
+      "captured": true,
+      "created": 1791345700,
+      "currency": "usd",
+      "customer": "cus_R1pQKz9xLp2mN4vB6yH8jL0",
+      "description": null,
+      "invoice": "in_1PZQaBcDeFgHiJkLmNoPqR3",
+      "livemode": false,
+      "metadata": {},
+      "paid": true,
+      "payment_intent": "pi_3PZQaBcDeFgHiJkLmNoPqR4",
+      "payment_method": "pm_1PZQaBcDeFgHiJkLmNoPqR9",
+      "receipt_url": "https://pay.stripe.com/receipts/acct_123/rcpt_1",
+      "refunded": false,
+      "status": "succeeded"
+    }
+  }
+}

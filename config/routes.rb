@@ -24,6 +24,21 @@ Rails.application.routes.draw do
     patch "plans/:id", to: "plans#update"
   end
 
+  # Processor webhooks. Each processor gets its own path, its own signature
+  # scheme and its own controller: a shared endpoint would need a dispatcher that
+  # branches on the path anyway, and one processor's parsing bug would end up
+  # sitting next to another's verification code.
+  #
+  # Declared outside the `scope "/v1", module: :v1` above on purpose. The version
+  # prefix is the same, but the controller is not part of the `V1` module and does
+  # not share its base: the `/v1` API is a cafaye client surface and this is a
+  # processor surface, authenticated by signature rather than by token, and the two
+  # must not grow a shared superclass that assumes both.
+  #
+  # It is declared in `openapi/v1.yaml`, which the manifest's `exposes.api`
+  # points at.
+  post "v1/webhooks/stripe", to: "webhooks/stripe#create", as: :stripe_webhook
+
   # Where `config.exceptions_app = routes` sends a response Rails raised rather
   # than one a controller rendered, so a 404 on an unknown path and a 500 on an
   # unhandled bug are problem+json too.

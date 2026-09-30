@@ -17,11 +17,26 @@ class OutboxEvent < ApplicationRecord
 
   # The types this service publishes. Closed on purpose: `test/contract` asserts
   # this list and `cafaye.yml`'s `exposes.events` are the same list, so the
-  # manifest cannot advertise an event nothing emits.
+  # manifest cannot advertise an event nothing emits — and, in the other
+  # direction, a type that is not on this list cannot be written at all. That
+  # second half is what stops a webhook mapping from parking every delivery as a
+  # failure: a type that fell off the end of this list is refused at the write,
+  # from inside a processor request, and answered 200.
+  #
+  # Three come from model callbacks and five from the Stripe webhook mapping
+  # (`Webhooks::StripeEvents::EVENT_TYPES` and the Checkout session, which
+  # becomes `billing.payment.succeeded`). `test/contract` asserts the two sets are
+  # the same, so a mapping added without a row here fails rather than failing in
+  # production.
   TYPES = %w[
     billing.customer.created
+    billing.payment.failed
+    billing.payment.succeeded
     billing.plan.created
     billing.plan.updated
+    billing.subscription.canceled
+    billing.subscription.started
+    billing.subscription.updated
   ].freeze
 
   # core's event-envelope.schema.json, `eventType` pattern, as of spec v0.2:
@@ -59,12 +74,19 @@ class OutboxEvent < ApplicationRecord
   #
   # The keyword is `type` because that is what the envelope calls it; the column
   # is `event_type` because `type` is reserved by Active Record.
-  def self.publish!(type:, subject:, data:)
+  #
+  # `time` is when the state change happened, and it is a keyword rather than
+  # always-`Time.current` because not every state change is made by this process.
+  # A webhook's event describes something Stripe did seconds or days ago, and
+  # stamping it with the moment the row was written would make an out-of-order
+  # delivery undetectable: every event would appear to have happened in the order
+  # it arrived. The default keeps the model-callback path exactly as it was.
+  def self.publish!(type:, subject:, data:, time: Time.current)
     create!(
       event_type: type,
       source: SERVICE,
       subject: subject,
-      time: Time.current,
+      time: time,
       data: data
     )
   end

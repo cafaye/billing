@@ -5,10 +5,13 @@ prepaid credit, usage metering, and webhooks coming in from a payment processor.
 Every other cafaye service that charges someone — `parlor` at checkout, `muse`
 when it meters a completion — accounts through this one.
 
-**v0 is customers and plans.** The schema, the models, the `/v1` API and the
-transactional outbox exist and are tested. There is no Stripe call anywhere in
-this repository yet: `processor`, `processor_product_id` and
-`processor_price_id` are stored and returned, and all three are null in practice.
+**v0 is customers, plans and the Stripe webhook.** The schema, the models, the
+`/v1` API and the transactional outbox exist and are tested, and a processor's
+signed event can be received, stored once, and turned into one of this service's
+own events. There is still no outbound Stripe call anywhere in this repository:
+`processor`, `processor_product_id` and `processor_price_id` are stored and
+returned, and all three are null in practice. This service receives from Stripe;
+it does not talk to it.
 
 ```sh
 $ curl -s localhost:3000/healthz
@@ -128,21 +131,28 @@ rather than a `422`: the request was well-formed, it just collides.
 
 ## Events
 
-Three events, all three-segment and prefixed with this service's own name, as
-core v0.2 requires:
+Eight events, all three-segment and prefixed with this service's own name, as
+core v0.2 requires. Three come from the models, five from the Stripe webhook:
 
 | Type | Subject | When |
 | --- | --- | --- |
 | `billing.customer.created` | the customer | a customer is created |
 | `billing.plan.created` | the plan | a plan becomes billable |
 | `billing.plan.updated` | the plan | a plan changes |
+| `billing.subscription.started` | the subscription | Stripe says a subscription became active |
+| `billing.subscription.updated` | the subscription | plan, quantity or interval changed |
+| `billing.subscription.canceled` | the subscription | a cancellation took effect |
+| `billing.payment.succeeded` | the payment | a charge settled |
+| `billing.payment.failed` | the payment | a charge was declined or errored |
 
 They are written to `outbox_events` **in the same transaction** as the change
-they describe, from `after_create`/`after_update` rather than
-`after_commit` — a separate transaction is a window in which the database says
-the plan exists and the event does not. A rollback takes the event with it. The
-column list is core's contract (`core: docs/event-outbox.md`); `id` is the
-envelope's `id`, generated before the insert so a republish is the same id.
+they describe — from `after_create`/`after_update` for the three model events,
+and for the five webhook events in the same transaction that marks the delivery
+finished. Never `after_commit`, and never a background job: a separate
+transaction is a window in which the database says the thing happened and the
+event does not. A rollback takes the event with it. The column list is core's
+contract (`core: docs/event-outbox.md`); `id` is the envelope's `id`, generated
+before the insert so a republish is the same id.
 
 `billing.plan.updated` is emitted only when a field actually changed. A `PATCH`
 that sets a field to the value it already holds is not a state change, and an
@@ -153,6 +163,68 @@ There is deliberately no `billing.customer.updated`: core's catalog has no row
 for it, and a service that publishes a type the catalog does not list is a
 service whose manifest is lying. The API can still change a customer's email
 and nothing downstream is told. That gap belongs to whoever owns the catalog.
+
+## Webhooks in
+
+`POST /v1/webhooks/stripe` receives Stripe's events. It makes no Stripe API call
+— this service only ever receives.
+
+**The signature is checked against the raw bytes.** `Stripe::Webhook.construct_event`
+over `request.raw_post`, never over a re-serialized parse. A body that does not
+verify is refused with a 400 and **stored nowhere**: an unverified payload is not
+an event, and writing one would put an attacker's JSON in the row a human reads
+when something is wrong.
+
+**A replay is a non-event.** Delivery is at-least-once, so the same event id will
+arrive again — immediately, or a day later. `processor_webhooks.stripe_event_id`
+is `UNIQUE`, and that index is the correctness mechanism rather than a query aid:
+two concurrent deliveries of one event produce one row, one `processed_at`, and
+one `billing.payment.succeeded`. The outbox row and the marking are a single
+commit, so a process that died between them cannot leave an event published with
+a row that still looks unfinished.
+
+**The processor's own timestamp is the event's `time`**, not the moment this
+service received it. That is what makes an out-of-order delivery detectable: two
+events stamped on arrival would appear to have happened in the order they
+arrived.
+
+```json
+{ "id": "evt_1PZQaBcDeFgHiJkLmNoPqR4", "type": "invoice.paid", "data": { "object": { "amount_paid": 8700, "currency": "usd" } } }
+```
+
+```json
+{ "type": "billing.payment.succeeded", "subject": "sub_1PZQaBcDeFgHiJkLmNoPqR1",
+  "data": { "kind": "payment", "amount": { "amount_minor": 8700, "currency": "USD" },
+            "processor": "stripe", "processor_event_id": "evt_1PZQaBcDeFgHiJkLmNoPqR4" } }
+```
+
+The processor's shape stops at the normalizer. Everything downstream is
+snake_case with integer minor units, and nothing that has not been sent is
+defaulted — a webhook payload is the weakest input in the system, and a default
+that silently fills a gap is how a customer ends up on a plan nobody charged
+them for.
+
+**Every terminal outcome is a 200.** A replay, an event type this build has no
+mapping for, a type it deliberately ignores (`ping`; a subscription-mode
+Checkout session, which restates `customer.subscription.created`), and an event
+whose mapping raised are all recorded and all answered 200. A 5xx would teach
+Stripe to retry a decision this service has already made and would hide a parked
+row behind a timeout. `processor_webhooks.error` is the record:
+
+| `error` | Meaning |
+| --- | --- |
+| `NULL` | the event became an event |
+| `ignored:<reason>` | understood, deliberately not acted on |
+| `failed:<class>: <message>` | parked for a human |
+
+A 503 rather than a 400 is the answer when no signing secret is configured: that
+is this service's misconfiguration, and telling Stripe its signature was bad
+would send an operator looking in the wrong place. The cause is logged; the body
+says only `unavailable`.
+
+Nothing here is token-authenticated, and nothing here may become so — the sender
+is a processor, not a cafaye client. A `Bearer` on this path would be a second,
+weaker trust path to the same door.
 
 ## Known gaps
 
@@ -183,6 +255,24 @@ to make, not an oversight.
 - **The unique-index race is handled but untested.** A `RecordNotUnique` that
   slips past the validations is a `409`, which is right; proving it needs two
   concurrent writers, so no spec covers that line.
+- **A webhook event's `subject` is the processor's own id.** There is no
+  subscriptions table yet, so a subscription or payment event carries Stripe's
+  subscription id when the payload has one and Stripe's customer id otherwise. A
+  consumer cannot join these to a cafaye account without that mapping, and a
+  subscriptions packet will change the subject — a semantic change to every
+  event already published. Recorded as a DECISION in `cafaye.yml`; it is one line
+  in `Webhooks::StripeEvents.subject_for`.
+- **`billing.subscription.started` does not match core's payload schema**, and
+  cannot until this service holds the ids that schema describes. Core's
+  `schemas/events/billing/subscription/started.schema.json` requires `plan_id`
+  and `account_id` as `pln_…` and `acc_…` values, and is closed over eight
+  fields. There is no subscriptions table, and `Plan#id` is a uuid. The event is
+  published anyway — the catalog row exists, the envelope is core-shaped, and a
+  payload a consumer cannot yet read is a gap in core rather than a reason to
+  stop publishing. The exact difference is asserted as a set in
+  `test/contract/outbox_envelope_contract_test.rb`, so the day the payload
+  changes this file has to change with it. Closing it is a core-side decision
+  plus a subscriptions table.
 
 ## Health
 
@@ -244,17 +334,34 @@ skips, loudly, when `core` is not on disk; set `CORE_PATH` to point it elsewhere
 
 ```
 app/controllers/v1/                 customers and plans
+app/controllers/webhooks/           inbound from a processor: raw body, signature
 app/controllers/concerns/            trace id, problem+json, cursor paging, idempotency
 app/controllers/errors_controller.rb what Rails raises into
 app/models/customer.rb               owner_type + owner_id, one per processor
 app/models/plan.rb                   price is a Money or it is not a price
+app/models/processor_webhook.rb      what a processor sent, stored once
 app/models/outbox_event.rb           the event, and the envelope it becomes
+app/services/webhooks/               store once, normalize, emit — in that order
 app/lib/problem.rb                   the one error shape
 app/lib/money_params.rb              the only place a request becomes an amount
 openapi/v1.yaml                      the HTTP contract
 test/contract/                       the checks against core
 cafaye.yml                           the manifest
 ```
+
+## Running it
+
+Two environment variables are needed for the webhook to answer at all:
+
+| Variable | Meaning |
+| --- | --- |
+| `STRIPE_WEBHOOK_SECRET` | the endpoint's signing secret. Unset, every request is a 503 `unavailable` rather than a 400, because that is this service's misconfiguration and not the sender's. |
+| `STRIPE_WEBHOOK_SECRETS` | a comma-separated list, for a rotation. A signature that verifies under any configured secret is accepted. |
+| `STRIPE_WEBHOOK_TOLERANCE` | seconds, default 300. The window in which a captured request stays replayable. |
+
+Nothing is stubbed in the specs: the suite signs committed fixture bytes with a
+constant that is a credential for nothing and exercises the real verification
+path, so there is no network in `bin/rails test`.
 
 ## Conventions
 

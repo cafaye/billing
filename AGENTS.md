@@ -38,10 +38,17 @@ Two packets, in order.
   API over them, and a transactional outbox that writes
   `billing.customer.created`, `billing.plan.created` and `billing.plan.updated`
   in the same transaction as the change they describe. No Stripe call.
+- **billing-03b** is the Stripe webhook: `POST /v1/webhooks/stripe`, signature
+  verification over the raw body, and `processor_webhooks` as the
+  at-most-once record of what arrived. It emits five more events —
+  `billing.subscription.started|updated|canceled` and
+  `billing.payment.succeeded|failed` — into **billing-02's** outbox. It still
+  makes no Stripe API call; it only receives.
 
-There are no subscriptions, invoices, payments, usage metering or webhooks yet.
-Do not read their absence as something to fix in a side patch; those are later
-packets with their own briefs.
+There are no subscriptions, invoices, payments or usage metering yet. Do not
+read their absence as something to fix in a side patch; those are later packets
+with their own briefs. The webhook is how those packets will learn that
+something happened — it is not the state, only the report of it.
 
 ## Layout
 
@@ -58,21 +65,26 @@ billing/
 │   │   ├── health_controller.rb       # /healthz, /readyz
 │   │   ├── errors_controller.rb       # what Rails raises into
 │   │   ├── concerns/                  # trace id, problem+json, paging, idempotency
-│   │   └── v1/                        # customers, plans
+│   │   ├── v1/                        # customers, plans
+│   │   └── webhooks/                  # signed inbound, from a processor not a client
 │   ├── lib/
 │   │   ├── problem.rb                 # the one error shape
 │   │   ├── money_params.rb            # the only place a request becomes an amount
 │   │   └── identifiers.rb             # the uuid shape, in one place
-│   └── models/
-│       ├── money.rb                   # the money primitive
-│       ├── customer.rb                # owner_type + owner_id, one per processor
-│       ├── plan.rb                    # price is a Money or it is not a price
-│       └── outbox_event.rb            # the event, and the envelope it becomes
+│   ├── models/
+│   │   ├── money.rb                   # the money primitive
+│   │   ├── customer.rb                # owner_type + owner_id, one per processor
+│   │   ├── plan.rb                    # price is a Money or it is not a price
+│   │   ├── processor_webhook.rb       # what a processor sent, stored once
+│   │   └── outbox_event.rb            # the event, and the envelope it becomes
+│   └── services/
+│       └── webhooks/                  # verify, store, normalize, emit — in that order
 ├── test/
 │   ├── contract/                      # the checks that read core
-│   ├── integration/health_test.rb
+│   ├── integration/                   # health, and the webhook's HTTP edge
 │   ├── models/                        # minitest, table-driven
-│   └── requests/v1/                   # the API specs
+│   ├── requests/v1/                   # the API specs
+│   └── services/webhooks/             # ingestion and the Stripe mapping
 └── .github/workflows/ci.yml           # brakeman, bundler-audit, rubocop, rails test
 ```
 
@@ -138,9 +150,52 @@ The rules are core's, in `core: docs/event-outbox.md` and
   no catalog row is a manifest that lies to whoever generates an SDK from it.
 - The outbox column list is core's, not local. If you change it, you are
   changing a contract.
+- **There is one outbox.** `app/models/outbox_event.rb` is it, for every
+  producer in this service. A webhook publishes through `OutboxEvent.publish!`
+  like a model callback does; a second table, a second envelope builder or a
+  second `to_envelope` is a second answer to a question a consumer asks once.
 - The publisher loop that moves rows to NATS **does not exist yet**. Until it
   does, `published_at` is always null, `attempts` always zero, and nothing
   consumes these events. Do not write a row and call it delivered.
+
+## Webhooks in
+
+A processor's event arrives signed, is stored verbatim, is acted on at most
+once, and leaves as one of this service's own events. The rules:
+
+- **The signature is over the raw bytes.** `request.raw_post`, never `params`
+  and never a re-serialized parse — the digest is computed over
+  `<timestamp>.<raw body>`, so a re-serialization produces a different digest
+  and rejects every real delivery. `Stripe::Webhook.construct_event` does the
+  verification; nothing here re-implements the scheme.
+- **An unverified body is stored nowhere.** It is not an event, and writing one
+  would put an attacker's JSON in the row a human reads when something is wrong.
+- **`stripe_event_id` is UNIQUE, and that index is the correctness mechanism**,
+  not a query aid. `ProcessorWebhook.ingest` turns the resulting conflict back
+  into a lookup, so two concurrent deliveries of one event produce one row.
+- **The outbox row and the `processed_at` that marks the delivery finished are
+  one commit.** If they were two, a process that died between them would leave a
+  row that looks unfinished with the event already published, and the next
+  delivery would emit a *second* `billing.payment.succeeded` with a second
+  envelope id for one charge. Do not move `handled!` out of the transaction.
+- **A replay, an unknown type, a deliberate ignore and a failed mapping are all
+  200.** Each is recorded and terminal, and a retry reaches the identical
+  outcome. A 5xx teaches a processor to retry a decision already made, and hides
+  a parked row behind a timeout. `processor_webhooks.error` is the record:
+  `ignored:<reason>` for a decision, `failed:<class>: <message>` for a row
+  parked for a human, NULL `processed_at` for the one state a crash leaves.
+- **A missing signing secret is a 503, not a 400.** It is our
+  misconfiguration and saying the signature was invalid sends an operator
+  looking in the wrong place. The cause is logged; the body says only
+  `unavailable`.
+- **Nothing here is token-authenticated, and nothing here may become so.** The
+  sender is a processor, not a cafaye client. A `Bearer` on this path would be a
+  second, weaker trust path to the same door.
+- The webhook is **not** the state. Nothing here writes a subscription or a
+  payment; it writes the receipt and the event. The tables for that are a later
+  packet, and until they exist `subject` is the processor's own id — recorded as
+  a DECISION in `cafaye.yml`, and changed by one line in
+  `Webhooks::StripeEvents.subject_for`.
 
 ## Testing
 
@@ -167,7 +222,14 @@ The rules are core's, in `core: docs/event-outbox.md` and
 - Raising a threshold is allowed. Lowering one, or adding an inline lint
   disable to make a build green, is not.
 - A gap that cannot be closed in this worktree is recorded in code, not skipped
-  quietly — see `PENDING_CORE_CATALOG_ROWS` in the contract spec.
+  quietly — see `PENDING_CORE_CATALOG_ROWS` and `PENDING_PAYLOAD_ALIGNMENT` in the
+  contract spec. Both are asserted **as sets**, not subtracted from the failures:
+  subtracting would let a payload that starts matching sit there forever.
+- A webhook spec posts **committed fixture bytes**, signed with a constant that
+  is a credential for nothing, and asserts against the real verification path. No
+  network, no stubbed verifier. The fixtures' `created` timestamps are what the
+  event-time assertions are derived from, so a fixture edited without its tests
+  failing is a fixture nobody looked at.
 
 ## Conventions
 
@@ -199,8 +261,17 @@ The rules are core's, in `core: docs/event-outbox.md` and
 - Migrations do not read model constants. Inline the literal, so the migration
   keeps meaning what it meant the day it ran.
 - A column named `type` is single-table inheritance on any Active Record model.
+  `processor_webhooks.type` is the processor's own type string, so the model sets
+  `self.inheritance_column = nil`. That line is load-bearing, not tidiness:
+  without it every `find` on the table tries to resolve
+  `customer.subscription.updated` to a class and raises.
 - Time is UTC, and stored `timestamptz` where the column is an instant. IDs are
   opaque strings. `db/schema.rb` is committed.
+- A webhook's event carries the **processor's** timestamp in `time`, not the
+  moment this service wrote the row. `OutboxEvent.publish!` takes `time:` for
+  exactly this; a model callback omits it and gets `Time.current`. An event
+  stamped on arrival makes out-of-order delivery undetectable, because every
+  event then appears to have happened in the order it arrived.
 
 ## Contracts
 
@@ -217,6 +288,23 @@ The rules are core's, in `core: docs/event-outbox.md` and
   JWKS verification is not in this repository yet, so `GET /v1/customers`
   returns every customer. This is a recorded gap, not a design: do not expose
   the surface to anything but the gateway, and do not build on it.
+- **`/v1/webhooks/stripe` is the one authenticated path, by signature.** It
+  authenticates the *processor*, not a cafaye client, and it is declared in
+  `openapi/v1.yaml` under the `webhooks` tag with its own `200`/`400`/`503`
+  responses. Its dedupe key is the processor's event id enforced by a unique
+  index, not an `Idempotency-Key` header, and it takes no query parameters. A
+  test asserts the manifest's `exposes.api` document declares the path that
+  `config/routes.rb` serves.
+- Every event type the webhook mapping can produce is in `OutboxEvent::TYPES`
+  and in `cafaye.yml`. A type that is not would be refused at the write, from
+  inside a processor request, and answered 200 — an outage visible only in the
+  processor's dashboard. `test/contract/` and the webhook specs both assert it.
+- **`billing.subscription.started` does not satisfy core's payload schema** for
+  this build, and the exact difference is in `PENDING_PAYLOAD_ALIGNMENT` in the
+  contract spec. Core's schema wants `pln_…` and `acc_…` ids this service does
+  not have. The event is published anyway — the catalog row exists and the
+  envelope is core-shaped — and the gap is a decision recorded in `cafaye.yml`
+  for the manager, not a silent skip.
 - Breaking a contract is a major version plus a migration note in `README.md`
   and `CHANGELOG.md`, reviewed by a human — not a patch.
 

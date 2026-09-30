@@ -17,15 +17,20 @@
 #    by the public handle, `PATCH /v1/plans/{id}` writes by uuid, because a slug
 #    can be changed by the very request being made and a mutable handle is not a
 #    safe thing to address a mutation by.
+# 3. `/v1/webhooks/stripe` is the one path that is not a cafaye client surface.
+#    Its sender is a processor and it authenticates by signature over the raw
+#    body, so it takes no `Idempotency-Key` (the processor's own event id is the
+#    dedupe key, and it is enforced by a unique index rather than by a header),
+#    and it must never grow a token check.
 openapi: 3.1.0
 info:
   title: billing
   version: 1.0.0
   description: >-
-    Plans, customers, subscriptions, prepaid credit and usage metering for
-    cafaye. This document describes the v0 surface: customers and plans.
-    The two health probes (/healthz, /readyz) are infrastructure and are
-    deliberately not here.
+    Plans, customers, subscriptions, prepaid credit, usage metering and inbound
+    payment-processor webhooks for cafaye. This document describes the v0
+    surface: customers, plans, and one Stripe webhook endpoint. The two health
+    probes (/healthz, /readyz) are infrastructure and are deliberately not here.
   contact:
     name: billing
     email: billing@cafaye.com
@@ -43,6 +48,10 @@ tags:
     description: Billing records of the users and accounts identity knows about.
   - name: plans
     description: What can be bought, at what price, on what cadence.
+  - name: webhooks
+    description: >-
+      Events coming in from a payment processor. Authenticated by signature
+      rather than by token, because the sender is not a cafaye client.
 
 paths:
   /v1/customers:
@@ -283,6 +292,67 @@ paths:
         '422':
           $ref: '#/components/responses/ValidationFailed'
 
+  /v1/webhooks/stripe:
+    post:
+      tags: [webhooks]
+      operationId: receiveStripeWebhook
+      summary: Receive one Stripe event
+      description: >-
+        Verifies the `Stripe-Signature` header against `STRIPE_WEBHOOK_SECRET` and
+        stores the event before interpreting it. `STRIPE_WEBHOOK_SECRETS`, a
+        comma-separated list, may be set instead during a secret rotation; a
+        signature that verifies under any configured secret is accepted.
+
+        The response says whether the request was *received*, not whether this
+        service found anything to do. Delivery is at-least-once, so the same event
+        id arrives again — immediately, or a day later — and a replay is a 200 and
+        a lookup rather than a second event. An event type this build has no
+        mapping for, a type it deliberately ignores, and an event whose mapping
+        failed are all 200 with the outcome recorded on the stored row. A 5xx
+        would teach Stripe to retry a decision this service has already made, and
+        would hide a parked row behind a timeout.
+
+        An unverified body is never stored. `stripe_event_id` is UNIQUE, so a
+        replay cannot produce a second row, and the row is written in the same
+        transaction as the event it produces, so a stored event and the receipt
+        saying it arrived cannot disagree.
+
+        This endpoint is not token-authenticated and must never grow a token
+        check: a `Bearer` here would be a second, weaker trust path to the same
+        door as the `/v1` API.
+      parameters:
+        - $ref: '#/components/parameters/StripeSignature'
+      requestBody:
+        required: true
+        description: >-
+          The Stripe event, unmodified. The body is hashed exactly as it arrives,
+          so it is never re-serialized before verification.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StripeEvent'
+      responses:
+        '200':
+          description: >-
+            The event was verified and is recorded. Whatever became of it —
+            emitted, deliberately ignored, or parked as failed — the processor has
+            nothing to retry.
+
+            There is no response body. The processor is told only that the event
+            was received; what this service did with it is a fact about billing's
+            own tables, and inventing a body here would be a response shape with
+            no contract behind it. What became of the event is queryable:
+            `processor_webhooks.error` carries `ignored:<reason>` or
+            `failed:<class>: <message>`, and a NULL `processed_at` is the only
+            state a crash can leave behind.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/TraceId'
+        '400':
+          $ref: '#/components/responses/SignatureRejected'
+        '503':
+          $ref: '#/components/responses/SigningUnconfigured'
+
 components:
   parameters:
     Limit:
@@ -351,6 +421,19 @@ components:
       schema:
         type: string
         format: uuid
+    StripeSignature:
+      name: Stripe-Signature
+      in: header
+      required: true
+      description: >-
+        Stripe's signature over the exact request bytes, in the form
+        `t=<unix seconds>,v1=<hex hmac-sha256>`. The HMAC is computed over
+        `<timestamp>.<raw body>` keyed with the endpoint's signing secret. More
+        than one `v1` may be present, which is how a rotation is absorbed.
+      schema:
+        type: string
+        pattern: '^t=\d+,v1=[0-9a-f]{64}(,v1=[0-9a-f]{64})*$'
+      example: "t=1790740800,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd"
 
   headers:
     TraceId:
@@ -587,6 +670,76 @@ components:
         has_more:
           type: boolean
 
+    # A processor event. Only `id` and `type` are read for routing;
+    # `data.object` is the processor-specific payload and its shape is the
+    # processor's, not cafaye's. The stored copy is the verified body verbatim,
+    # because a normalized hash would be the wrong thing to replay: it is the
+    # *processor's* bytes that the mapping is a claim about.
+    StripeEvent:
+      type: object
+      required: [id, object, type, data]
+      properties:
+        id:
+          type: string
+          description: >-
+            The processor's id for the event, UNIQUE in this service's
+            `processor_webhooks` table. This is the whole of replay protection.
+        object:
+          type: string
+          const: event
+        type:
+          type: string
+          description: The processor's event type, e.g. `customer.subscription.updated`.
+        created:
+          type: integer
+          description: >-
+            Epoch seconds at which the event was created. This becomes the emitted
+            event's `time` — when the state change happened, not when this service
+            received it — which is what lets a consumer detect out-of-order
+            delivery.
+        livemode:
+          type: boolean
+        data:
+          type: object
+          properties:
+            object:
+              type: object
+              description: The processor object the event is about. Untyped on purpose.
+
+    # Which Stripe types this build acts on, and what each becomes. Documentation
+    # of the mapping rather than a request or response shape: it is here so a
+    # reader of the contract does not have to read the code to learn which events
+    # are handled. Deliberately-ignored types are listed with the reason, so "we
+    # chose to skip this" is visible without querying the table.
+    #
+    # `checkout.session.completed` appears twice on purpose: a session in payment
+    # mode is the only record of that charge and becomes
+    # `billing.payment.succeeded`, while a session in subscription mode restates
+    # what `customer.subscription.created` says moments later and is ignored, so a
+    # signup is not counted twice.
+    StripeEventMapping:
+      type: object
+      properties:
+        handled:
+          type: object
+          additionalProperties:
+            type: string
+          example:
+            customer.subscription.created: billing.subscription.started
+            customer.subscription.updated: billing.subscription.updated
+            customer.subscription.deleted: billing.subscription.canceled
+            invoice.paid: billing.payment.succeeded
+            invoice.payment_failed: billing.payment.failed
+            checkout.session.completed (payment mode): billing.payment.succeeded
+        ignored:
+          type: object
+          additionalProperties:
+            type: string
+          example:
+            ping: connectivity_check
+            checkout.session.completed (subscription mode): subscription_mode_is_restated_by_the_subscription_lifecycle
+            any other type: unhandled_event_type
+
     # core's error envelope. `errors` appears only on a 422.
     Problem:
       type: object
@@ -662,3 +815,39 @@ components:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/Problem'
+    SignatureRejected:
+      description: >-
+        The signature did not verify, the signature header was missing, or the
+        body was not an event. Nothing is stored. 400 rather than 422 because the
+        sender could not have known its signing secret was wrong, and rather than
+        5xx because a retry would fail identically.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://errors.cafaye.com/bad_request
+            title: Bad request
+            status: 400
+            detail: The Stripe-Signature header did not verify against the request body.
+            instance: /v1/webhooks/stripe
+            code: bad_request
+            trace_id: 0af7651916cd43dd8448eb211c80319c
+    SigningUnconfigured:
+      description: >-
+        No signing secret is configured, so no signature can be checked. This is
+        this service's misconfiguration and never the sender's fault; the body
+        deliberately does not say the signature was invalid, because that would
+        send an operator looking in the wrong place. The cause is logged.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://errors.cafaye.com/unavailable
+            title: Service unavailable
+            status: 503
+            detail: Webhook signature verification is not configured.
+            instance: /v1/webhooks/stripe
+            code: unavailable
+            trace_id: 0af7651916cd43dd8448eb211c80319c

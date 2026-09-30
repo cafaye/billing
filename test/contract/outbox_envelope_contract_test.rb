@@ -22,11 +22,52 @@ class OutboxEnvelopeContractTest < ActiveSupport::TestCase
   # published here with no catalog row would pass every suite in the system.
   PENDING_CORE_CATALOG_ROWS = %w[billing.plan.updated].freeze
 
-  # Events with no payload schema in core, which core's outbox checklist asks for.
-  # Core ships two (identity's and billing's subscription.started) and neither is
-  # this service's. Same reasoning: recorded, not ignored, and this list is what
-  # fails if a new event is published without anyone noticing the schema is owed.
-  NO_PAYLOAD_SCHEMA_YET = OutboxEvent::TYPES
+  # Events whose `data` does not yet satisfy core's payload schema, and exactly
+  # how it differs.
+  #
+  # Core ships two payload schemas in total, and one of them is billing's:
+  # `schemas/events/billing/subscription/started.schema.json`. The gap is not a
+  # disagreement about the event — it is that the schema describes a world in
+  # which this service holds ids it does not have yet:
+  #
+  #   * `plan_id` and `account_id` are required, and a Stripe webhook carries a
+  #     Stripe price id and a Stripe customer id. There is no subscriptions table,
+  #     and `Plan#id` is a uuid rather than core's `pln_[0-9A-Z]{26}`.
+  #   * `additionalProperties: false` and the schema names eight fields, so
+  #     everything this service does send — which processor it came from, the
+  #     period it covers, the cancellation intent — is unexpected to core until
+  #     the schema is widened.
+  #
+  # Recorded rather than skipped, and asserted as a set rather than subtracted
+  # from the failures. Subtracting would let a payload that starts matching sit
+  # here forever, and would let a new event stop matching without anyone
+  # noticing. A set means a difference in either direction fails.
+  PENDING_PAYLOAD_ALIGNMENT = {
+    "billing.subscription.started" => {
+      missing: %w[account_id plan_id],
+      unexpected: %w[
+        cancel_at_period_end canceled_at current_period_end current_period_start
+        customer_id kind price_id processor processor_event_id trial unit_amount
+      ].sort
+    }
+  }.freeze
+
+  # The events core has no payload schema for, which core's outbox checklist asks
+  # for. This is the accounting, and it fails the day core lands one so the entry
+  # is dropped deliberately rather than by accident.
+  NO_PAYLOAD_SCHEMA_YET = (OutboxEvent::TYPES - PENDING_PAYLOAD_ALIGNMENT.keys).freeze
+
+  # The webhook fixtures that produce the events that do not come from a model
+  # callback. Ingested for real by the fixtures under test, so the payloads
+  # checked against core are the ones this build would put on the wire.
+  WEBHOOK_FIXTURES = %w[
+    customer.subscription.created
+    customer.subscription.updated
+    customer.subscription.deleted
+    invoice.paid
+    invoice.payment_failed
+    checkout.session.completed.payment
+  ].freeze
 
   setup do
     skip("core is not on disk; set CORE_PATH to #{default_core_path}") unless schema
@@ -84,24 +125,23 @@ class OutboxEnvelopeContractTest < ActiveSupport::TestCase
     # core v0.2 (D3) put the payload schemas in core and the outbox checklist
     # asks for `data` to be validated against
     # `schemas/events/<service>/<entity>/<action>.schema.json` before the insert.
-    # Core ships two payload schemas in total and neither is billing's, so today
-    # this checks the accounting and nothing else. It is the thing that notices
-    # the day a schema lands, rather than the payload drifting until a consumer
-    # breaks.
-    validated = []
+    # One of the two core ships is billing's, so this stops being bookkeeping the
+    # moment it lands for a type this build publishes.
+    assert_equal PENDING_PAYLOAD_ALIGNMENT, payload_mismatches,
+      "the payloads that do not match core's schemas have changed: fix them, or record the new gap in PENDING_PAYLOAD_ALIGNMENT and in cafaye.yml"
+  end
 
-    envelopes.each do |envelope|
-      schema = payload_schema_for(envelope.fetch("type"))
-      next if schema.nil?
-
-      assert_matches_payload_schema(schema, envelope.fetch("data"), envelope.fetch("type"))
-      validated << envelope.fetch("type")
-    end
-
-    unspecified = OutboxEvent::TYPES - validated
+  test "the set of events with no payload schema in core has changed" do
+    unspecified = OutboxEvent::TYPES.reject { |event_type| payload_schema_for(event_type) }
 
     assert_equal NO_PAYLOAD_SCHEMA_YET.sort, unspecified.sort,
       "the set of events with no payload schema in core has changed: drop the entries this service no longer owes one for"
+  end
+
+  # A type with no fixture here would be silently unchecked by the test above,
+  # which is the failure mode a contract test exists to prevent.
+  test "the events under test are every type this service publishes" do
+    assert_equal OutboxEvent::TYPES.sort, envelopes.map { |envelope| envelope.fetch("type") }.uniq.sort
   end
 
   test "the manifest declares an api, and the document it points at exists" do
@@ -114,11 +154,92 @@ class OutboxEnvelopeContractTest < ActiveSupport::TestCase
     # --- the fixtures under test: real emissions, not hand-built envelopes ---
 
     def envelopes
-      customer = Customer.create!(owner_type: "User", owner_id: "11111111-1111-4111-8111-111111111111", processor: "stripe")
+      @envelopes ||= emit_one_event_of_every_type
+    end
+
+    # Three of the eight events come from a model callback and five from the
+    # webhook mapping. Both are produced here the way production produces them —
+    # a record written, a signed fixture ingested — because an envelope assembled
+    # by hand in a test is an envelope nothing has checked this service against.
+    def emit_one_event_of_every_type
+      Customer.create!(owner_type: "User", owner_id: "11111111-1111-4111-8111-111111111111", processor: "stripe")
       plan = Plan.create!(name: "Pro monthly", slug: "pro-monthly", price: Money.new(1900, "USD"), interval: "month")
       plan.update!(active: false)
 
+      WEBHOOK_FIXTURES.each { |fixture| ingest(fixture) }
+
       OutboxEvent.order(:created_at, :id).map(&:to_envelope)
+    end
+
+    def ingest(fixture)
+      body = JSON.parse(stripe_fixture(fixture))
+
+      Webhooks::Ingestion.new(processor: :stripe, event_id: body["id"], type: body["type"], payload: body).call
+    end
+
+    def data_for(event_type)
+      envelopes.find { |envelope| envelope.fetch("type") == event_type }.fetch("data")
+    end
+
+    # Every way a payload disagrees with a core schema, as a hash keyed by
+    # event type, so a difference in either direction fails. An empty result is
+    # the passing case; anything in it that is not recorded above is a contract
+    # breach, not a tolerance.
+    def payload_mismatches
+      OutboxEvent::TYPES.each_with_object({}) do |event_type, mismatches|
+        schema = payload_schema_for(event_type)
+        next if schema.nil?
+
+        data = data_for(event_type)
+        properties = schema.fetch("properties")
+
+        difference = {
+          missing: (schema.fetch("required") - data.keys).sort,
+          unexpected: (data.keys - properties.keys).sort,
+          ill_typed: ill_typed_fields(data, properties)
+        }.reject { |_reason, entries| entries.empty? }
+
+        mismatches[event_type] = difference if difference.any?
+      end
+    end
+
+    # A property-by-property type check, not a JSON Schema engine: a dependency
+    # that can validate a document is a dependency this service does not have,
+    # and the two payload schemas in core are flat objects of typed scalars. A
+    # constraint this does not understand is named in the failure rather than
+    # skipped, so a schema that starts using one fails loudly.
+    def ill_typed_fields(data, properties)
+      data.filter_map do |field, value|
+        constraint = properties[field]
+        next if constraint.nil?
+        next if value_is_type?(constraint.fetch("type"), value)
+
+        "#{field} is #{json_type_of(value)}, core says #{constraint.fetch("type").inspect}"
+      end
+    end
+
+    def value_is_type?(declared, value)
+      case declared
+      when "string" then value.is_a?(String)
+      when "integer" then value.is_a?(Integer)
+      when "boolean" then value.equal?(true) || value.equal?(false)
+      when "object" then value.is_a?(Hash)
+      when "array" then value.is_a?(Array)
+      when "null" then value.nil?
+      else raise "this test does not understand type #{declared.inspect}"
+      end
+    end
+
+    def json_type_of(value)
+      case value
+      when nil then "null"
+      when true, false then "boolean"
+      when Integer then "integer"
+      when String then "string"
+      when Hash then "object"
+      when Array then "array"
+      else value.class.name
+      end
     end
 
     # --- core's schema, read from disk ---
@@ -158,32 +279,6 @@ class OutboxEnvelopeContractTest < ActiveSupport::TestCase
       end
     end
 
-    # A property-by-property check, not a JSON Schema engine: a dependency that
-    # can validate a document is a dependency this service does not have, and
-    # the two payload schemas in core are flat objects of typed scalars. The
-    # constraints actually used are asserted, so a schema that starts using
-    # something this does not understand fails loudly instead of passing.
-    def assert_matches_payload_schema(schema, data, event_type)
-      properties = schema.fetch("properties")
-
-      assert_equal schema.fetch("required").sort, data.keys.sort, "#{event_type}: payload keys must be exactly core's required set"
-      assert_empty data.keys - properties.keys, "#{event_type}: additionalProperties is false in core"
-
-      data.each do |field, value|
-        constraint = properties.fetch(field)
-
-        case constraint.fetch("type")
-        when "string" then assert_kind_of String, value, "#{event_type}.#{field}"
-        when "integer" then assert_kind_of Integer, value, "#{event_type}.#{field}"
-        when "boolean" then assert_equal [ true, false ], value.class == TrueClass || value.class == FalseClass ? value : nil, "#{event_type}.#{field}"
-        when "object" then assert_kind_of Hash, value, "#{event_type}.#{field}"
-        when "array" then assert_kind_of Array, value, "#{event_type}.#{field}"
-        when "null" then assert_nil value, "#{event_type}.#{field}"
-        else raise "#{event_type}.#{field}: this test does not understand type #{constraint.fetch("type").inspect}"
-        end
-      end
-    end
-
     # core's catalog rows, as a set of published event types, keyed by publisher.
     def core_catalog
       return @core_catalog if defined?(@core_catalog)
@@ -214,15 +309,24 @@ class OutboxEnvelopeContractTest < ActiveSupport::TestCase
     # comparison would only prove the two texts are alike, not that they accept
     # the same language. A corpus does prove that.
     GRAMMAR_CORPUS = [
-      # What this service emits.
+      # What this service emits. Kept as the full list rather than one example:
+      # a corpus is only evidence about the strings in it.
       "billing.customer.created",
+      "billing.payment.failed",
+      "billing.payment.succeeded",
       "billing.plan.created",
       "billing.plan.updated",
+      "billing.subscription.canceled",
+      "billing.subscription.started",
+      "billing.subscription.updated",
       # The other legal shape: two segments.
       "customer.created",
       # A uuid, which is what a subject is in practice.
       "11111111-1111-4111-8111-111111111111",
       "usr_01J9Z8QK5M4N7P2R3T6V8W9X0A",
+      # What a webhook's subject is, before this service has its own ids for
+      # subscriptions: the processor's.
+      "sub_1PZQaBcDeFgHiJkLmNoPqR1",
       # Neighbouring cases, where a grammar difference would show up.
       "identity.api_key.created",
       "billing",
@@ -258,6 +362,11 @@ class OutboxEnvelopeContractTest < ActiveSupport::TestCase
       assert_empty disagreements, "core and this service disagree about: #{disagreements.inspect}"
     end
 
+    # A property-by-property check, not a JSON Schema engine: a dependency that
+    # can validate a document is a dependency this service does not have, and
+    # the two payload schemas in core are flat objects of typed scalars. The
+    # constraints actually used are asserted, so a schema that starts using
+    # something this does not understand fails loudly instead of passing.
     def assert_valid_envelope(envelope)
       properties = schema.fetch("properties")
 
