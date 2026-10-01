@@ -15,7 +15,9 @@
 # STRICTNESS NOTES
 #   - No `mise install` here. mise.toml pins the interpreter; this script fails
 #     loudly (127) with instructions instead of installing a toolchain behind
-#     your back.
+#     your back. The same 127 is what a WRONG interpreter gets: `.ruby-version`
+#     is read and compared, so macOS's system Ruby cannot answer and have the
+#     run die four lines later naming a gem instead of the toolchain.
 #   - `bundle install`, never `bundle update`: a prime that moves the lockfile
 #     can make two worktrees disagree about the same commit.
 #   - Rubocop runs before the tests: a formatting offense should cost a second,
@@ -47,6 +49,44 @@ require() {
   fi
 }
 
+# The pin, and the interpreter that answered, are two different facts and only
+# one of them is a question.
+#
+# `require ruby` above proves *an* interpreter is on PATH. On any Mac that is
+# satisfied by the system Ruby in /usr/bin, and the run then dies four lines
+# later with `Could not find 'bundler' (4.0.18) ... (Gem::GemNotFoundException)`
+# — a gem error naming a gem, four steps away from the toolchain that is wrong.
+# Measured on this machine, with /usr/bin first on PATH: that is the whole
+# output, and nowhere in it is the 4.0.1 in .ruby-version. A developer reads it
+# as a lockfile problem and installs a gem.
+#
+# So the pin is read from `.ruby-version` — the same file mise, ruby/setup-ruby
+# and the `pins` CI job read, and the reason there is no second copy of the
+# number here — and anything else is refused here, with the number named, before
+# a gem is touched. Same exit code as a missing interpreter (127), because a
+# wrong interpreter is a missing interpreter.
+require_pinned_ruby() {
+  local pin_file running
+  pin_file="$(cd -- "$(dirname -- "$0")" && pwd)/../.ruby-version"
+  if [ ! -r "$pin_file" ]; then
+    echo "bin/prime: .ruby-version is missing or unreadable, so the interpreter cannot be checked" >&2
+    echo "  at $(pwd). One ruby number in three files is this repository's rule" >&2
+    echo "  (mise.toml, .ruby-version, Dockerfile) and this check is where it is read." >&2
+    exit 127
+  fi
+  PINNED_RUBY="$(tr -d '[:space:]' < "$pin_file")"
+  PINNED_RUBY="${PINNED_RUBY#ruby-}"
+  running="$(ruby -e 'print RUBY_VERSION' 2>/dev/null || true)"
+  if [ "$running" != "$PINNED_RUBY" ]; then
+    echo "bin/prime: .ruby-version pins ruby $PINNED_RUBY; the ruby on PATH answers '${running:-nothing}'" >&2
+    echo "  run 'mise install' in this worktree, or put mise's shims first on PATH." >&2
+    echo "  this gate refuses to run on an unpinned interpreter. A money calculation" >&2
+    echo "  on the wrong Ruby is not the program this repository ships, and a gem" >&2
+    echo "  error four lines down is not a report of that." >&2
+    exit 127
+  fi
+}
+
 step() {
   printf '\n== %s\n' "$1"
 }
@@ -59,8 +99,15 @@ version_of() {
 
 require ruby
 require bundle
+require_pinned_ruby
 
-step "ruby $(version_of ruby)"
+# The pin, and not `ruby --version`'s whole first line. Those agree by
+# construction here — the check above just refused to continue unless they do —
+# and the version string carries a build date and a platform that differ per
+# machine, so printing it would print a fact no assertion is about. `gate.yml`'s
+# `toolchain` proof matches this line whole, and it is the line that disappears
+# if the pin check is deleted.
+step "ruby $PINNED_RUBY (pinned by .ruby-version)"
 
 step "bundle install"
 bundle install
