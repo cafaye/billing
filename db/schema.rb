@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_09_30_000010) do
+ActiveRecord::Schema[8.1].define(version: 2026_09_30_000012) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -24,6 +24,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_09_30_000010) do
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
     t.index ["owner_type", "owner_id", "processor"], name: "index_customers_on_owner_type_and_owner_id_and_processor", unique: true
+    t.index ["processor_customer_id"], name: "customers_processor_customer_id_idx", unique: true, where: "(processor_customer_id IS NOT NULL)"
     t.check_constraint "processor::text = 'stripe'::text", name: "customers_processor_known"
   end
 
@@ -66,6 +67,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_09_30_000010) do
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
     t.jsonb "entitlements", default: {}, null: false
+    t.index ["processor_price_id"], name: "plans_processor_price_id_idx", unique: true, where: "(processor_price_id IS NOT NULL)"
     t.index ["slug"], name: "index_plans_on_slug", unique: true
     t.check_constraint "NOT entitlements ? 'features'::text OR jsonb_typeof(entitlements -> 'features'::text) = 'array'::text", name: "plans_entitlements_features_is_array"
     t.check_constraint "NOT entitlements ? 'limits'::text OR jsonb_typeof(entitlements -> 'limits'::text) = 'object'::text", name: "plans_entitlements_limits_is_object"

@@ -229,7 +229,12 @@ class HttpSurfaceContractTest < ActiveSupport::TestCase
     # It is a pin and not a derived value on purpose. A test that read the version
     # out of the document and compared it with itself would pass every document ever
     # written, including a regenerated one.
-    assert_equal "1.2.0", document.fetch("info").fetch("version")
+    #
+    # 1.3.0 (billing-13) is the 409 on `PATCH /v1/customers/{id}`: making
+    # `processor_customer_id` unique gave that operation a status it could not
+    # answer before, and a response the document does not list is a document lying
+    # about its own surface.
+    assert_equal "1.3.0", document.fetch("info").fetch("version")
   end
 
   test "the manifest declares an api, and the document it points at exists" do

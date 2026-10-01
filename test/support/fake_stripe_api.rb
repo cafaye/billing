@@ -16,7 +16,21 @@ class FakeStripeAPI
 
   # Prices and subscriptions this fake knows about. Everything else is refused,
   # which is what makes "the processor said no" a thing the specs can arrange.
-  KNOWN_PRICES = %w[price_1PZQaBcDeFgHiJkLmNoPqR2 price_new].freeze
+  #
+  # The price list has to contain every price `StripeSubscriptionFixtures` hands
+  # a plan, or a spec that puts a second plan on sale gets a processor refusal
+  # where it meant a successful one. That is a second literal kept in step with
+  # the first, and `test/support/fixture_processor_ids_test.rb` asserts the two
+  # agree — the fake loads before the fixtures module, so the agreement cannot be
+  # structural and is checked instead.
+  KNOWN_PRICES = %w[
+    price_1PZQaBcDeFgHiJkLmNoPqR2
+    price_new
+    price_FAKEteamplanBBBBBBBBB
+    price_FAKElateralplanBBBBBBB
+    price_FAKEcheaperplanBBBBBBB
+    price_FAKEyearlyplanBBBBBBBB
+  ].freeze
   KNOWN_SUBSCRIPTIONS = %w[sub_1PZQaBcDeFgHiJkLmNoPqR1].freeze
 
   # A refusal, in the processor's own vocabulary.

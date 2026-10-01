@@ -268,6 +268,48 @@ class StripeWebhookTest < ActionDispatch::IntegrationTest
     assert_equal "ignored:no_subscription_to_update", ProcessorWebhook.find_by(type: "customer.subscription.updated").error
   end
 
+  # The seventh refusal, `account_mismatch`, over the HTTP edge and with the
+  # signature path in play — this is the half of F1 the tenant specs cannot reach,
+  # because they call `Webhooks::Ingestion` directly.
+  #
+  # **The 200 is half the claim.** A refused delivery is a *decision*, not an
+  # error: this service understood the event and deliberately did not apply it,
+  # and answering anything but 200 would tell the processor to redeliver a
+  # delivery that reaches the identical conclusion every time. The row carries the
+  # reason, and a human reads it there.
+  #
+  # The accounts are the same `1111…`/`2222…` pair the tenant specs use, so the two
+  # files compare the same two accounts rather than two sets that look alike.
+  test "a delivery naming another account is refused, and the endpoint still answers 200" do
+    create_stripe_customer(account_id: TwoAccounts::ACCOUNT_A, processor_customer_id: TwoAccounts::CUSTOMER_A)
+    other = create_stripe_customer(account_id: TwoAccounts::ACCOUNT_B, processor_customer_id: TwoAccounts::CUSTOMER_B)
+    create_stripe_plan
+
+    post_stripe_webhook(subscription_delivery_named("customer.subscription.created", TwoAccounts::CUSTOMER_A))
+    assert_response :ok
+    row = Subscription.sole
+    assert_equal TwoAccounts::ACCOUNT_A, row.account_id
+
+    # The same subscription id, now naming the other account's customer. The
+    # fixture's `updated` event is a week later than the `created` one, so
+    # `stale_delivery` cannot be what refuses this — the account comparison is.
+    post_stripe_webhook(
+      subscription_delivery_named("customer.subscription.updated", TwoAccounts::CUSTOMER_B, customer_record: other)
+    )
+
+    assert_response :ok,
+      "a refused delivery must not be answered with a 4xx or a 5xx. The processor retries a " \
+      "non-2xx, the retry reaches the identical decision, and the delivery row already " \
+      "carries the reason."
+    assert_equal "ignored:account_mismatch", ProcessorWebhook.find_by(type: "customer.subscription.updated").error
+    assert_equal TwoAccounts::ACCOUNT_A, row.reload.account_id,
+      "the subscription moved between accounts. `Lifecycle#apply` compares the resolved " \
+      "account with the one on the row and refuses before `assign_attributes`."
+    refute_equal other.id, row.customer_id,
+      "the subscription now points at the other account's customer. The account is derived " \
+      "from the customer on every apply, so the two move together or not at all."
+  end
+
   # core: the event's `time` is when the state change happened, not when this
   # service read about it.
   test "each delivery keeps the time the processor reported" do
@@ -602,5 +644,27 @@ class StripeWebhookTest < ActionDispatch::IntegrationTest
       create_stripe_customer
       create_stripe_plan
       yield
+    end
+
+    # A committed subscription fixture with its **customer** moved onto another
+    # account's pair, and nothing else changed.
+    #
+    # Both halves of the customer reference are rewritten, because
+    # `Lifecycle#customer` consults both and consults the cafaye one first: a body
+    # whose `customer` names account B while its `metadata.cafaye_customer_id` still
+    # names account A's row would resolve to A and prove nothing.
+    #
+    # The delivery's own `id` is left where the fixture put it, and so is the id
+    # inside the body — they are one value in production, and moving one without the
+    # other is a state Stripe never sends.
+    def subscription_delivery_named(fixture, processor_customer_id, customer_record: nil)
+      body = JSON.parse(stripe_fixture(fixture))
+      object = body.dig("data", "object")
+      record = customer_record || Customer.find_by!(processor_customer_id: processor_customer_id)
+
+      object["customer"] = processor_customer_id
+      object["metadata"] = { "cafaye_customer_id" => record.id }
+
+      JSON.generate(body)
     end
 end

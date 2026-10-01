@@ -24,6 +24,25 @@ class Plan < ApplicationRecord
 
   validates :name, presence: true
   validates :slug, presence: true, uniqueness: true
+
+  # **A second plan may not claim one `price_`.** The database says so
+  # (`plans_processor_price_id_idx`, billing-13); this is what turns the collision
+  # into a *named* answer for a client.
+  #
+  # `Subscriptions::Lifecycle#plan` resolves a delivery by this column with
+  # `find_by`, so a subscription is billed against whichever plan claimed the id.
+  # Two plans on one `price_` and one of them is billed at an amount this service
+  # never agreed to with the customer, and `billing.subscription.started` carries
+  # that plan's currency and says nothing about the one that was intended — so the
+  # wrong amount is not only charged but published. With the index alone that is a
+  # 409 naming no field; with this it names `processor_price_id`.
+  #
+  # `allow_nil` because a plan is written through `/v1` before it is ever put on
+  # sale at the processor, and many plans are legitimately unsold at once. The rule
+  # is "a value here is unique", not "this column is unique" — the same reading the
+  # index's partial predicate states.
+  validates :processor_price_id, uniqueness: true, allow_nil: true
+
   validates :interval, presence: true
   # `allow_nil` so that a missing interval is reported once, as a blank, rather
   # than twice — once as a blank and once as "not one of the allowed values".

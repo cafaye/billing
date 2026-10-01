@@ -138,17 +138,57 @@ Three packets, in order.
     a count of account-constrained queries in `app/` that is **0 today**. The day
     scoping lands, that count moves and **all four fail** saying to rewrite them
     as 404s.
-  * **Three cross-tenant defects were found and reported, not fixed**, because
-    each is a change to money and none can be discharged inside the packet. F1: a
-    delivery reassigns a live subscription between accounts, because
-    `Lifecycle#apply` writes `account_id: customer.owner_id` and never compares it
-    to the account already on the row. F2: `customers.processor_customer_id` is
-    not unique and `POST`/`PATCH /v1/customers` both permit it, which is what
-    makes F1 reachable through this service's own surface. F3: the same shape on
-    `plans.processor_price_id`. Each is asserted **as a finding**, so each test is
-    a tripwire that goes red **when it is fixed** — a finding test that survives
-    its own fix is a test nobody will trust next time. See
-    `REPORT-billing-12-isolation.md`.
+  * **Three cross-tenant defects were found and reported, and billing-13 fixed
+    them.** F1: a delivery reassigned a live subscription between accounts, because
+    `Lifecycle#apply` wrote `account_id: customer.owner_id` and never compared it to
+    the account already on the row. F2: `customers.processor_customer_id` was not
+    unique and `POST`/`PATCH /v1/customers` both permitted it, which is what made
+    F1 reachable through this service's own surface. F3: the same shape on
+    `plans.processor_price_id`. See `REPORT-billing-12-isolation.md` for the
+    before, and `REPORT-billing-13-fixes.md` for the after.
+
+- **billing-13** is those three fixes, and it is the packet that turned billing-12's
+  findings into refusals. `+37 runs / +126 assertions`, `950 runs / 2724
+  assertions`, and the six findings tests are **rewritten rather than deleted**:
+  same two accounts, same delivery, same `PATCH`, same pair of plans, with each
+  assertion flipped from "the defect reproduces" to "the defect is refused". Three
+  things in it are worth knowing before you touch the delivery path:
+
+  * **A delivery may not change a subscription's account.**
+    `Subscriptions::Lifecycle::ACCOUNT_REASON` is `"account_mismatch"`, the
+    **seventh** `Refused` reason and the first about **tenancy** rather than about
+    the row's shape. The comparison is one line in `Lifecycle#apply`, and it is
+    **before `assign_attributes`** — a comparison after the overwrite compares the
+    new account with itself and always agrees, which a mutation proved. It is also
+    guarded by `existed &&`, because a first delivery has no account to disagree
+    with and an unconditional check would break the deletion-arriving-before-its-
+    creation rule. Recorded as `ignored:account_mismatch` and answered **200**.
+    **The model's own validation could not have caught this**, and that is the
+    reason the guard had to go in the only writer: `account_is_the_customers_owner`
+    enforces "a subscription's account is its customer's", which is **true** after a
+    reassignment.
+  * **A processor customer id and a price id each belong to one row**, enforced by
+    `customers_processor_customer_id_idx` and `plans_processor_price_id_idx`, with
+    matching model validations so a collision is a **409 naming the field** rather
+    than a raw index violation. **Both indexes are partial, and the reason is not
+    stylistic**: the columns are nullable and legitimately so, so the rule is *a
+    value here is unique*, and a bare `unique` index would allow the nulls only by
+    way of PostgreSQL's `NULLS DISTINCT` default — a database default rather than a
+    statement of intent, and one that `NULLS NOT DISTINCT` could remove. **A
+    deploy step, not a no-op**: a table already holding the duplicates cannot be
+    migrated, and the migration test asserts that refusal as behaviour.
+  * **`/v1` is still unauthenticated and still unscoped.** 14 account-scoped routes
+    and 33 data accesses still carry **zero** account scopes, and the four `gap:`
+    tripwires still pin the open surface. These three fixes make the *delivery
+    path's* resolution unambiguous and immovable; they authorize nobody and they are
+    not a substitute for scoping.
+
+  **The two constraint tests are in files of their own** because running a
+  migration commits the enclosing transaction, and **the index's shape is asserted
+  in `test/tenant/`, not in them**: a file that rolls the index back and up
+  *rebuilds* what it then measures, so a non-unique index was repaired by whichever
+  test ran first and the assertion passed. A guard that only ever rebuilds what it
+  measures cannot detect a wrong thing about it.
 
 billing-05 changes a claim the earlier packets made, so it is stated plainly:
 **this service now talks to Stripe.** It did not, and saying so was true when it
@@ -206,9 +246,12 @@ billing/
 │   ├── contract/                      # the checks against core, and the HTTP one
 │   │   ├── http_surface_contract_test.rb # the document and the router, by method and path
 │   ├── coverage/                      # the money-path coverage gate, and its inventory
+│   │   └── fixture_processor_ids_check_test.rb # the fake processor and the helpers agree
 │   ├── integration/                   # health, and the webhook's HTTP edge
 │   ├── models/                        # minitest, table-driven
-│   │   └── outbox_processor_event_id_migration_test.rb # reversibility, run for real
+│   │   ├── outbox_processor_event_id_migration_test.rb # reversibility, run for real
+│   │   ├── customer_processor_customer_id_migration_test.rb # ditto, for the cus_ index
+│   │   └── plan_processor_price_id_migration_test.rb       # ditto, for the price_ index
 │   ├── requests/v1/                   # the API specs
 │   ├── services/                      # the lifecycle, the client, the webhook mapping
 │   │   └── webhooks/
@@ -219,11 +262,12 @@ billing/
 │       ├── account_entry_point_matrix_test.rb # every account-scoped access, derived from app/
 │       ├── cross_account_delivery_test.rb     # the boundaries that hold, against Postgres
 │       ├── cross_account_web_test.rb          # the 404 shape, the 403 audit, the recorded gap
-│       └── cross_account_findings_test.rb     # the three cross-tenant defects, as findings
+│       └── cross_account_findings_test.rb     # the three cross-tenant defects, as refusals
 ├── .github/workflows/ci.yml           # calls kit's reusable workflow, plus the gate
 ├── CHANGELOG.md                       # every notable change, per Keep a Changelog
 ├── REPORT-billing-09.md               # the race: evidence, fix, and what was not fixed
-└── REPORT-billing-12-isolation.md     # the tenant boundary: the count, and three findings
+├── REPORT-billing-12-isolation.md     # the tenant boundary: the count, and three findings
+└── REPORT-billing-13-fixes.md         # F1, F2, F3 closed: before, after, and eight mutations
 ```
 
 ## Commands
@@ -395,7 +439,21 @@ Two rules that are not obvious and that the specs exist to hold:
 Every refusal raises `Subscriptions::Refused`, which the webhook layer records as
 `ignored:<reason>` and answers 200. The reasons are part of the contract:
 `unknown_customer`, `unknown_plan`, `no_subscription_to_update`,
-`canceled_is_terminal`, `no_change_to_record`, `stale_delivery`.
+`canceled_is_terminal`, `no_change_to_record`, `stale_delivery`,
+`account_mismatch`.
+
+**`account_mismatch` is the seventh and the only one about tenancy.** The other six
+ask "can this delivery be applied to this subscription?"; this one asks "whose
+subscription is it?" and the answer is not allowed to change. A delivery whose
+resolved customer belongs to a **different account** than the row is on is refused
+rather than applied, in `Lifecycle#apply` and **before** `assign_attributes`. Two
+details are load-bearing and both were proven by a mutation: it must be *before*
+the overwrite, or it compares the new account with itself and always agrees; and
+it must be guarded by the row **existing**, or it breaks the
+deletion-arriving-before-its-creation rule. The model's
+`account_is_the_customers_owner` cannot do this job — after a reassignment the new
+account genuinely belongs to the new customer, so that rule passes. See
+`REPORT-billing-13-fixes.md`.
 
 ## Webhooks in
 
@@ -525,23 +583,28 @@ Four things that are not obvious and that the file argues in full:
   deletes it, so the condition for retiring it is written into the file: kit's
   `ruby` job grows a `services`/`env` seam, **and** `rake coverage` exists here
   or kit stops running it.
-- **The suite size is held by equality, not as a floor.** `913 runs / 2598
+- **The suite size is held by equality, not as a floor.** `950 runs / 2724
   assertions / 0 skips` is the number asserted at the top of the workflow on this
-  branch. master at `e63bb7a` was `763 / 2100`; the difference is billing-08's
-  hardening, billing-09's race fix and billing-12's tenant isolation, itemised in
-  the workflow's own header so a reviewer does not have to reconstruct it.
+  branch, which is billing-13's three cross-tenant fixes on top of billing-08's
+  hardening, billing-09's race fix and billing-12's tenant isolation. master at
+  `8bbbcec` was `913 / 2598` and master at `e63bb7a` was `763 / 2100`; both
+  differences are itemised in the workflow's own header so a reviewer does not have
+  to reconstruct them.
   A floor would accept a suite that lost 200 tests, and the tests it would lose
   first are the money arithmetic and the webhook signatures. Adding a test turns
   CI red until
   `BASELINE_RUNS`/`BASELINE_ASSERTIONS` are raised **in the same commit** — that
   is the intended direction, and lowering one is not.
 
-  The header's own itemisation does **not** add up to its totals, and that is
-  written down in the file rather than propagated: the per-packet deltas sum to
-  147 against a claimed 150, and billing-08's claimed `45 / 99` does not match
-  its own bullets. The asserted totals are right — they are what `bin/prime`
-  prints — and it is the prose that has drifted. Raising a threshold and
-  correcting the prose about it are separate jobs.
+  **The tiers are measured by directory, and `test_helper.rb` requires all of
+  `test/support/**/*.rb`** — so a `_test.rb` file living in `test/support/` joins
+  **every** CI tier that names any other path. A file placed there inflated the
+  contract tier's 45 runs to 53 and the webhook tier's 150 to 159, for a file that
+  belonged to neither. **Put a test in the directory of the thing it tests.**
+  `test/support/` is for modules, and a module there is what every other test file
+  is entitled to load. The same mechanism is why the webhook tier asserts five
+  files' worth of tests while listing four: `concurrent_delivery_test.rb` arrives
+  through that require rather than by being listed.
 
 ### The tier that skips without you noticing
 
@@ -552,8 +615,12 @@ commit, same code, with `CORE_PATH` pointed at a checkout and then at nothing:
 
 | `CORE_PATH` | `test/contract` (the tier) | whole suite |
 |---|---|---|
-| a core checkout | 45 runs, 400 assertions, 0 skips | 913 runs, 2598 assertions, 0 skips |
-| pointing at nothing | 45 runs, 61 assertions, **19 skips** | 913 runs, 2255 assertions, **20 skips** |
+| a core checkout | 45 runs, 400 assertions, 0 skips | 950 runs, 2724 assertions, 0 skips |
+| pointing at nothing | 45 runs, 61 assertions, **19 skips** | 950 runs, 2381 assertions, **20 skips** |
+
+(Re-measured on this branch, by moving `../core` aside rather than by reading the
+old row forward. The contract tier is **unchanged** at 45 / 400 — billing-13 added
+nothing under `test/contract/` but a version pin — so the 19 skips are the same 19.)
 
 **Same run count, same exit code, and 343 assertions of contract checking simply
 not done.** A green run that did not notice would have reported "the outbox
@@ -747,6 +814,25 @@ environment, and the `pins` job fails the build if the workflow file ever gains 
   `test/support/two_accounts.rb` deliberately share one plan**, because with a plan
   each, `(account_id, plan_id)` would be satisfied by `plan_id` alone and a
   dropped `account_id` from the index would go unnoticed.
+- **A partial unique index is also the honest way to say "a value here is
+  unique", on a nullable column.** `customers.processor_customer_id` and
+  `plans.processor_price_id` are unique **where not null**, because a customer
+  created through `/v1` has no `cus_` and a plan not yet on sale has no `price_` —
+  many rows are legitimately in that state at once. A bare `unique` index would
+  allow that only by way of PostgreSQL's `NULLS DISTINCT` default, and that is a
+  **database default rather than a statement of intent**: `NULLS NOT DISTISTINCT`
+  (PostgreSQL 15) is a feature a future migration could set for an unrelated
+  reason, and it would turn every not-yet-on-sale row into a collision. The
+  partial index has no such dependency, because a null is not *in* the index.
+  **And the test does not overclaim**: the null-rows test proves repeated nulls are
+  permitted, which is not the same as proving the predicate — a bare `unique`
+  index would pass it too. The comments in both migrations say so.
+- **A test that rebuilds what it measures cannot detect a wrong thing about
+  it.** The two index migration tests roll the index back and up to prove the
+  `down` works, so an assertion *inside* them about the index's shape read an index
+  the file had just created itself — a non-unique index was repaired by whichever
+  test ran first and the assertion passed. The observation lives in
+  `test/tenant/cross_account_findings_test.rb`, which never mutates the schema.
 - **A cross-account spec must not print the other account's row.** "This write
   changed nothing over there" is naturally written by comparing the records, and
   on failure that dumps a whole other account's subscription, price and status
@@ -818,14 +904,21 @@ environment, and the `pins` job fails the build if the workflow file ever gains 
   `test/tenant/`: 14 account-scoped routes and 33 account-scoped data accesses,
   of which **zero carry an account scope**, against two constraints that do hold
   (`(account_id, plan_id)` on live subscriptions, and one customer per
-  `(owner, processor)`). **Three cross-tenant defects were found on the delivery
-  path and reported, not fixed** — F1, F2 and F3 in
-  `REPORT-billing-12-isolation.md`. Read that report before adding a field to
-  `CustomerUpdate` or `PlanUpdate`: `processor_customer_id` and
-  `processor_price_id` are permitted on the client's **own** row precisely because
-  `owner` and `processor` are not, and they are the whole of F2's attack surface.
-  When scoping lands, the four `gap:` tests in `cross_account_web_test.rb` fail
-  by design — rewrite them as 404s, do not delete them.
+  `(owner, processor)`).
+
+  **The three cross-tenant defects billing-12 found on the delivery path — F1, F2
+  and F3 — are fixed** (`REPORT-billing-13-fixes.md`; the before is
+  `REPORT-billing-12-isolation.md`). **Read both before adding a field to
+  `CustomerUpdate` or `PlanUpdate`.** `processor_customer_id` and
+  `processor_price_id` are still permitted on the client's **own** row precisely
+  because `owner` and `processor` are not — and they were the whole of F2's and
+  F3's attack surface. **Both are now unique**, so a client claiming one another
+  row holds gets a **409 naming the field** and nothing is written. That is a
+  *determinism* guarantee on the delivery path, not authorization: with the column
+  unique, `Lifecycle`'s `find_by` has one answer instead of an arbitrary one, and
+  a delivery can no longer move a subscription's account. Neither is a substitute
+  for scoping, and the four `gap:` tests in `cross_account_web_test.rb` fail by
+  design when scoping lands — rewrite them as 404s, do not delete them.
 - **A 403 is never the answer here, and the vocabulary enforces it.**
   `Problem::CATALOG` is a frozen table with **no entry of status 403**, so this
   service has no code path to render one; the guarantee is a property of a closed
@@ -929,9 +1022,18 @@ environment, and the `pins` job fails the build if the workflow file ever gains 
       that covers every status fails if any of the four is missing
 - [ ] Anything published is in `cafaye.yml`, in `OutboxEvent::TYPES`, and in
       core's catalog — or the gap is written down in both places
+- [ ] A new `Refused` reason is added to the list in **Subscriptions** above, to
+      `README.md`, and asserted by a test that names it on the delivery row
+- [ ] A new unique index is **partial where the column is nullable**, and its
+      migration test proves the index refuses the duplicate with the model
+      bypassed — plus a test that repeated nulls are still writable
 - [ ] A data access added to `app/` is classified in
       `test/tenant/account_entry_point_matrix_test.rb`, with its kind and what it
       touches — and a `scope` or association added to a tenant model is too
+- [ ] A new test file is in the directory of the thing it tests, and **not** in
+      `test/support/`, which is auto-required into every CI tier
+- [ ] `openapi/v1.yaml`'s `info.version` is raised, and any response the code can
+      now answer is declared on the operation that can answer it
 - [ ] Nothing added a 403, and nothing made the open surface *look* closed with a
       404: absence, never refusal
 - [ ] Every guard in this packet has been seen red, and the mutation is reported

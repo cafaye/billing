@@ -20,13 +20,42 @@
 #
 # THE BASELINE THIS FILE HOLDS
 #
-#   **913 runs, 2598 assertions, 0 failures, 0 errors, 0 skips** — measured on
-#   this branch, with billing-08's hardening, billing-09's race fix and
-#   billing-12's tenant-isolation packet. The numbers below are that line,
-#   asserted.
+#   **950 runs, 2724 assertions, 0 failures, 0 errors, 0 skips** — measured on
+#   this branch, with billing-13's three cross-tenant fixes on top of billing-08's
+#   hardening, billing-09's race fix and billing-12's tenant isolation. The numbers
+#   below are that line, asserted.
 #
-#   master at `e63bb7a` was 763 / 2100, and this packet started from there. The
-#   whole difference, so that a reviewer does not have to reconstruct it:
+# master at `8bbbcec` was 913 / 2598, and **this packet is +37 runs / +126
+# assertions**, so a reviewer does not have to reconstruct it:
+#
+#   - **+8 — billing-13's two index tests.** `customer_processor_customer_id_migration_test.rb`
+#     and `plan_processor_price_id_migration_test.rb`, five tests each, in files of
+#     their own because running a migration commits the enclosing transaction.
+#   - **+6 — the `account_mismatch` refusal.** Six tests on the seventh
+#     `Subscriptions::Refused` reason, and the three that matter are the
+#     same-account delivery still being applied, a first delivery not being a
+#     mismatch, and the row changing no column.
+#   - **+5 — the uniqueness API contract.** Three on `Customer`, three on `Plan`,
+#     and the four request tests that a colliding `processor_customer_id` or
+#     `processor_price_id` is a 409 naming the field. **No existing webhook test
+#     broke**; see `REPORT-billing-13-fixes.md`.
+#   - **+8 — the fixture drift-guard** in `test/coverage/`, and the four
+#     request/model tests that pinned the helper change it guards. The helper
+#     change is the part worth reading about: giving the helpers one `cus_` and one
+#     `price_` between them was an F2/F3 collision, and the two new unique indexes
+#     turned 85 passing tests in one file into 85 errors.
+#   - **+1 — the HTTP edge** for a refused cross-account delivery, in the webhook
+#     tier, which is why that tier's count moved too.
+#   - **+9 — the findings tests, rewritten rather than added to.** billing-12's six
+#     are the same six: same two accounts, same delivery, same `PATCH`, same pair
+#     of plans, with the assertion flipped from "the defect reproduces" to "the
+#     defect is refused". Two of the eight in that file are new, and the six
+#     rewritten ones are not double-counted here.
+#
+# The prior history, for a reader who wants the whole line: master at `e63bb7a` was
+# 763 / 2100, and billing-08, billing-09 and billing-12 took it to 913 / 2598. The
+#   whole difference of that stretch, so that a reviewer does not have to
+#   reconstruct it:
 #
 #   - **+62 runs, +230 assertions — billing-12's tenant isolation.** Four new
 #     files under `test/tenant/` (20 + 18 + 16 + 8 runs, 45 + 55 + 101 + 29
@@ -165,22 +194,24 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # master at e63bb7a was 763 / 2100; this commit is billing-08's hardening,
-  # billing-09's race fix and billing-12's tenant isolation, which together add 150
-  # runs and 498 assertions. The gate asserts 913 runs / 2598 assertions /
-  # 0 failures / 0 errors / 0 skips against this, and every tier below carries its
-  # own count. Raising a number is allowed; lowering one is not.
+  # master at 8bbbcec was 913 / 2598; this commit is billing-13, which fixes the
+  # three cross-tenant defects billing-12 proved: +37 runs and +126 assertions. The
+  # gate asserts 950 runs / 2724 assertions / 0 failures / 0 errors / 0 skips
+  # against this, and every tier below carries its own count. Raising a number is
+  # allowed; lowering one is not.
   #
-  # A note on the itemisation above, so the next packet does not inherit it: the
-  # three per-packet deltas as written sum to 147, not 150, and the two numbers the
-  # header claims for billing-08 (45/99) do not match what its own bullets add up
-  # to. The asserted totals are right — they are what `bin/prime` prints — and it is
-  # the prose above that has drifted. Correcting it is a separate job from raising
-  # the threshold, and this packet only raised. The one place where the drift was
-  # corrected is the webhook step's name, because that file had to be read anyway
-  # to find out what the tier actually asserted.
-  BASELINE_RUNS: '913'
-  BASELINE_ASSERTIONS: '2598'
+  # **The tiers are measured by directory, and that has a consequence worth
+  # knowing before adding a test anywhere.** `test_helper.rb` requires *all* of
+  # `test/support/**/*.rb`, so a `_test.rb` file living in `test/support/` is loaded
+  # into **every** tier that names any other path — the contract tier's 45 runs
+  # became 53, and the webhook tier's 150 became 159, for a file that has nothing
+  # to do with either. billing-13 hit this with its fixture drift-guard and moved
+  # the file to `test/coverage/` to get it out of the glob. **Put a test in the
+  # directory of the thing it tests, not in `test/support/`.** The support directory
+  # is for modules, and a module in it is what every other test file is entitled to
+  # load.
+  BASELINE_RUNS: '950'
+  BASELINE_ASSERTIONS: '2724'
 
 jobs:
   # ------------------------------------------------------------------ shared
@@ -712,7 +743,7 @@ jobs:
           echo "$summary"
           echo "::notice::the contract tier ran against core at $(git -C "$CORE_PATH" rev-parse --short HEAD)"
 
-      - name: tier — the webhook tier, signatures verified for real (162 tests)
+      - name: tier — the webhook tier, signatures verified for real (163 tests)
         # **The highest-value tests in this repository.** A forged amount is
         # believed if this tier is skipped, and a payment processor does not
         # re-send a delivery it has already made, so the failure has no retry to
@@ -767,9 +798,20 @@ jobs:
           # that ends in a comma ("failures,") and every number is bare, so the
           # numbers land in the named variables with nothing to strip.
           read -r runs _r assertions _a failures _f errors _e skips _s <<< "$summary"
-          if [ "$runs" != 162 ] || [ "$assertions" != 390 ] ||
+          # **163 runs / 396 assertions.** billing-13 added one test to
+          # `stripe_webhook_test.rb` — a cross-account delivery is refused and the
+          # endpoint still answers 200 — which is the +1 run and the +6 assertions
+          # over master's 162 / 390.
+          #
+          # **The list below names four files and the count is five files' worth**,
+          # because `concurrent_delivery_test.rb` reaches this tier through
+          # `test_helper.rb` requiring all of `test/support/**` rather than by being
+          # listed. Measured both ways on this branch: the four listed files alone are
+          # 151 runs / 368 assertions, and the five are 163 / 396. The number that
+          # gates is the five.
+          if [ "$runs" != 163 ] || [ "$assertions" != 396 ] ||
              [ "$failures" != 0 ] || [ "$errors" != 0 ] || [ "$skips" != 0 ]; then
-            echo "::error::expected 162 runs, 390 assertions, 0 failures, 0 errors, 0 skips; got '$summary'." >&2
+            echo "::error::expected 163 runs, 396 assertions, 0 failures, 0 errors, 0 skips; got '$summary'." >&2
             exit 1
           fi
           echo "$summary"
@@ -891,7 +933,7 @@ jobs:
             echo
             whole="${BASELINE_RUNS} runs / ${BASELINE_ASSERTIONS} assertions / 0 skipped"
             contract="45 runs / 400 assertions / 0 skipped"
-            webhook="147 runs / 352 assertions / 0 skipped"
+            webhook="163 runs / 396 assertions / 0 skipped"
             coverage="5 runs / 11 assertions / 0 skipped"
             echo "| tier | asserted | checked by |"
             echo "|---|---|---|"

@@ -20,6 +20,12 @@ require "test_helper"
 # dies mid-way leaves neither. That is asserted here by rolling the transaction
 # back at the emission, and the row is checked to be gone with it.
 class Subscriptions::LifecycleTest < ActiveSupport::TestCase
+  # The two accounts the cross-account cases compare. The same `1111…`/`2222…`
+  # pair `test/support/two_accounts.rb` uses, written out rather than referenced so
+  # this file does not depend on a module whose other members are the tenant
+  # specs' business — and so a reader sees the two uuids rather than a name.
+  OTHER_ACCOUNT = "22222222-2222-4222-8222-222222222222".freeze
+
   setup do
     travel_to(frozen_now)
     @customer = create_customer
@@ -118,6 +124,80 @@ class Subscriptions::LifecycleTest < ActiveSupport::TestCase
 
     assert_equal 0, Subscription.count
     assert_equal "ignored:unknown_plan", record.error
+  end
+
+  # ## A delivery may not move a subscription to another account
+  #
+  # `apply` writes `account_id: customer.owner_id` and, before billing-13, never
+  # compared it to the account already on the row. A second delivery naming a
+  # different customer therefore reassigned a live subscription between accounts
+  # and published the move as `billing.subscription.updated`.
+  #
+  # **The model could not catch it, and that is the reason the guard belongs in
+  # the one place that writes.** `Subscription#account_is_the_customers_owner`
+  # enforces "a subscription's account is its customer's" — and after a
+  # reassignment that is *true*, because the new account genuinely belongs to the
+  # new customer. The rule has no opinion about the account **changing**, so the
+  # write was internally consistent and cross-tenant at the same time.
+  test "a delivery naming a customer on another account is recorded and refused" do
+    setup_subscription(status: "active")
+    other = create_customer(account_id: OTHER_ACCOUNT)
+
+    record = apply("customer.subscription.updated", customer: other)
+
+    assert_equal "ignored:account_mismatch", record.error
+  end
+
+  test "a delivery naming a customer on another account changes no column" do
+    setup_subscription(status: "active")
+    before = Subscription.sole.attributes
+    other = create_customer(account_id: OTHER_ACCOUNT)
+
+    apply("customer.subscription.updated", customer: other)
+
+    assert_equal before, Subscription.sole.reload.attributes
+  end
+
+  test "a delivery naming a customer on another account publishes nothing" do
+    setup_subscription(status: "active")
+    before = events.pluck(:event_type)
+    other = create_customer(account_id: OTHER_ACCOUNT)
+
+    apply("customer.subscription.updated", customer: other)
+
+    # Silence is half the fix. A refusal that still emitted would be a
+    # reassignment to every consumer downstream, whatever the row says.
+    assert_equal before, events.pluck(:event_type)
+  end
+
+  # The guard reads `existed && !same_account?(subscription)`, and the `existed`
+  # half is load-bearing rather than defensive. A **creation** has no account to
+  # disagree with — which is the whole of the deletion-arriving-before-its-creation
+  # rule, where a delivery whose row does not exist still creates a `canceled` row
+  # because it is the only statement about that subscription that has arrived. An
+  # unconditional comparison would have refused that delivery and dropped it.
+  test "a first delivery is not an account mismatch, because there is no account yet to disagree with" do
+    other = create_customer(account_id: OTHER_ACCOUNT)
+
+    record = apply("customer.subscription.created", customer: other)
+
+    assert_nil record.error
+    assert_equal OTHER_ACCOUNT, Subscription.sole.account_id,
+      "a subscription created for a customer is billed to that customer's own account"
+  end
+
+  # The other direction, and the one that matters for not breaking the service: an
+  # ordinary update names the account the row is already on. Refusing that would
+  # stop the lifecycle working for every subscriber, and it is the failure mode a
+  # comparison like this invites.
+  test "a delivery naming the account the row is already on is applied, not refused" do
+    setup_subscription(status: "active")
+
+    record = apply("customer.subscription.updated", status: "past_due", customer: @customer)
+
+    assert_nil record.error
+    assert_equal "past_due", Subscription.sole.status,
+      "the same account arriving again must not be mistaken for a cross-account delivery"
   end
 
   # A status this service does not model is refused rather than coerced. A row that
@@ -803,6 +883,15 @@ class Subscriptions::LifecycleTest < ActiveSupport::TestCase
         subscription.dig("items", "data", 0)["price"]["id"] = overrides[:price_id]
       end
 
+      if (customer = overrides[:customer])
+        # **Both** halves of the customer reference, because
+        # `Lifecycle#customer` consults both and consults the cafaye one first. A
+        # body naming the other account's `cus_` while its metadata still named
+        # this account's row would resolve here, and the case would prove nothing.
+        subscription["customer"] = customer.processor_customer_id
+        subscription["metadata"] = { "cafaye_customer_id" => customer.id }
+      end
+
       body
     end
 
@@ -816,12 +905,22 @@ class Subscriptions::LifecycleTest < ActiveSupport::TestCase
       )
     end
 
+    # **A distinct `cus_` per customer.** The first one keeps the committed
+    # fixture's id, because every spec here ingests a subscription fixture that
+    # carries it and the lifecycle resolves the customer through it. The
+    # cross-account cases build a second customer, and before billing-13 this
+    # helper handed it the same id — an F2 collision, which the new unique index
+    # turned into a `RecordInvalid` in the middle of the test rather than at the
+    # assertion that was about it.
     def create_customer(account_id: "11111111-1111-4111-8111-111111111111")
+      @customers_created = (@customers_created || 0) + 1
+      fixture_id = "cus_R1pQKz9xLp2mN4vB6yH8jL0"
+
       Customer.create!(
         owner_type: "Account",
         owner_id: account_id,
         processor: "stripe",
-        processor_customer_id: "cus_R1pQKz9xLp2mN4vB6yH8jL0"
+        processor_customer_id: @customers_created == 1 ? fixture_id : "cus_FAKEother#{format('%016d', @customers_created)}"
       )
     end
 

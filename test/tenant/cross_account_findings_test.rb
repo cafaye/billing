@@ -1,74 +1,82 @@
 require "test_helper"
 
-# Three cross-tenant defects this packet found, pinned as findings.
+# Three cross-tenant defects billing-12 found, and the three refusals that close
+# them.
 #
-# ## Why findings live in a test file and not only in a report
+# ## What changed in this file, and why it is the same file
 #
-# A finding written only in prose is a finding that rots. Each of the three
-# below is asserted here as a **green test that says precisely what is true** —
-# the repository's own rule, and the reason it matters here specifically: a red
-# test advertising a known hole is how a suite starts being ignored, and a red
-# test that fails is a test somebody will delete to make the build green.
+# billing-12 wrote these six tests to **document** F1, F2 and F3: each asserted
+# that the defect was present, coupled itself to the thing that would remove it,
+# and said in its own failure message that landing the fix should turn it red with
+# an instruction to delete it. That was the right shape for a packet that reports
+# findings, and it is why every one of them went red the moment
+# `REPORT-billing-13-fixes.md`'s work landed.
 #
-# So each test asserts the defect is *present*, and couples itself to the thing
-# that would remove it. The direction of the failure is the important half:
+# They are **replaced rather than deleted**, and they are the same tests: the same
+# two accounts from `test/support/two_accounts.rb`, the same
+# `customer.subscription.updated` delivery naming the other account's customer,
+# the same `PATCH` on a caller's own row carrying a victim's `cus_`, the same pair
+# of plans charging different amounts. **The setup is untouched. Only the
+# assertion changed** — from "the row moved" to "the row did not move, and here is
+# the refusal that stopped it".
 #
-#   * **F1** fails the moment `Lifecycle` compares the resolved account with the
-#     account already on the row — the fix, and the only sensible one.
-#   * **F2** and **F3** fail the moment a unique index lands on the column. A
-#     unique index with a `WHERE` clause is the natural fix and would also permit
-#     it, since these columns are nullable and many rows legitimately are.
+# That is deliberate and it is the point. A test that proved the defect could not
+# have been written from scratch after the fix without re-deciding what the
+# defect was, and the risk of quietly proving something easier is exactly what a
+# regression test is supposed to remove.
 #
-# A test that goes red when the defect is fixed is a **tripwire for the fix**, and
-# that is the point. It is deliberately *not* a test that goes red when the defect
-# is present, and it is not a test that would pass after the fix — each of these
-# is a test to be **deleted and replaced** by the scoping work, and each says so
-# in its own failure message.
+# The names change, because a test called "a delivery naming a different customer
+# moves the subscription between accounts" that asserts it did **not** is a lie in
+# the name, and the next person to read it would believe the first half. The
+# `F1`/`F2`/`F3` prefix is kept, so `declared_finding_labels` below still derives
+# the three findings from the file rather than from a constant.
 #
-# ## The chain, and why F2 is worse than F1
+# ## Where each fix actually lives, and what is therefore *not* here
 #
-# `Lifecycle#apply` writes `account_id: customer.owner_id` without ever comparing
-# it to the account already on the row it is updating. That is F1.
+#   * **F1** is a comparison in `Subscriptions::Lifecycle#apply`, raising
+#     `Subscriptions::Refused` with the seventh reason, `account_mismatch`. The
+#     delivery row carries `ignored:account_mismatch` and the endpoint answers
+#     200 — a refusal is a decision, not an error. The 200 is asserted over the
+#     HTTP edge in `test/integration/stripe_webhook_test.rb`, where the signing
+#     path lives; here the assertions are about what happened to the row.
+#   * **F2** and **F3** are unique indexes,
+#     `customers_processor_customer_id_idx` and `plans_processor_price_id_idx`,
+#     plus the model validations that turn a violation into a named 409.
 #
-# On its own, F1 needs a delivery whose resolved customer disagrees with the
-# subscription's existing row, and a well-behaved processor does not send that —
-# one `sub_` has one `cus_`. **F2 is what makes F1 reachable through this
-# service's own public surface:** `customers.processor_customer_id` is not unique,
-# `POST`/`PATCH /v1/customers` both permit it, and `Lifecycle#customer` resolves it
-# with `find_by`. So a caller can point their *own* customer row at a victim's
-# `cus_` id, and from then on a delivery about the victim's subscription resolves
-# to the caller's row — and F1 does the rest.
-#
-# F3 is the same shape one table over, on `plans.processor_price_id`, and it is
-# about correctness rather than tenancy: a subscription is billed against whichever
-# plan claimed the price id, so a customer can end up on a plan nobody sold them.
+# **The indexes are not proved here.** These tests run inside a transaction, and a
+# `PG::UniqueViolation` aborts it — so a test that tried to show the *index*
+# refusing would poison every assertion after it. That is what the two migration
+# tests are for (`test/models/customer_processor_customer_id_migration_test.rb`,
+# `test/models/plan_processor_price_id_migration_test.rb`), in files of their own
+# because running a migration commits the enclosing transaction. This file proves
+# the **API contract**: a caller who tries gets a refusal, and a refusal names the
+# field.
 class TenantCrossAccountFindingsTest < ActionDispatch::IntegrationTest
   setup do
     travel_to(frozen_now)
   end
 
-  # --- F1: a delivery moves a subscription between accounts -----------------
+  # --- F1: a delivery naming another account is refused -----------------------
 
-  # **The finding.** `Subscriptions::Lifecycle#apply` resolves a customer from the
-  # delivery and then writes `account_id: customer.owner_id` onto the row it is
-  # updating — with no comparison against the account already there. A second
-  # delivery that resolves a *different* customer therefore reassigns a live
-  # subscription from one account to another, and publishes the move as
-  # `billing.subscription.updated`.
+  # **The refusal.** `Subscriptions::Lifecycle#apply` now compares the account the
+  # delivery resolves to against the account already on the row, and refuses
+  # before `assign_attributes` overwrites it.
   #
-  # **Why it is not caught by the model.** `Subscription#account_is_the_customers_owner`
-  # does compare an account against a customer, and it is the only such check in
-  # the service. It holds here too — the write *is* internally consistent, the new
-  # account belongs to the new customer. What it cannot see is that the account
-  # changed, because the rule it enforces is "a subscription's account is its
-  # customer's", not "a subscription's account does not move".
+  # **Why the model could not catch it, which is the reason this was a finding.**
+  # `Subscription#account_is_the_customers_owner` does compare an account against
+  # a customer, and it is the only such check in the service. It passed: the new
+  # account really does belong to the new customer, so the write was internally
+  # consistent. What it cannot see is that the account **changed**, because the
+  # rule it enforces is "a subscription's account is its customer's" and not "a
+  # subscription's account does not move". The comparison had to be added to the
+  # only writer, which is `Lifecycle`.
   #
-  # **What it costs.** The first account loses the subscription and everything
-  # `grants_entitlements?` derives from it, the second gains one it never bought,
-  # and the `billing.subscription.updated` event carries the new account — so a
-  # consumer counting plan changes, or reading a timeline of an account's billing,
-  # is told this was always the arrangement.
-  test "F1: a delivery naming a different customer moves the subscription between accounts" do
+  # **Asserted as the refusal and not only as an absence.** Four facts, and each
+  # of them is a way the defect used to be observable: the row is byte-identical,
+  # it still belongs to the account that paid, the delivery row records *which*
+  # reason, and nothing was published. A guard that stopped the write but still
+  # published an update would pass the first two and fail the fourth.
+  test "F1: a delivery naming a different customer is refused and the subscription does not move" do
     create_account_customers
     shared_plan
 
@@ -77,36 +85,57 @@ class TenantCrossAccountFindingsTest < ActionDispatch::IntegrationTest
     assert_equal ACCOUNT_A, row.account_id, "the first delivery should have billed account A"
 
     before = fingerprint([ row ])
+    # The events that legitimately exist before the refused delivery. Compared
+    # rather than asserted empty, because the **first** delivery is supposed to
+    # have published `billing.subscription.started` for this very row: a test that
+    # asserted "no events" would be asserting that the first delivery did nothing,
+    # which is a different bug and not this one.
+    events_before = subscription_events_for(row)
 
     # The second delivery names account B's customer for the subscription id that
     # account A holds. A processor does not do this; a processor *dashboard* does,
-    # and so does F2 below.
-    deliver_subscription_updated(subscription_id: SUBSCRIPTION_A, customer: customer_b, event_id: "evt_FAKEfind2")
+    # and so does the F2 collision below, which is what made this reachable
+    # through this service's own surface.
+    record = deliver_subscription_updated(subscription_id: SUBSCRIPTION_A, customer: customer_b, event_id: "evt_FAKEfind2")
+
+    assert_equal "ignored:account_mismatch", record.error,
+      "the delivery row must record the refusal and say which one. A different reason means " \
+      "the delivery was refused for something other than the account, and F1's guard is not " \
+      "what stopped it — check the ordering against `stale_delivery` and the state machine."
 
     row.reload
-    assert_equal [ row.id ], drifted_ids(before, [ row ]),
-      "the row did not change, so F1 no longer reproduces. The fix is to compare the " \
-      "resolved account against the account already on the row and refuse a change; " \
-      "delete this finding and replace it with the refusal's test."
-    assert_equal ACCOUNT_B, row.account_id,
-      "the subscription now belongs to the account its second delivery named. " \
-      "F1 has been fixed; delete this finding."
-    assert_equal customer_b.id, row.customer_id
+    assert_empty drifted_ids(before, [ row ]),
+      "the row changed, so the subscription moved between accounts. The guard in " \
+      "`Lifecycle#apply` compares the resolved account with the one already on the row and " \
+      "refuses; nothing may be written before that comparison."
+    assert_equal ACCOUNT_A, row.account_id,
+      "the subscription no longer belongs to the account that paid for it"
+    assert_equal customer_a.id, row.customer_id,
+      "the subscription now points at the customer the second delivery named"
 
-    # And it is published, not just written: a consumer is told.
-    event = OutboxEvent.find_by!(subject: row.id, event_type: "billing.subscription.updated")
-    assert_equal ACCOUNT_B, event.data.fetch("account_id"),
-      "the reassignment is announced as an update naming the new account. If the event " \
-      "no longer does, F1 has been fixed; delete this finding."
+    # And nothing new was published. The reassignment used to be announced as an
+    # update carrying the new account, so a consumer counting plan changes, or
+    # reading one account's billing timeline, was told this was always the
+    # arrangement. Silence is the whole of the fix here: a refusal that published
+    # an event would still be a reassignment to anybody downstream.
+    assert_equal events_before, subscription_events_for(row),
+      "the refused delivery published an event. A refusal that emits is not a refusal; the " \
+      "lifecycle has to raise before it writes an outbox row."
   end
 
-  # The half that makes F1 a *money* defect rather than a bookkeeping one: the
-  # subscription does not stop working, it starts working for somebody else. The
-  # row stays `live`, so `grants_entitlements?` stays true — which is the point.
-  # **Entitlements are decided by status, and a reassignment does not change the
-  # status**, so a consumer checking "is this subscription active?" sees an active
-  # subscription for an account that never bought one.
-  test "F1: the account that lost the subscription no longer holds it, and the one that gained it never bought it" do
+  # The half that makes F1 a *money* defect rather than a bookkeeping one, and it
+  # is worth stating what changed: before the fix, the subscription did not stop
+  # working — it started working for somebody else. The row stayed `live`, so
+  # `grants_entitlements?` stayed true, which is the point. **Entitlements are
+  # decided by status and a reassignment did not change the status**, so a consumer
+  # asking "is this subscription active?" saw an active subscription for an account
+  # that never paid for one.
+  #
+  # Now the row is still live — which is right, nobody canceled it — and it is live
+  # **for the account that bought it**. Those two facts are the same assertion from
+  # either side of the fix, which is why the comparisons below are unchanged and
+  # only their direction is.
+  test "F1: the account that paid still holds the live subscription, and the one that named it holds nothing" do
     create_account_customers
     shared_plan
 
@@ -117,54 +146,63 @@ class TenantCrossAccountFindingsTest < ActionDispatch::IntegrationTest
     deliver_subscription_updated(subscription_id: SUBSCRIPTION_A, customer: customer_b, event_id: "evt_FAKEfind4")
 
     row.reload
-    assert_empty Subscription.where(account_id: ACCOUNT_A, id: row.id),
-      "account A still holds the subscription it paid for. F1 has been fixed; delete this " \
-      "finding."
-    assert_equal [ row.id ], Subscription.where(account_id: ACCOUNT_B).pluck(:id),
-      "account B does not hold the subscription a delivery named it on. F1 has been fixed; " \
-      "delete this finding."
+    assert_equal [ row.id ], Subscription.where(account_id: ACCOUNT_A).pluck(:id),
+      "the account that paid no longer holds the subscription it paid for"
+    assert_empty Subscription.where(account_id: ACCOUNT_B),
+      "account B holds a subscription a delivery named it on. B never bought one, and B is " \
+      "not going to be billed for one; the guard in `Lifecycle#apply` refuses the delivery " \
+      "before the account is written."
 
-    # Still live, still granting — which is why this is a grant to the wrong account
-    # rather than a lapse.
+    # Still live, still granting — now for the right account. The finding was about
+    # *which account* a live subscription belongs to, so the row's status is
+    # asserted unchanged; if this is false something else wrote the status and the
+    # refusal is not the only thing that changed.
     assert row.grants_entitlements?,
       "the subscription stopped granting. The finding is about *which account* a live " \
       "subscription belongs to, not about whether it is live; if this is false the row's " \
-      "status changed and the finding needs rewriting."
+      "status changed and this test needs rewriting."
   end
 
-  # --- F2: one Stripe customer id, two accounts -----------------------------
+  # --- F2: one Stripe customer id, one customer row ---------------------------
 
-  # **The finding.** `customers.processor_customer_id` carries no unique index, and
-  # `POST /v1/customers` and `PATCH /v1/customers/:id` both permit a client to set
-  # it. So two accounts can each hold a customer row answering to the *same*
-  # `cus_` id, and `Subscriptions::Lifecycle#customer` resolves that id with
-  # `find_by` — no `ORDER BY`, no uniqueness, so which account a delivery lands on
-  # is **not determined by the data**.
+  # **The refusal.** `customers_processor_customer_id_idx` is unique over the
+  # non-null values, and `Customer` carries a matching validation so the collision
+  # is a named answer rather than a raw index violation. `Lifecycle#customer`
+  # resolves a delivery with `find_by` and no `ORDER BY`, so two rows on one `cus_`
+  # made *which account a delivery is billed to* undecided by the data.
   #
-  # The pair matters and is arranged deliberately: with both accounts claiming one
-  # id, a lookup keyed on the id does not error and does not return nothing, it
-  # returns a row and the wrong one. Every id-keyed test in the repository stays
-  # green, which is why this is a finding and not a bug somebody would trip over.
-  test "F2: two accounts can hold customer rows that answer to one Stripe customer id" do
+  # The index itself is proved in
+  # `test/models/customer_processor_customer_id_migration_test.rb`; what is proved
+  # here is that a caller gets a refusal that names the field.
+  test "F2: two accounts can no longer hold customer rows that answer to one Stripe customer id" do
     shared = "cus_FAKEcontestedBBBBBBBBBBBB"
 
     first = Customer.create!(owner_type: "Account", owner_id: ACCOUNT_A, processor: "stripe", processor_customer_id: shared)
-    second = Customer.create!(owner_type: "Account", owner_id: ACCOUNT_B, processor: "stripe", processor_customer_id: shared)
+    second = contested_customer(ACCOUNT_B, shared)
 
-    assert_equal 2, Customer.where(processor_customer_id: shared).count,
-      "the two accounts no longer share the id. A unique index has landed on " \
-      "`customers.processor_customer_id`; F2 is fixed — delete this finding and keep the " \
-      "index test."
-    assert_equal [ ACCOUNT_A, ACCOUNT_B ], [ first.owner_id, second.owner_id ].sort,
-      "the two rows must belong to different accounts, or the collision proves nothing"
+    assert_equal 1, Customer.where(processor_customer_id: shared).count,
+      "two accounts hold the id again. `customers_processor_customer_id_idx` is unique over " \
+      "the non-null values and `Customer` validates it; a second row means one of the two is gone."
+    assert_equal ACCOUNT_A, first.owner_id, "the first row must have been written, or this proves nothing"
+    refute_predicate second, :persisted?
+    assert second.errors.of_kind?(:processor_customer_id, :taken),
+      "the refusal must name `processor_customer_id` and say it is taken, so the 409 tells a " \
+      "client which field collided. Got: #{second.errors.full_messages.join('; ')}"
+    assert_equal [ ACCOUNT_A, ACCOUNT_B ], [ first.owner_id, ACCOUNT_B ].sort,
+      "the two rows must have been aimed at different accounts, or the collision proves nothing"
   end
 
-  # F2 is reachable through this service's own surface, which is what separates it
-  # from a theoretical one. The claim is a `PATCH` on a caller's **own** row —
-  # `CustomerUpdate` permits `processor_customer_id`, and `owner`/`processor` are
-  # the fields that are *not* updatable, so this is the one identifier a client can
-  # move. A victim id is then copied onto the caller's row.
-  test "F2: a client can point its own customer row at another account's Stripe customer id" do
+  # F2 was reachable through this service's own surface, and that is what
+  # separated it from a theoretical one: `CustomerUpdate` closes `owner` and
+  # `processor` — the columns the existing `(owner_type, owner_id, processor)`
+  # index is built on — and permits `processor_customer_id`, making that one column
+  # the whole attack surface. A `PATCH` on a caller's **own** row copied a
+  # victim's `cus_` onto it.
+  #
+  # The answer is a 409 and the caller's row is untouched. Both halves matter: a
+  # 409 with the write half-applied would be a different bug, and a silent 200
+  # that ignored the field would leave the client believing it had moved.
+  test "F2: a client can no longer point its own customer row at another account's Stripe customer id" do
     victim = Customer.create!(
       owner_type: "Account", owner_id: ACCOUNT_B, processor: "stripe",
       processor_customer_id: "cus_FAKEvictimBBBBBBBBBBBBB"
@@ -173,67 +211,91 @@ class TenantCrossAccountFindingsTest < ActionDispatch::IntegrationTest
       owner_type: "Account", owner_id: ACCOUNT_A, processor: "stripe",
       processor_customer_id: "cus_FAKEattackerAAAAAAAAA"
     )
+    before = fingerprint([ attacker ])
 
     patch "/v1/customers/#{attacker.id}", params: { processor_customer_id: victim.processor_customer_id }, as: :json
 
-    assert_response :ok
-    assert_equal 2, Customer.where(processor_customer_id: victim.processor_customer_id).count,
-      "the claim was not accepted, so the two rows no longer collide. F2 is not reachable " \
-      "through the public surface any more; delete this finding and assert the refusal."
-    assert_equal victim.processor_customer_id, attacker.reload.processor_customer_id
+    assert_response :conflict,
+      "the PATCH was not refused. `processor_customer_id` is unique, so claiming another " \
+      "account's `cus_` is a 409 — the request was well-formed and it collides."
+    assert_equal 1, Customer.where(processor_customer_id: victim.processor_customer_id).count,
+      "two rows answer to the victim's `cus_`. A validation that refuses a `save` is not a " \
+      "lock; the index is what holds under concurrency, and both are required."
+    assert_empty drifted_ids(before, [ attacker ]),
+      "the caller's own row changed even though the request was refused. A 409 that half-wrote " \
+      "the row would leave the caller holding an id it was not given."
+    assert_equal "cus_FAKEattackerAAAAAAAAA", attacker.reload.processor_customer_id,
+      "the refused field was written anyway"
   end
 
-  # The resolution itself, and the reason the *outcome* is not asserted: with two
-  # rows matching, `find_by` returns one of them and which one is not decided by
-  # the data. Asserting a specific account here would be a flake waiting for a
-  # different plan on a different day — and the ambiguity is the finding, so what
-  # is asserted is the ambiguity and the two candidates.
-  test "F2: the resolution is ambiguous, and the outcome is not decided by the data" do
+  # The flip of the test that used to assert the ambiguity. billing-12 pinned the
+  # two candidates and that `find_by` returns one of them, and **deliberately did
+  # not assert which** — asserting it would be a test of PostgreSQL's mood, and
+  # the ambiguity *was* the finding.
+  #
+  # There is no longer anything to be ambiguous about, so the strongest available
+  # statement is the one that could not be made before: **the resolution is
+  # single-valued**. The same `find_by`, the same pair of accounts, and it now has
+  # one answer that the data decides — because the second claimant cannot be
+  # written. The equality at the end is the assertion the old test declined to
+  # make, and the index is what makes it safe to make.
+  test "F2: the resolution is no longer ambiguous, because the second claimant cannot be written" do
     shared = "cus_FAKEambiguousBBBBBBBBBBBBB"
-    { "a" => ACCOUNT_A, "b" => ACCOUNT_B }.each_value do |account|
-      Customer.create!(owner_type: "Account", owner_id: account, processor: "stripe", processor_customer_id: shared)
-    end
+    written = { "a" => contested_customer(ACCOUNT_A, shared), "b" => contested_customer(ACCOUNT_B, shared) }
 
-    candidates = Customer.where(processor_customer_id: shared).pluck(:owner_id).sort
+    claimants = Customer.where(processor_customer_id: shared).pluck(:owner_id)
     resolved = Customer.find_by(processor_customer_id: shared)
 
-    assert_equal [ ACCOUNT_A, ACCOUNT_B ], candidates,
-      "the two candidate accounts are gone; a unique index has landed and F2 is fixed"
-    assert_includes candidates, resolved.owner_id,
-      "`find_by` returned a row that is not one of the two claimants, which would be a " \
-      "third defect rather than this one"
-    assert_predicate resolved, :present?,
-      "`find_by` returned nothing at all, which is `unknown_customer` and not this finding"
+    # Exactly one of the two writes was accepted. Which one is the data's business
+    # and this test does not say — the old version of this test declined to, and
+    # was right to: the point is that there is one answer, not which it is.
+    assert_equal 1, written.values.count(&:persisted?),
+      "the two writes did not resolve to one winner and one refusal, so the collision is not " \
+      "what it was arranged to be. Exactly one row may claim a `cus_`."
+    assert_equal 1, claimants.size,
+      "#{claimants.size} rows answer to the id, so the resolution is still a coin toss. The " \
+      "index is unique over the non-null values; only one of these two rows can exist."
+    assert_predicate resolved, :present?, "`find_by` returned nothing, which is `unknown_customer` and not this test"
+    assert_equal claimants.sole, resolved.owner_id,
+      "`find_by` returned a row that is not the only claimant, which would be a third defect"
   end
 
-  # --- F3: one Stripe price id, two plans -----------------------------------
+  # --- F3: one Stripe price id, one plan --------------------------------------
 
-  # **The finding.** The same shape on `plans.processor_price_id`: no unique index,
-  # `POST`/`PATCH /v1/plans` both permit it, and
-  # `Subscriptions::Lifecycle#plan` resolves it with `find_by`. A subscription is
-  # then billed against whichever plan claimed the id.
+  # **The refusal.** The same shape one table over. A plan is catalogue and the
+  # catalogue is shared on purpose, so this one is a correctness defect rather than
+  # a tenancy one — and the consequence is worse than a lookup landing on the
+  # wrong row. The two plans charge **different amounts**, so a subscription
+  # billed against whichever one claimed the id is billed at a price this service
+  # never agreed to with the customer, and `billing.subscription.started` carries
+  # that plan's `currency` and nothing about the one that was intended. The wrong
+  # amount is not only charged but published.
   #
-  # This one is a correctness defect rather than a tenancy one — a plan is
-  # catalogue, and the catalogue is shared on purpose — but the consequence is the
-  # same shape: a customer's subscription lands on a plan they were not sold, at a
-  # price this service did not agree with them, and `billing.subscription.started`
-  # carries that plan's `currency` and nothing about the one that was intended.
-  test "F3: two plans can claim one Stripe price id, and a delivery resolves to one of them" do
+  # The index is proved in
+  # `test/models/plan_processor_price_id_migration_test.rb`; the amount difference
+  # is asserted here so the reason this is a money defect stays visible rather than
+  # becoming "a lookup might be wrong".
+  test "F3: two plans can no longer claim one Stripe price id" do
     shared = "price_FAKEcontestedAAAAAAAAAA"
 
     first = create_stripe_plan(processor_price_id: shared, price: Money.new(1_900, "USD"))
-    second = create_stripe_plan(processor_price_id: shared, price: Money.new(49_000, "USD"))
+    second = contested_plan(shared, Money.new(49_000, "USD"))
 
-    assert_equal 2, Plan.where(processor_price_id: shared).count,
-      "the two plans no longer share the price id. A unique index has landed on " \
-      "`plans.processor_price_id`; F3 is fixed — delete this finding."
     refute_equal first.amount_cents, second.amount_cents,
-      "the two plans must charge different amounts, or resolving to the wrong one is not " \
-      "a pricing defect"
-    assert_includes Plan.where(processor_price_id: shared).pluck(:id), Plan.find_by(processor_price_id: shared).id
+      "the two plans must charge different amounts, or a collision would be a cosmetic " \
+      "lookup problem rather than a pricing one"
+    assert_equal 1, Plan.where(processor_price_id: shared).count,
+      "two plans share the price id again. `plans_processor_price_id_idx` is unique over the " \
+      "non-null values and `Plan` validates it; a second row means one of the two is gone."
+    assert_equal [ first.id ], Plan.where(processor_price_id: shared).pluck(:id),
+      "the plan that claimed the id changed, so the collision resolved to the wrong one"
+    refute_predicate second, :persisted?
+    assert second.errors.of_kind?(:processor_price_id, :taken),
+      "the refusal must name `processor_price_id` and say it is taken, so the 409 tells a " \
+      "client which field collided. Got: #{second.errors.full_messages.join('; ')}"
   end
 
-  # --- what these three are not ---------------------------------------------
+  # --- what these three are, now that they are fixed -------------------------
 
   # The three findings are about the **delivery** path, where this service resolves
   # a row from an identifier a third party controls. They are not about the
@@ -241,50 +303,99 @@ class TenantCrossAccountFindingsTest < ActionDispatch::IntegrationTest
   # `(account_id, plan_id)` and `(owner_type, owner_id, processor)` both hold
   # today, and `cross_account_delivery_test.rb` proves each one behaviourally.
   #
-  # So the count of account-scoped constraints that hold is 2, and the count of
-  # resolution keys that are ambiguous is 2. Asserted together, because "2 and 2"
-  # read as a coincidence unless the two are named.
-  test "meta: two account-scoped constraints hold, and two resolution keys are ambiguous" do
-    create_ambiguous_resolution_keys
+  # The shape of this assertion is deliberately the **inverse** of the one it
+  # replaces. It used to pin that two resolution keys were ambiguous — a count that
+  # had to drop to zero — which is a tripwire for the fix. It now pins that **no**
+  # resolution key is ambiguous, which is a tripwire for the *unfixing*: drop
+  # `customers_processor_customer_id_idx` and the count goes back up and this fails
+  # by name. A guard that can only be tripped in one direction is a test of a
+  # moment rather than of a property.
+  test "meta: no resolution key is ambiguous, and the two indexes are what say so" do
+    attempt_ambiguous_resolution_keys
 
-    assert_equal %w[customers plans], ambiguous_resolution_keys.keys.sort,
-      "the ambiguous resolution keys changed. A new one is a fourth finding; an index " \
-      "removed one is a fix, and the report must be corrected."
-    assert_equal 0, account_scoped_queries,
-      "account scoping landed, so the report's characterisation of this surface is wrong."
+    assert_empty ambiguous_resolution_keys,
+      "a delivery can again resolve a row ambiguously. The unique indexes over " \
+      "`customers.processor_customer_id` and `plans.processor_price_id` are the fix; one of " \
+      "them has been dropped, and `REPORT-billing-13-fixes.md` has to be corrected."
+
+    # The indexes are asserted **here** rather than in the two migration tests, and
+    # the placement is the point.
+    #
+    # The migration tests have to *rebuild* the index — they roll it back and up to
+    # prove the `down` works — so any assertion in them about the index's shape
+    # would be reading an index the file had just created itself. A mutation
+    # proved it: with a non-unique index in place, `test "the index is unique"`
+    # inside the migration file still passed, because whichever test ran first had
+    # already restored the right one and the file's teardown repaired the table
+    # before the assertion read it. **This file observes and never repairs**, so
+    # what it reads is what the database actually has.
+    assert_equal [ "customers_processor_customer_id_idx", "plans_processor_price_id_idx" ],
+      unique_processor_id_indexes, "the uniqueness that closes F2 and F3 is not on the table"
   end
 
-  # The three findings are reported, not fixed, in this packet. `Lifecycle` is the
-  # only writer of subscription state and adding a guard to it is a behavioural
-  # change to money; a unique index is a migration. Both are named in the report as
-  # the next packet's work. This asserts the packet did not fix them **quietly** —
-  # a fix that landed without the finding being retired would leave the report
-  # describing a defect that no longer exists.
-  test "meta: the three findings are reported rather than fixed, and their counts are pinned" do
-    create_ambiguous_resolution_keys
+  # The findings are **fixed** in this packet, and this asserts that in the
+  # direction that matters: that the file still names the same three findings, that
+  # each has its reproductions, and that the fix for F1 is on the class rather than
+  # somewhere a reader would not look.
+  #
+  # billing-12's version of this test asserted they were *not* fixed, so that a fix
+  # landing quietly would leave the report describing a defect that no longer
+  # exists. That concern still holds and the assertion is still here — the label set
+  # and the test count are pinned, so a finding quietly dropped from this file
+  # fails rather than passing unnoticed.
+  test "meta: the three findings are still named, still reproduced, and F1's guard is on the lifecycle" do
+    attempt_ambiguous_resolution_keys
 
     assert_equal %w[F1 F2 F3], declared_finding_labels,
-      "the set of findings changed. A new label is a fourth finding to report; a missing " \
-      "one means a finding was fixed and the report must say so."
+      "the set of findings changed. A new label is a fourth finding to report; a missing one " \
+      "means a finding was dropped from this file, and `REPORT-billing-13-fixes.md` must say so."
     assert_equal 6, declared_finding_tests.size,
       "the number of tests reproducing a finding changed. F1 and F2 each take more than one " \
       "because each needed the consequence proven as well as the mechanism."
-    assert_equal 2, ambiguous_resolution_keys.size
+    assert_equal "account_mismatch", Subscriptions::Lifecycle::ACCOUNT_REASON,
+      "the refusal reason F1 records on the delivery row changed. It is the seventh reason and " \
+      "part of this service's contract — it is what a human reads on `processor_webhooks.error`."
   end
 
   private
-    # Both ambiguous resolutions, arranged. A helper that reads the database for
-    # ambiguity cannot arrange it, so the two collisions are created here and
-    # `ambiguous_resolution_keys` reads the result back.
-    def create_ambiguous_resolution_keys
-      [ ACCOUNT_A, ACCOUNT_B ].each do |account|
-        Customer.create!(
-          owner_type: "Account", owner_id: account, processor: "stripe",
-          processor_customer_id: "cus_FAKEambiguousBBBBBBBBBBBBB"
-        )
-      end
+    # Both collisions, **attempted**. A helper that reads the database for
+    # ambiguity cannot arrange it any more — that was always the awkward part of
+    # asserting a finding, and it is why this now attempts the writes and lets the
+    # refusals happen. Nothing is rescued: a collision that is *accepted* is the
+    # failure, and the assertions above read the result.
+    def attempt_ambiguous_resolution_keys
+      [ ACCOUNT_A, ACCOUNT_B ].each { |account| contested_customer(account, "cus_FAKEambiguousBBBBBBBBBBBBB") }
       create_stripe_plan(processor_price_id: "price_FAKEambiguousAAAAAAAAA", price: Money.new(1_900, "USD"))
-      create_stripe_plan(processor_price_id: "price_FAKEambiguousAAAAAAAAA", price: Money.new(49_000, "USD"))
+      contested_plan("price_FAKEambiguousAAAAAAAAA", Money.new(49_000, "USD"))
+    end
+
+    # A customer row **aimed at** an id another row already holds, with the write
+    # attempted.
+    #
+    # `create!` would raise before the assertions ran, and a test that has to
+    # rescue its own setup to check that the setup was refused is a test whose
+    # failure is an exception rather than a message — so the record is saved
+    # rather than saved-and-bang, and the caller reads `persisted?` and `errors`.
+    # The distinction matters: `refute_predicate record, :persisted?` is a claim
+    # about the database, and a raised `RecordInvalid` would have proved nothing
+    # about whether the row is there.
+    def contested_customer(account_id, processor_customer_id)
+      Customer.new(
+        owner_type: "Account", owner_id: account_id, processor: "stripe",
+        processor_customer_id: processor_customer_id
+      ).tap(&:save)
+    end
+
+    def contested_plan(processor_price_id, price)
+      @contested_plans = @contested_plans.to_i + 1
+
+      Plan.new(
+        name: "Contested #{@contested_plans}",
+        slug: "contested-#{@contested_plans}",
+        price: price,
+        interval: "month",
+        processor_price_id: processor_price_id
+      ).tap(&:save)
     end
 
     # The tests whose name names a finding. Counted so the report's "three findings,
@@ -302,12 +413,35 @@ class TenantCrossAccountFindingsTest < ActionDispatch::IntegrationTest
       declared_finding_tests.map { |method| method.to_s[/\Atest_(F\d):/, 1] }.uniq.sort
     end
 
-    # The columns a delivery resolves a tenant row by, which have no uniqueness.
+    # The columns a delivery resolves a tenant row by, keyed by table — a column
+    # that currently has more than one claimant for some value.
+    #
+    # The `group … having` is the honest way to ask it, and it is worth saying why
+    # this is not just "count the rows": the question is whether *any* value is
+    # claimed twice, which is a question about the whole column and not about one
+    # fixture's id. With the unique indexes in place this is provably empty — which
+    # is exactly why the indexes are also asserted by name in the test above.
     def ambiguous_resolution_keys
       ambiguous = {}
       ambiguous["customers"] = 2 if Customer.where.not(processor_customer_id: nil).group(:processor_customer_id).having("count(*) > 1").any?
       ambiguous["plans"] = 2 if Plan.where.not(processor_price_id: nil).group(:processor_price_id).having("count(*) > 1").any?
       ambiguous
+    end
+
+    # The unique indexes, read from the database rather than from `schema.rb` — the
+    # same reason the matrix test derives its enumeration: a test that reads the
+    # committed schema file is a test of a comment.
+    #
+    # **`unique` is part of the filter on purpose.** A plain index over the column
+    # would be invisible here, so a drop to a non-unique index — the one mutation
+    # that would leave the rule documented and unenforced — fails this assertion by
+    # name rather than passing because the index is technically there.
+    def unique_processor_id_indexes
+      %w[customers plans].flat_map { |table|
+        ActiveRecord::Base.connection.indexes(table)
+          .select { |index| index.unique && index.columns.size == 1 && index.columns.first.start_with?("processor_") }
+          .map(&:name)
+      }.sort
     end
 
     def account_scoped_queries
@@ -340,7 +474,10 @@ class TenantCrossAccountFindingsTest < ActionDispatch::IntegrationTest
     # (`stale_delivery`). A second delivery at the *same* processor timestamp is
     # not stale — epoch seconds are coarse — but it would then be refused as
     # `no_change_to_record` if the two deliveries agreed about everything, and the
-    # findings here are about a delivery that disagrees.
+    # finding here is a delivery that disagrees. It is also *not* the ordering that
+    # lets F1's guard fire first: the account comparison happens after the machine
+    # and the stale check, so a test that relied on their order would be testing
+    # the order rather than the account.
     def deliver_subscription_event(type, subscription_id:, customer:, event_id:)
       body = JSON.parse(stripe_fixture(type == "customer.subscription.created" ? "customer.subscription.created" : "customer.subscription.updated"))
       object = body.dig("data", "object")
@@ -353,5 +490,13 @@ class TenantCrossAccountFindingsTest < ActionDispatch::IntegrationTest
       object["plan"]["id"] = shared_plan.processor_price_id
 
       Webhooks::Ingestion.new(processor: :stripe, event_id: event_id, type: body["type"], payload: body).call
+    end
+
+    # The subscription's own events, by **subject** — the row's own uuid, which is
+    # what `Lifecycle#apply` publishes under. A `find_by(event_type:)` alone would
+    # match the `billing.subscription.started` the *first* delivery legitimately
+    # published and report the refusal as having emitted something.
+    def subscription_events_for(subscription)
+      OutboxEvent.where(subject: subscription.id).pluck(:event_type)
     end
 end

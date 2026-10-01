@@ -467,8 +467,13 @@ class V1SubscriptionsTest < ActionDispatch::IntegrationTest
   end
 
   test "a change to a plan in a different currency is refused" do
+    # Its own processor price, not the USD plan's. A euro plan claiming the same
+    # `price_` as a dollar one is incoherent on its face, and since billing-13
+    # made the column unique it is also a unique violation — the assertion below
+    # is about the currency refusal, and a collision would have replaced it with
+    # an exception before the request was ever made.
     euros = Plan.create!(name: "Pro EUR", slug: "pro-eur", price: Money.new(1900, "EUR"), interval: "month",
-      processor_price_id: "price_1PZQaBcDeFgHiJkLmNoPqR2")
+      processor_price_id: "price_FAKEeuroplanBBBBBBBBB")
 
     post change_plan_path, params: { plan_id: euros.id }, as: :json
 
