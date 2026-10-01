@@ -186,17 +186,46 @@ verdict "case2-deleted-test" "gate.floor" prove
 # Raising the floor one past the measured count. If this does not go red, the
 # floors are not being read and the other four cases are passing on the exit
 # code alone.
-note "3: the suite floor raised from 763 to 764"
-sed 's/^      minimum: 763$/      minimum: 764/' \
-  "$repo_root/gate.yml" >"$work/gate.yml.raised"
-mv "$work/gate.yml.raised" "$repo_root/gate.yml"
-if grep -q '^      minimum: 764$' "$repo_root/gate.yml"; then
-  verdict "case3-raised-floor" "gate.floor" prove
-else
-  echo "    CASE COULD NOT RUN: the sed did not find the line to raise." >&2
-  echo "    If the declaration's formatting changed, fix this case." >&2
+#
+# THE FLOOR IS READ, NOT WRITTEN HERE. The first version of this case hardcoded
+# `minimum: 763` and `minimum: 764`, which is D9's defect — the same number
+# written down in two files and correct in neither. It is not hypothetical: when
+# billing-12 and billing-13 merged and the real floor moved to 950, this case
+# raised a floor that no longer existed. The sed found its literal, edited a line
+# that said `minimum: 763`, produced a gate that was still green at 950 runs, and
+# **reported the case as passing** while proving nothing about floors at all.
+# That is the worst version of a self-test: not a red that gets read, but a
+# green that gets believed.
+#
+# So the case reads the current floor out of the declaration and raises *that*.
+# If the declaration's shape changes and the floor cannot be found, the case
+# FAILS loudly rather than silently editing nothing.
+# `[0-9][0-9]*` and not `[0-9]\+`: BSD sed, which is what macOS ships and what
+# this repository's contributors run, does not accept `\+` in a POSIX basic
+# regular expression. It does not error — it matches nothing and exits 0 — so
+# the first version of this line looked like a perfectly good empty answer and
+# the case reported COULD NOT RUN rather than silently editing nothing. The
+# fail-loudly branch below is what caught it, which is the reason it is there.
+suite_floor="$(sed -n 's/^      minimum: \([0-9][0-9]*\)$/\1/p' "$repo_root/gate.yml" | tail -1)"
+if [ -z "$suite_floor" ]; then
+  echo "    CASE COULD NOT RUN: no '      minimum: <digits>' line was found in gate.yml." >&2
+  echo "    If the declaration's formatting changed, fix this case — and do not" >&2
+  echo "    paper over it by putting the number back in this script." >&2
   failed=$((failed + 1))
-  restore
+else
+  raised_floor=$((suite_floor + 1))
+  note "3: the suite floor raised from $suite_floor to $raised_floor"
+  sed "s/^      minimum: ${suite_floor}\$/      minimum: ${raised_floor}/" \
+    "$repo_root/gate.yml" >"$work/gate.yml.raised"
+  mv "$work/gate.yml.raised" "$repo_root/gate.yml"
+  if grep -q "^      minimum: ${raised_floor}\$" "$repo_root/gate.yml"; then
+    verdict "case3-raised-floor" "gate.floor" prove
+  else
+    echo "    CASE FAILED: the sed did not find the line to raise." >&2
+    echo "    If the declaration's formatting changed, fix this case." >&2
+    failed=$((failed + 1))
+    restore
+  fi
 fi
 
 # --- 4: a script the proofs name, gone ---------------------------------------

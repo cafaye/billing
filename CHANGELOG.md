@@ -95,6 +95,43 @@ All notable changes to billing are recorded here. The format follows
 
 ### Fixed
 
+- **The two numeric floors in `gate.yml` were 187 runs below the truth, and the
+  declaration's own self-test could not tell.** The packet wrote the merge
+  obligation into a comment — *"WHEN billing-09-race MERGES, raise this and
+  `BASELINE_RUNS` together in that commit, or in the merge"* — and CI's
+  `BASELINE_RUNS` was raised to 950 by billing-13 while `gate.yml` still said
+  763. Measured on the merged tree: **950 runs / 2724 assertions**, 109 files
+  linted, so both floors moved to the measured numbers.
+
+  **What the stale floor did, rather than what it failed to prevent.** With the
+  suite floor at 763 on a tree running 950, self-test case 2 —
+  `rm test/integration/health_test.rb`, the exact five-test file deletion the
+  packet designed to be caught by *both* numeric floors — reported **exit 0**.
+  The deletion left 945 runs against a floor of 763, so neither floor moved and
+  the declaration certified a suite that had just lost five tests. A floor that
+  is too *low* is not a safe floor; it is a check that has stopped checking, and
+  it is invisible because floors never block a merge, so nothing goes red to say
+  so.
+
+  **The self-test caught it, which is the whole argument for shipping one.**
+  The control was green, cases 1, 4 and 5 were green, and cases 2 and 3 were
+  the two reds that should not have been red. That is the packet's own
+  mechanism reporting a real defect in its own arithmetic, and the fix
+  (measure, do not predict) is the fix the comment had already prescribed.
+
+- **Self-test case 3 no longer hardcodes the floor it raises.** It read
+  `minimum: 763` and replaced it with `764`, so when the real floor moved to 950
+  the sed edited a line that no longer existed and **the case reported green
+  while proving nothing about floors** — the worst failure mode a self-test has,
+  since a green that means nothing is believed. It now reads the current floor
+  out of `gate.yml` and raises *that*, and fails loudly if it cannot find one.
+  This is D9's exact defect (the same number written down in two files and
+  correct in neither) found by the case that exists to check floors.
+
+  Measured on the way: `[0-9]\+` is not valid in a POSIX BRE, so BSD sed —
+  what macOS ships — matched nothing and exited 0. The fail-loudly branch is what
+  turned that into `CASE COULD NOT RUN` rather than a silent no-op.
+
 - **The three cross-tenant defects billing-12 proved are now closed: a delivery
   can no longer move a subscription between accounts, and a processor customer id
   or price id can no longer be claimed twice.** `+37 runs / +126 assertions`
