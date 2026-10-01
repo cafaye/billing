@@ -28,10 +28,19 @@ class Problem
   # `cursor_expired` in the pagination section without listing it. They are
   # recorded as a decision for the manager in CHANGELOG.md rather than invented
   # quietly.
+  #
+  # **`unauthorized` (401) is core's own reserved code and is here for `/v1`'s
+  # token check.** It is the *only* new status this service answers for
+  # authentication, and the table still has **no 403** — deliberately, and the
+  # property is asserted in `test/tenant/cross_account_web_test.rb`. A caller whose
+  # token is good but who named another account's row gets the same 404 a caller
+  # naming a row that does not exist gets, because a 403 would say "this exists,
+  # you may not have it", which is an enumeration oracle. Absence, never refusal.
   CATALOG = {
     bad_request: { title: "Bad request", status: :bad_request },
     cursor_invalid: { title: "Invalid cursor", status: :bad_request },
     cursor_expired: { title: "Cursor expired", status: :bad_request },
+    unauthorized: { title: "Unauthorized", status: :unauthorized },
     not_found: { title: "Not found", status: :not_found },
     conflict: { title: "Conflict", status: :conflict },
     idempotency_key_reused: { title: "Idempotency key reused", status: :conflict },

@@ -17,6 +17,14 @@ class V1SubscriptionsTest < ActionDispatch::IntegrationTest
   IDEMPOTENCY_KEY = "6f1c3a52-9d84-4f0e-b7a2-1c5e8d3f6b90".freeze
   OTHER_IDEMPOTENCY_KEY = "0b7d2e14-58ca-4a36-9f1e-3d2b6c4a8e51".freeze
 
+  # The account these fixtures belong to, and therefore the one the token names.
+  # It is **the same value as the authenticated account** and that is the point:
+  # every query on `/v1` is scoped by the token's `account_id`, so a fixture owned
+  # by a random uuid is invisible to every caller. `test/requests/v1/customers_test.rb`
+  # has the same constant, and the two being equal is what makes a request in either
+  # file reach the row it means to.
+  ACCOUNT_ID = TestSupport::TestIdentity::Account
+
   setup do
     travel_to(frozen_now)
     @api = FakeStripeAPI.new
@@ -701,7 +709,12 @@ class V1SubscriptionsTest < ActionDispatch::IntegrationTest
     document = YAML.load_file(Rails.root.join("openapi/v1.yaml"))
     cancel = document.fetch("paths").fetch("/v1/subscriptions/{id}/cancel").fetch("post").fetch("responses")
 
-    assert_equal %w[200 400 404 409 422 503], cancel.keys.sort
+    # **`401` joined this list in billing-21** — the operation answers it when the
+    # caller sends no token, or one this service refuses. `503` was already here for
+    # the unconfigured processor and is now also what an unconfigured or unreachable
+    # identity answers; the document's `ProcessorUnconfigured` row says so, because one
+    # status per operation means one row has to name both causes.
+    assert_equal %w[200 400 401 404 409 422 503], cancel.keys.sort
   end
 
   private

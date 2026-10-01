@@ -31,15 +31,23 @@ module V1
   # times — which is the same rule `render_validation_failure` follows for a model's
   # own errors.
   #
-  # ## Open in v0, and the gap is recorded
+  # # Scoped by the caller's account
   #
-  # There is no authorization on this controller, so `index` returns every
-  # subscription and `create` takes a `customer_id` from the body. Both are the same
-  # recorded gap as `CustomersController` (README, "Authorization") and the same
-  # resolution: when identity's JWKS verification lands, every query here is scoped
-  # by the token's `account_id` and the body stops being the way a customer is
-  # named. That is a breaking change to this surface, not a bug fix, and it is why
-  # `create` refuses a user-owned customer rather than inventing the account one.
+  # `index` pages `Subscription.for_account(current_account_id)` — this account's
+  # subscriptions, not every subscription in the database — and **every** row-addressed
+  # action resolves inside that same scope: `show`, `cancel`, `change_plan` and
+  # `entitlements`. So a uuid naming another account's subscription is a **404**,
+  # byte for byte the answer a uuid naming nothing gets. Not 403: a 403 says "this
+  # exists, you may not have it", and a caller walking uuids would learn exactly
+  # which subscriptions exist without reading one. Absence, never refusal.
+  #
+  # `create` names the customer by `customer_id` in the body still — a Checkout
+  # session needs a buyer, and the body is where a buyer goes — but the customer is
+  # resolved **inside the account scope**, so a `customer_id` naming another
+  # account's customer is refused as "not a record this service has" rather than
+  # billing that account's card. It refuses a `User`-owned customer for the reason
+  # it always did: which account a user belongs to is identity's fact, and no event
+  # carrying it is in this build's `consumes`.
   class SubscriptionsController < BaseController
     # One thing wrong with the request. `code` is core's problem code, `field` is the
     # name the client sent it under, and the message is the sentence.
@@ -50,7 +58,7 @@ module V1
     end
 
     def index
-      render_page(paginate(Subscription.all), ->(subscription) { serialize(subscription) })
+      render_page(paginate(Subscription.for_account(current_account_id)), ->(subscription) { serialize(subscription) })
     end
 
     def show
@@ -150,8 +158,20 @@ module V1
         @refusals = []
       end
 
+      # `find`, not `find_by`, and **inside `for_account`**: a row in another account
+      # raises `RecordNotFound` exactly as a row that does not exist does, and both
+      # render the same fixed 404 sentence. `uuid_param!` runs first so an id that
+      # could never name a row is that same answer — all three are one document,
+      # which is what makes a 404 safe to reuse for another account's row.
+      #
+      # **Every row-addressed action on this controller comes through here** —
+      # `show`, `cancel`, `change_plan`, `entitlements` — so the mutating directions,
+      # which are the expensive ones, cannot be the one somebody forgot to scope.
+      # The scope is written out rather than hidden behind a `scoped` helper because
+      # this is the line a reviewer reads to decide whether account A can cancel
+      # account B's subscription.
       def subscription_record
-        @subscription_record ||= Subscription.find(uuid_param!(params[:id]))
+        @subscription_record ||= Subscription.for_account(current_account_id).find(uuid_param!(params[:id]))
       end
 
       def checkout_for(customer, plan)
@@ -176,11 +196,19 @@ module V1
       end
 
       # The customer the request named, and the check that it is one this service can
-      # bill. A user-owned customer is refused rather than resolved to an account:
-      # which account a user belongs to is identity's fact, and no event carrying it
-      # is in this build's `consumes`.
+      # bill **and one this caller owns**. A user-owned customer is refused rather than
+      # resolved to an account: which account a user belongs to is identity's fact,
+      # and no event carrying it is in this build's `consumes`.
+      #
+      # The scope is the load-bearing half. `Customer.for_account` means a
+      # `customer_id` naming another account's row resolves to `nil` here, so the
+      # refusal is the same "not a record this service has" a bogus uuid gets —
+      # absent, not refused, and carrying nothing about whether the row exists. A
+      # Checkout session is created against `customer_reference: customer.id` and
+      # `customer.processor_customer_id`, so an unscoped lookup would have opened a
+      # payment against another account's saved Stripe customer.
       def billable_customer
-        customer = find_or_refuse(:customer_id) { Customer.find_by(id: _1) }
+        customer = find_or_refuse(:customer_id) { Customer.for_account(current_account_id).find_by(id: _1) }
         return if customer.nil?
 
         unless customer.owner_type == Subscription::BILLABLE_OWNER_TYPE

@@ -33,7 +33,7 @@ $ curl -s localhost:3000/healthz
 $ curl -s localhost:3000/readyz
 {"status":"ok","checks":{"database":"ok"}}
 
-$ curl -s localhost:3000/v1/plans/pro-monthly
+$ curl -s -H "Authorization: Bearer $TOKEN" localhost:3000/v1/plans/pro-monthly
 {"id":"…","name":"Pro monthly","slug":"pro-monthly","processor_product_id":null,
  "processor_price_id":null,"price":{"amount_minor":1900,"currency":"USD"},
  "interval":"month","trial_days":0,"active":true,"created_at":"…","updated_at":"…"}
@@ -168,17 +168,55 @@ or a lateral move lands at the renewal** — and without it a client would have 
 way to tell a caller that a downgrade is scheduled rather than applied. It is not
 state; the subscription's own fields have not moved.
 
-**Authorization is a later platform packet, and the `/v1` surface is open until
-it is not.** No endpoint reads a token, because there is no token to read: core
-says identity is the only issuer and that services verify against the JWKS, and
-that machinery is not in this repository yet. The visible consequences are
-`GET /v1/customers` and `GET /v1/subscriptions`, which return every row, and
-`POST /v1/subscriptions`, which takes a `customer_id` in the body, because
-without a token there is no `account_id` to scope a query by. That is also why
-`POST /v1/subscriptions` refuses a customer whose owner is a `User` rather than an
-`Account`: which account a user belongs to is identity's fact, and no event
-carrying it is in this build's `consumes`. Do not expose this surface to anything
-but the gateway.
+**Every `/v1` operation requires a bearer token, and every customer and
+subscription operation is scoped by the account it names.** Two environment
+variables, `BILLING_IDENTITY_ISSUER` and `BILLING_IDENTITY_AUDIENCE`, are what a
+deployment sets; the token is an RS256 JWT from `identity`, verified locally
+against the published JWKS at `{issuer}/.well-known/jwks.json` and cached by `kid`
+for five minutes.
+
+| | |
+| --- | --- |
+| no token, or one this service refused | **401** `unauthorized` — one fixed body, so which of signature / expiry / issuer / audience was wrong is not something a caller learns by trying |
+| no issuer or audience configured, or `identity` unreachable | **503** `unavailable` — ours, not the caller's; a 401 here would tell someone holding a valid token to go and rotate it |
+| another account's resource | **404** — the same answer a uuid that names nothing gets. Never a 403. |
+
+**An unconfigured deployment is locked, not open.** Every `/v1` request answers 503
+when no issuer is configured. That is the property the whole thing exists to hold:
+a self-hosted billing API whose authentication quietly degrades open because nobody
+filled in an environment variable is the failure it prevents, and the direction that
+matters is the one that refuses.
+
+Three consequences worth stating plainly, because they are breaking:
+
+- `GET /v1/customers` and `GET /v1/subscriptions` return **this account's** rows.
+- `POST /v1/customers` **ignores `owner_type`/`owner_id` in the body**. The owner is
+  the token's account. A `User`-owned customer is therefore no longer creatable
+  through `/v1`: which account a user belongs to is identity's fact, no event
+  carrying it is in this build's `consumes`, and a row with no tenant has nobody to
+  scope it to.
+- **`Idempotency-Key` is scoped to the caller's `sub`** as well as to the endpoint.
+  Two tenants choosing the same uuid no longer share one namespace, so a replay
+  cannot return another caller's stored response.
+
+`/v1/webhooks/stripe` is not part of this. Its sender is a payment processor and it
+authenticates by signature over the raw body; it declares `security: []` and must
+never grow a token check, because a `Bearer` there would be a second, weaker trust
+path to the same door. That is structural rather than a convention — the token check
+is a filter on the `/v1` client base controller, which the webhook controller does not
+inherit from — and `test/authentication/principal_lock_test.rb` reads the boundary
+from the router's own table rather than from this paragraph.
+
+### Breaking change
+
+`openapi/v1.yaml` is at **2.0.0** and the prefix is still `/v1`. That is a judgement
+call and it is recorded rather than made quietly. Core's rule is that a breaking
+change gets a new prefix *beside* the old one, so the old contract keeps being
+served — and that is exactly what cannot be done here: the old `/v1` answers every
+request without a token, so "keep serving `/v1` for compatibility" is "keep the
+vulnerability", and a second prefix over one open door is one open door. The major
+bump plus this note is the signal instead, and `info.version` is what every client
+generator reads.
 
 Errors are `application/problem+json` — RFC 9457 with core's extensions, built
 in one place (`app/lib/problem.rb`) so no controller can invent its own:
@@ -359,7 +397,27 @@ weaker trust path to the same door.
 Written down rather than hidden. Each one is a decision this packet did not get
 to make, not an oversight.
 
-- **No authorization.** See above. The `/v1` surface is open.
+- **Authentication is on; authorization is one claim wide.** Every `/v1` request
+  carries a verified principal and every customer and subscription query is scoped
+  by the account in its token, so no caller reaches another account's row. Nothing
+  narrower than that is checked. There is no capability model — no
+  `plans:write` scope, no per-account plan override, no distinction between an
+  account's member and its owner — because billing has no scope vocabulary to check
+  against, and a scope invented here would be a scope nothing else in the fleet
+  grants. **The one place that bites is the plan catalogue's writes**: any
+  authenticated account may create, change or delete a platform-wide plan, because
+  plans are the fleet's catalogue and not an account's. `Principal#scope_set`
+  parses the token's `scope` claim and nothing reads it yet. Closing this is a
+  decision about what a plan write is for, not a missing line, and it is recorded
+  as a DECISION NEEDED in `cafaye.yml`.
+- **Plans are not account-scoped, deliberately.** `GET /v1/plans` returns the whole
+  catalogue to any authenticated caller. A plan is a price every account can
+  subscribe to, so scoping the listing to one account's rows would return an empty
+  collection to a caller who has subscribed to nothing — a real 404-shaped wrong
+  answer rather than an open door. `test/contract/tenant_isolation_matrix_test.rb`
+  carries a third verdict, `catalogue`, for exactly these four routes, and asserts
+  it as a *set of distinct verdicts* rather than as a count, so the day a plan route
+  becomes scoped the failure names the verdict that changed.
 - **No publisher loop.** The outbox table and the transactional insert are here;
   the process that moves rows to NATS is not. `published_at` is therefore always
   null and `attempts` always zero, and `outbox_events` grows without bound. This
@@ -377,8 +435,10 @@ to make, not an oversight.
   day core lands another — so the accounting is a test, not a claim.
 - **Cursors are not signed.** They are base64url and opaque, which is all core
   requires, but nothing stops a client crafting one. It can only ask for a
-  different page of a collection it can already read, and the endpoints are open
-  anyway. Signing needs a secret this service does not have.
+  different page of a collection it can already read — the collection is already
+  scoped to the caller's own account, so a forged cursor can only reach the reader's
+  own rows or a page that names a position in them. Signing needs a secret this
+  service does not have.
 - **Three problem codes are not in core's reserved list**: `bad_request`,
   `cursor_invalid`, `cursor_expired`. See `cafaye.yml`.
 - **The unique-index race is handled but untested.** A `RecordNotUnique` that
@@ -412,8 +472,10 @@ to make, not an oversight.
   them a delivery could resolve to either of two accounts' rows — a
   `find_by` with no `ORDER BY` decides nothing when two rows answer to one id —
   and a subscription could be billed against a plan at a price nobody agreed to.
-  `/v1` is still unauthenticated and still unscoped; these make the *delivery
-  path* resolve deterministically, which is not the same as authorizing the caller.
+  These make the *delivery path* resolve deterministically, which is a separate
+  guarantee from authorizing the caller: `Lifecycle`'s `find_by` has one answer
+  instead of an arbitrary one. The caller's own side is closed by the account scope
+  on every query — a client can no longer reach the other row to claim its id.
 - **A subscription created directly in the processor's dashboard is not tracked.**
   It carries no cafaye customer id, so the delivery is recorded as
   `ignored:unknown_customer` and answered 200. Matching it to whoever happens to

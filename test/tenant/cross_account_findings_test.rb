@@ -211,6 +211,11 @@ class TenantCrossAccountFindingsTest < ActionDispatch::IntegrationTest
       owner_type: "Account", owner_id: ACCOUNT_A, processor: "stripe",
       processor_customer_id: "cus_FAKEattackerAAAAAAAAA"
     )
+    # **Acting as A.** `/v1` is scoped by the token's `account_id` since billing-21, so
+    # without this the `PATCH` would be a 404 — the scoping, not the unique index — and
+    # this test would pass while proving nothing about F2. F2's own refusal is a 409, and
+    # `cross_account_web_test.rb` is where the 404 boundary is proved.
+    acts_as(ACCOUNT_A)
     before = fingerprint([ attacker ])
 
     patch "/v1/customers/#{attacker.id}", params: { processor_customer_id: victim.processor_customer_id }, as: :json

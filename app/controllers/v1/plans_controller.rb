@@ -9,7 +9,25 @@ module V1
   # address a mutation by. Both are 404 for the other's identifier, and the
   # specs say so.
   #
-  # Open in v0, same as CustomersController, and for the same reason.
+  # # A plan carries no account, and that is the model, not a gap in the scoping
+  #
+  # Every `/v1` operation needs a token now (`AuthenticatesPrincipal`), but the two
+  # controllers that reach **tenant rows** — customers and subscriptions — scope
+  # their queries by `account_id` and this one does not, because a plan has no
+  # `account_id` column: a plan is what an account may **buy**, not what an account
+  # owns. `test/support/two_accounts.rb` deliberately shares ONE plan between both
+  # accounts for the same reason, and `subscriptions_live_account_plan_idx` is keyed
+  # on `(account_id, plan_id)` because the plan is shared and the account is not.
+  #
+  # **What is still open is who may WRITE the catalogue.** `POST /v1/plans` and
+  # `PATCH /v1/plans/:id` change what every account is offered and at what price, so
+  # they are a capability question and core's answer is `scopes` — not tenancy. No
+  # client in this build holds a billing scope, so **any authenticated caller can
+  # currently write the catalogue**. That is recorded in `README.md` rather than
+  # papered over with a check that cannot be satisfied, and `Principal#scopes` is
+  # where the check goes once there is a vocabulary to check against. Inventing a
+  # scope name here would lock every deployment out of its own catalogue for the
+  # sake of a check no token could pass.
   class PlansController < BaseController
     def index
       render_page(paginate(Plan.all), ->(plan) { plan.as_json })

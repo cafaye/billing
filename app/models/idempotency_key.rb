@@ -13,19 +13,23 @@
 class IdempotencyKey < ApplicationRecord
   RETENTION = 24.hours
 
-  # v0's endpoints are unauthenticated, so there is no caller to scope the key
-  # to. The column is already part of the unique index because core defines the
-  # scope as (endpoint, principal, key): when authorization lands this constant
-  # becomes the token's `sub` and the uniqueness is correct without a migration.
-  PRINCIPAL = "anonymous"
-
+  # **The principal is the token's `sub`, and it is passed in rather than
+  # resolved here.** core defines the scope as `(endpoint, principal, key)`, and a
+  # key scoped to nobody is a key any caller can replay another's answer under: two
+  # tenants choosing the same uuid would have shared one namespace, and a replay
+  # under a key the *other* tenant used would have returned that tenant's stored
+  # 201 to whoever guessed the uuid. The `principal` column is already in the unique
+  # index, so this is a value and not a migration.
+  #
+  # The `sub` claim and not `account_id`: two users in one account are two callers,
+  # and a replay under one user's key must not answer for the other's.
   validates :endpoint, :principal, :key, :request_digest, :response_body, presence: true
 
   # The stored response for this exact request, or nil if the key is new.
   # Raises when the key was used for a *different* body, which is a client bug
   # rather than a retry and must not be answered with someone else's response.
-  def self.replay_for(endpoint:, key:, digest:)
-    record = find_by(endpoint: endpoint, principal: PRINCIPAL, key: key)
+  def self.replay_for(endpoint:, principal:, key:, digest:)
+    record = find_by(endpoint: endpoint, principal: principal, key: key)
     return nil if record.nil?
 
     raise IdempotencyKeyReused, key if record.request_digest != digest
@@ -33,10 +37,10 @@ class IdempotencyKey < ApplicationRecord
     record
   end
 
-  def self.remember(endpoint:, key:, digest:, status:, body:)
+  def self.remember(endpoint:, principal:, key:, digest:, status:, body:)
     create!(
       endpoint: endpoint,
-      principal: PRINCIPAL,
+      principal: principal,
       key: key,
       request_digest: digest,
       status: status,

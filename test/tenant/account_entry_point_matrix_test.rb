@@ -26,13 +26,17 @@ require "test_helper"
 #
 # A **route** is a caller-facing operation on the HTTP surface: 14 of them. A
 # **data access** is one place in `app/` that reads or writes a tenant's row:
-# 33 of them, in 31 methods. The two layers overlap — a route is served by a
+# 35 of them, in 33 methods. The two layers overlap — a route is served by a
 # controller method that performs a data access — and they are counted separately
 # on purpose. Adding them would produce one larger number that means nothing,
 # and the two answer different questions: the route count is "how much of the
-# surface is a caller's to reach", the data-access count is "how many places have
-# to be scoped when identity's JWKS verification lands". The packet's headline is
-# the second, because that is the one that is not yet done.
+# surface is a caller's to reach", the data-access count is "how many places hold
+# a tenant's row".
+#
+# billing-12 wrote this when the second number was a to-do list — "how many places
+# have to be scoped when identity's JWKS verification lands" — and billing-21 landed
+# it. The two account scopes are in the count, the five `/v1` customer and
+# subscription reads now go through them, and nothing was removed.
 #
 # ## Why the derivation is per-method and not per-line
 #
@@ -55,12 +59,12 @@ require "test_helper"
 # every account buys from, and because the contract matrix already treats it as
 # tenant data — the same three models, re-pinned here so neither file drifts alone.
 #
-# Seven of the 33 are **declarations** rather than executed resolutions: the two
-# `belongs_to` on `Subscription`, the five `scope`s on `Subscription` and
-# `OutboxEvent`. They are counted, because an association and a scope are both
+# Nine of the 35 are **declarations** rather than executed resolutions: the two
+# `belongs_to` on `Subscription`, the seven `scope`s on `Subscription`, `Customer`
+# and `OutboxEvent`. They are counted, because an association and a scope are both
 # queries and leaving a category out of an enumeration is how the enumeration stops
 # being one — but they are counted as declarations, so a reader who wants only the
-# places a request actually reaches a row has **26** and not 33.
+# places a request actually reaches a row has **26** and not 35.
 #
 # A declaration is counted only when the class declaring it holds tenant data:
 # `Customer`, `Plan`, `Subscription` (an `account_id` column) or `OutboxEvent` (an
@@ -106,25 +110,39 @@ class TenantAccountEntryPointMatrixTest < ActiveSupport::TestCase
   # table written in the OpenAPI document's spelling (`{id}`) and compared against
   # the router would report every parameterised route as both unclassified and
   # stale at once, and a reader could not tell which half was wrong.
+  #
+  # **billing-21 made the first and last groups scoped**, and the value says so
+  # rather than leaving a reader to grep for `for_account`: every customer and
+  # subscription read is now `Customer.for_account(token.account_id)` or
+  # `Subscription.for_account(token.account_id)`, and a uuid naming another account's
+  # row is a 404. See `test/authentication/` for the refusals and
+  # `test/tenant/cross_account_web_test.rb` for the rewritten characterisations.
+  #
+  # **The four plan rows are the exception and say why**: a plan is platform
+  # catalogue — what an account may buy, not what an account owns — so it carries no
+  # account and the routes resolve it by slug or uuid with no filter. That is the
+  # model, not a gap; `test/support/two_accounts.rb` shares one plan between both
+  # accounts precisely because it is true.
   ACCOUNT_SCOPED_ROUTES = {
-    [ "GET", "/v1/customers" ] => [ "list", "returns every customer of every account" ],
-    [ "POST", "/v1/customers" ] => [ "write", "takes `owner_type`/`owner_id` in the body" ],
-    [ "GET", "/v1/customers/:id" ] => [ "read", "resolves any customer by its uuid" ],
-    [ "PATCH", "/v1/customers/:id" ] => [ "update", "writes any customer by its uuid" ],
+    [ "GET", "/v1/customers" ] => [ "list", "returns this account's customers, scoped by `for_account`" ],
+    [ "POST", "/v1/customers" ] => [ "write", "writes a customer owned by the token's account, never by a body field" ],
+    [ "GET", "/v1/customers/:id" ] => [ "read", "resolves a customer by its uuid inside `for_account`; another account's is a 404" ],
+    [ "PATCH", "/v1/customers/:id" ] => [ "update", "writes a customer resolved inside `for_account`" ],
 
-    [ "GET", "/v1/plans" ] => [ "list", "returns the whole catalogue" ],
-    [ "POST", "/v1/plans" ] => [ "write", "writes the catalogue" ],
+    [ "GET", "/v1/plans" ] => [ "list", "returns the whole catalogue, which is platform-wide and carries no account" ],
+    [ "POST", "/v1/plans" ] => [ "write", "writes the catalogue every account is offered" ],
     [ "GET", "/v1/plans/:slug" ] => [ "read", "reads the catalogue by handle" ],
     [ "PATCH", "/v1/plans/:id" ] => [ "update", "writes the catalogue by uuid" ],
 
-    [ "GET", "/v1/subscriptions" ] => [ "list", "returns every subscription of every account" ],
-    [ "POST", "/v1/subscriptions" ] => [ "write", "takes a `customer_id` in the body, in any account" ],
-    [ "GET", "/v1/subscriptions/:id" ] => [ "read", "resolves any subscription by its uuid" ],
+    [ "GET", "/v1/subscriptions" ] => [ "list", "returns this account's subscriptions, scoped by `for_account`" ],
+    [ "POST", "/v1/subscriptions" ] => [ "write", "resolves the `customer_id` in the body inside `Customer.for_account`" ],
+    [ "GET", "/v1/subscriptions/:id" ] => [ "read", "resolves a subscription by its uuid inside `for_account`; another account's is a 404" ],
     # The two mutating ones. Reading another account's row is a disclosure;
-    # cancelling one is a write to it, and it is the expensive direction.
-    [ "POST", "/v1/subscriptions/:id/cancel" ] => [ "update", "cancels whichever subscription the path names" ],
-    [ "POST", "/v1/subscriptions/:id/change_plan" ] => [ "update", "moves whichever subscription the path names onto another plan" ],
-    [ "GET", "/v1/subscriptions/:id/entitlements" ] => [ "read", "reads another account's entitlements" ]
+    # cancelling one is a write to it, and it is the expensive direction — which is
+    # why both resolve through the same scoped `subscription_record` as the read.
+    [ "POST", "/v1/subscriptions/:id/cancel" ] => [ "update", "cancels a subscription resolved inside `for_account`" ],
+    [ "POST", "/v1/subscriptions/:id/change_plan" ] => [ "update", "moves a subscription resolved inside `for_account` onto another plan" ],
+    [ "GET", "/v1/subscriptions/:id/entitlements" ] => [ "read", "reads entitlements for a subscription resolved inside `for_account`" ]
   }.freeze
 
   # The one `/v1` operation that is served and is **not** account-scoped.
@@ -147,21 +165,32 @@ class TenantAccountEntryPointMatrixTest < ActiveSupport::TestCase
   # return every row.
   DATA_ACCESSES = {
     # --- the /v1 surface -----------------------------------------------------
-    [ "app/controllers/v1/customers_controller.rb", "index", "list" ] => "reads every customer of every account",
-    [ "app/controllers/v1/customers_controller.rb", "create", "write" ] => "creates a customer for a named owner",
-    [ "app/controllers/v1/customers_controller.rb", "update", "update" ] => "writes any customer by its uuid",
-    [ "app/controllers/v1/customers_controller.rb", "customer_record", "read" ] => "resolves any customer by its uuid",
-    [ "app/controllers/v1/plans_controller.rb", "index", "list" ] => "reads the whole catalogue",
-    [ "app/controllers/v1/plans_controller.rb", "create", "write" ] => "creates a catalogue row",
+    # **Every one of these is scoped, and it says so in the value rather than in the
+    # key.** billing-21 landed the scoping these entries were the list of, so the
+    # twelve `/v1` customer and subscription rows now read `Customer.for_account`
+    # and `Subscription.for_account` — the scope carries the account and the reason
+    # column records what it is holding to.
+    #
+    # The four plan rows are the exception and are the interesting ones: a plan is
+    # **platform catalogue**, not tenant data, so they carry no account and the reason
+    # says so. `test/support/two_accounts.rb` shares one plan between both accounts
+    # precisely because that is true, and a plan scoped to an account would have been
+    # a bug rather than a fix. See `app/models/plan.rb` and `V1::PlansController`.
+    [ "app/controllers/v1/customers_controller.rb", "index", "list" ] => "pages this account's customers, scoped by `Customer.for_account`",
+    [ "app/controllers/v1/customers_controller.rb", "create", "write" ] => "creates a customer owned by the token's account, never by a body field",
+    [ "app/controllers/v1/customers_controller.rb", "update", "update" ] => "writes a customer resolved inside `for_account`",
+    [ "app/controllers/v1/customers_controller.rb", "customer_record", "read" ] => "resolves a customer by its uuid inside `for_account`",
+    [ "app/controllers/v1/plans_controller.rb", "index", "list" ] => "reads the whole catalogue, which is platform-wide and carries no account",
+    [ "app/controllers/v1/plans_controller.rb", "create", "write" ] => "creates a catalogue row, which every account is then offered",
     [ "app/controllers/v1/plans_controller.rb", "show", "read" ] => "resolves a catalogue row by its slug",
     [ "app/controllers/v1/plans_controller.rb", "plan_record", "read" ] => "resolves a catalogue row by its uuid",
     [ "app/controllers/v1/plans_controller.rb", "update", "update" ] => "writes a catalogue row by its uuid",
-    [ "app/controllers/v1/subscriptions_controller.rb", "index", "list" ] => "reads every subscription of every account",
-    [ "app/controllers/v1/subscriptions_controller.rb", "subscription_record", "read" ] => "resolves any subscription by its uuid",
-    [ "app/controllers/v1/subscriptions_controller.rb", "billable_customer", "read" ] => "resolves the customer the body names, in any account",
-    [ "app/controllers/v1/subscriptions_controller.rb", "sellable_plan", "read" ] => "resolves the plan the body names",
-    [ "app/controllers/v1/subscriptions_controller.rb", "cancel", "update" ] => "asks the processor to cancel any subscription the path names",
-    [ "app/controllers/v1/subscriptions_controller.rb", "change_plan", "update" ] => "asks the processor to move any subscription the path names",
+    [ "app/controllers/v1/subscriptions_controller.rb", "index", "list" ] => "pages this account's subscriptions, scoped by `Subscription.for_account`",
+    [ "app/controllers/v1/subscriptions_controller.rb", "subscription_record", "read" ] => "resolves a subscription by its uuid inside `for_account`; every row-addressed action comes through here",
+    [ "app/controllers/v1/subscriptions_controller.rb", "billable_customer", "read" ] => "resolves the customer the body names, inside `Customer.for_account`",
+    [ "app/controllers/v1/subscriptions_controller.rb", "sellable_plan", "read" ] => "resolves the plan the body names, which is catalogue and unscoped",
+    [ "app/controllers/v1/subscriptions_controller.rb", "cancel", "update" ] => "asks the processor to cancel a subscription resolved inside `for_account`",
+    [ "app/controllers/v1/subscriptions_controller.rb", "change_plan", "update" ] => "asks the processor to move a subscription resolved inside `for_account`",
 
     # --- the processor delivery path, where an account is resolved from an id -
     [ "app/services/subscriptions/lifecycle.rb", "call", "read" ] => "resolves the row a delivery writes, by the processor's subscription id",
@@ -184,14 +213,26 @@ class TenantAccountEntryPointMatrixTest < ActiveSupport::TestCase
     [ "app/models/subscription.rb", "belongs_to :plan", "read" ] => "declares the join to the catalogue row the subscription is billed against",
 
     # --- the declared queries, for the same reason ---------------------------
-    # Five scopes on two tenant tables. None is account-scoped *today* — they are
-    # status and publication predicates — and they are still counted, because a
-    # scope is a query and a scope added tomorrow carrying `where(account_id:` is
-    # the single most likely shape for the account scoping this packet is waiting
-    # on. Leaving the category out of the enumeration is how the enumeration stops
+    # Seven scopes on three tenant tables: **two carry an account**
+    # (`Customer.for_account`, `Subscription.for_account`, both landed in billing-21)
+    # and five do not.
+    #
+    # --- the two account scopes, which is where billing-21 put the scoping -----
+    # The shape scoping arrives in is `scope :for_account, ->(id) { where(account_id: id) }`,
+    # and these two are that shape. They are counted because a scope is a query — and
+    # `Subscription#for_account` in particular is the query every row-addressed `/v1`
+    # action reaches a subscription through, so a change to it moves the tenant
+    # boundary of the whole surface and this matrix is where that shows up.
+    [ "app/models/customer.rb", "scope :for_account", "list" ] => "resolves one account's customers by `owner_type: Account` and `owner_id`; a `User`-owned customer is in no account and is excluded",
+    [ "app/models/subscription.rb", "scope :for_account", "list" ] => "resolves one account's subscriptions by `account_id`, which is the tenancy key every row-addressed action reads through",
+
+    # --- the five scopes that carry no account ---------------------------------
+    # Status and publication predicates. All seven scopes are counted, because a scope
+    # is a query and the two above are the shape these five would take if they were
+    # scoped; leaving the category out of the enumeration is how the enumeration stops
     # being one.
-    [ "app/models/subscription.rb", "scope :live", "list" ] => "resolves a subscription's live rows, across accounts",
-    [ "app/models/subscription.rb", "scope :canceled", "list" ] => "resolves a subscription's canceled rows, across accounts",
+    [ "app/models/subscription.rb", "scope :live", "list" ] => "resolves a subscription's live rows; carries no account and is not meant to",
+    [ "app/models/subscription.rb", "scope :canceled", "list" ] => "resolves a subscription's canceled rows; carries no account and is not meant to",
     [ "app/models/outbox_event.rb", "scope :unpublished", "list" ] => "resolves unpublished outbox rows, whose payloads carry every account's events",
     [ "app/models/outbox_event.rb", "scope :oldest_first", "list" ] => "orders outbox rows for the publisher loop, which does not exist yet",
     [ "app/models/outbox_event.rb", "scope :for_processor_event", "list" ] => "resolves outbox rows by a processor event id, never by an account"
@@ -204,6 +245,15 @@ class TenantAccountEntryPointMatrixTest < ActiveSupport::TestCase
   # Two assertions below hold this closed in both directions.
   NO_DATA_ACCESS = {
     "app/controllers/application_controller.rb" => "assembles the shared response concerns; it queries nothing",
+    # The four files billing-21 added. None reads a row: the concern decides whether
+    # a request may proceed at all, the verifier reads a **signature and a key set**,
+    # and the principal is a value object. Naming them here is what keeps the list
+    # closed — a new file under `app/` that queries nothing has to say so, and this
+    # one did.
+    "app/controllers/concerns/authenticates_principal.rb" => "the `/v1` boundary: it reads a bearer token and renders a refusal, and it reaches no tenant row on either path",
+    "app/lib/principal.rb" => "the verified caller as a value; it holds an account id and reads no model",
+    "app/services/identity.rb" => "the identity namespace and its three refusal classes; it holds no query",
+    "app/services/identity/token_verifier.rb" => "verifies a signature against identity's published key set, which is not this service's data",
     "app/controllers/concerns/idempotent_requests.rb" => "replays a response this service already sent, keyed on the request's own idempotency key",
     "app/controllers/concerns/problem_responses.rb" => "renders problem documents for a status a controller chose",
     "app/controllers/concerns/request_trace_id.rb" => "stamps a trace id on a response; it queries nothing",
@@ -277,9 +327,27 @@ class TenantAccountEntryPointMatrixTest < ActiveSupport::TestCase
   # five and miss both, in the same way, on the same line. Every scope returns a
   # relation and every relation is a collection read, so `list` is the correct kind
   # for all of them and no body needs reading.
+  #
+  # **`for_account` is in the list, and its kind depends on what it is chained to.**
+  #
+  # billing-21 made it the shape every account-scoped query takes, so a scanner that
+  # only knew `find` and `all` would have watched all five `/v1` customer and
+  # subscription reads **disappear from the enumeration** the day the code was fixed
+  # — and a matrix whose count falls when the boundary lands is a matrix that stops
+  # being able to notice the boundary moving again.
+  #
+  # Two entries rather than one, and the order matters because the scan breaks on the
+  # first pattern a line matches:
+  #
+  #   * `Customer.for_account(id).find(...)` is a **read** — one row, resolved inside
+  #     a scope. This is what every row-addressed action on `/v1` does.
+  #   * `Customer.for_account(id)` on its own is a **list** — a relation, which is
+  #     what `paginate` is handed.
   ACCESS_EXPRESSIONS = [
+    [ "read",   /\b(?:Customer|Plan|Subscription)\.for_account\([^)]*\)\s*\.\s*(?:find|find_by|find_by!)\(/ ],
     [ "read",   /\b(?:Customer|Plan|Subscription)\.(?:find|find_by|find_by!)\(/ ],
     [ "read",   /\bbelongs_to\s+:[a-z_]/ ],
+    [ "list",   /\b(?:Customer|Plan|Subscription)\.for_account\(/ ],
     [ "list",   /\b(?:Customer|Plan|Subscription)\.all\b/ ],
     [ "list",   /\bscope\s+:[a-z_]+,\s*->/ ],
     [ "list",   /\bscope\.where\(/ ],
@@ -423,9 +491,27 @@ class TenantAccountEntryPointMatrixTest < ActiveSupport::TestCase
 
   # --- the counts the report quotes ------------------------------------------
 
-  # **33 data accesses, in 31 methods, filed under 32 keys.** All three numbers
+  # **35 data accesses, in 33 methods, filed under 34 keys.** All three numbers
   # are asserted, and neither gap between them is a rounding of the one above.
-  # Two methods do two things, for two different reasons:
+  #
+  # billing-13's 33 became 35 and **both of the new ones are the account scopes
+  # themselves** — `Customer.for_account` and `Subscription.for_account`, declared on
+  # the two models. They are counted here for the reason the five existing scopes are:
+  # a scope is a query, and `Subscription#for_account` is the query every
+  # row-addressed `/v1` action reaches a subscription through, so it is an entry
+  # point whose scope somebody decided rather than one that arrived by nobody writing
+  # it down. Both are `list`: a scope returns a relation, and a relation is a
+  # collection read whatever it is later chained to.
+  #
+  # Nothing was **removed** in billing-21, which is the more interesting half: the five
+  # `/v1` customer and subscription rows were re-expressed from `Customer.all` and
+  # `Subscription.find` into `for_account(...)`, and the scanner's `ACCESS_EXPRESSIONS`
+  # gained the two patterns that keep them in the enumeration. Without those patterns
+  # this count would have fallen by five on the day the boundary landed, and a matrix
+  # whose total drops when the tenant boundary is fixed is a matrix that can no longer
+  # notice it moving again.
+  #
+  # Two methods still do two things, for two different reasons:
   #
   #   * `Subscriptions::Lifecycle#customer` performs **two lookups** —
   #     `Customer.find_by(id: cafaye_customer_id)` and
@@ -437,10 +523,10 @@ class TenantAccountEntryPointMatrixTest < ActiveSupport::TestCase
   #     than methods.
   #
   # A single number would have hidden both, and both are the shape of the code.
-  test "there are 33 account-scoped data accesses in 31 methods, filed under 32 keys" do
-    assert_equal 33, self.class.accesses.size
-    assert_equal 31, classified_sites.size
-    assert_equal 32, DATA_ACCESSES.size
+  test "there are 35 account-scoped data accesses in 33 methods, filed under 34 keys" do
+    assert_equal 35, self.class.accesses.size
+    assert_equal 33, classified_sites.size
+    assert_equal 34, DATA_ACCESSES.size
 
     assert_equal 1, self.class.accesses.size - DATA_ACCESSES.size,
       "the gap between accesses and keys has changed. It is 1 because `Lifecycle#customer` " \
@@ -458,8 +544,8 @@ class TenantAccountEntryPointMatrixTest < ActiveSupport::TestCase
   # zero kinds are filled in explicitly because `tally` omits an absent key, and
   # a breakdown that quietly lost `delete` is the one breakdown this file exists
   # to keep honest.
-  test "the data-access breakdown is read 12, list 9, write 7, update 5, delete 0" do
-    assert_equal({ "read" => 12, "list" => 9, "write" => 7, "update" => 5, "delete" => 0 }, breakdown(self.class.accesses.map(&:kind)))
+  test "the data-access breakdown is read 12, list 11, write 7, update 5, delete 0" do
+    assert_equal({ "read" => 12, "list" => 11, "write" => 7, "update" => 5, "delete" => 0 }, breakdown(self.class.accesses.map(&:kind)))
   end
 
   # **14 account-scoped routes**, derived from the router, in the same four kinds.
@@ -494,7 +580,7 @@ class TenantAccountEntryPointMatrixTest < ActiveSupport::TestCase
   # double-counts a route against the method that serves it.
   test "the two layers are counted separately, because a route and the method that serves it overlap" do
     assert_equal 14, ACCOUNT_SCOPED_ROUTES.size
-    assert_equal 33, self.class.accesses.size
+    assert_equal 35, self.class.accesses.size
     refute_equal ACCOUNT_SCOPED_ROUTES.size, self.class.accesses.size,
       "the two layers have converged, which means one of them is counting the other's rows"
   end

@@ -125,6 +125,59 @@ class V1PlansTest < ActionDispatch::IntegrationTest
     assert_equal slugs.size, (first_page + second_page).size
   end
 
+  # The page-size cases, which `customers_test.rb` used to hold and cannot any more.
+  #
+  # They moved here because **`/v1/plans` is the collection that still grows.** A
+  # customer listing became one-account-wide in billing-21 and `customers` is unique on
+  # `(owner_type, owner_id, processor)`, so an account's customer listing holds at most
+  # one row and a 101-row page of them cannot be honestly arranged. A plan is platform
+  # catalogue with no account at all, so `bulk_plans` is an ordinary fixture rather than
+  # one reaching past a unique index.
+  #
+  # The cursor behaviour being proved is `CursorPaging`'s, which is shared — so this is
+  # the same coverage in the one place it is reachable.
+  test "GET /v1/plans defaults to 25 rows" do
+    bulk_plans(26)
+
+    get "/v1/plans"
+
+    assert_equal 25, json_body.fetch("data").size
+    assert json_body.dig("page", "has_more")
+  end
+
+  test "GET /v1/plans caps the page at 100 rows" do
+    bulk_plans(101)
+
+    get "/v1/plans", params: { limit: 1000 }
+
+    assert_response :ok
+    assert_equal 100, json_body.fetch("data").size
+    assert json_body.dig("page", "has_more")
+  end
+
+  # Each row gets its own instant, because rows sharing a `created_at` fall to the uuid
+  # tiebreaker and "newest first" would become a test of uuid generation. `insert_all`
+  # rather than a hundred `create!` calls: these rows are never validated and never
+  # announce anything, and the suite should not pay for a hundred outbox events.
+  def bulk_plans(count)
+    now = frozen_now
+    Plan.insert_all(
+      count.times.map do |index|
+        {
+          id: SecureRandom.uuid,
+          name: "Bulk #{index}",
+          slug: "bulk-#{index}",
+          amount_cents: 1900,
+          currency: "USD",
+          interval: "month",
+          entitlements: {},
+          created_at: now + index,
+          updated_at: now + index
+        }
+      end
+    )
+  end
+
   # --- GET /v1/plans/:slug ---------------------------------------------------
 
   test "GET /v1/plans/:slug round-trips what POST created" do
