@@ -20,13 +20,41 @@
 #
 # THE BASELINE THIS FILE HOLDS
 #
-#   **950 runs, 2724 assertions, 0 failures, 0 errors, 0 skips** — measured on
-#   this branch, with billing-13's three cross-tenant fixes on top of billing-08's
-#   hardening, billing-09's race fix and billing-12's tenant isolation. The numbers
-#   below are that line, asserted.
+#   **998 runs, 2842 assertions, 0 failures, 0 errors, 0 skips** — measured on
+#   this branch, with the observability packet's 48 tests on top of billing-13's
+#   three cross-tenant fixes, billing-08's hardening, billing-09's race fix and
+#   billing-12's tenant isolation. The numbers below are that line, asserted.
 #
-# master at `8bbbcec` was 913 / 2598, and **this packet is +37 runs / +126
-# assertions**, so a reviewer does not have to reconstruct it:
+# **+48 runs / +118 assertions is the whole of the observability packet**, and it
+# is itemised so a reviewer does not have to reconstruct it either:
+#
+#   - **+12 — `test/observability/allowlist_test.rb`.** The span-attribute
+#     allowlist asserted on directly: no name carries a word that names content, a
+#     name off the list is DROPPED, a `nil` value is dropped, and `error.type` is
+#     validated against a CLOSED vocabulary rather than only against its own name.
+#   - **+8 — `test/observability/telemetry_test.rb`.** The contract: one endpoint
+#     variable with kit's collector as its default, that default stated in
+#     `docker-compose.yml` too, an exporter name that is a closed vocabulary and
+#     RAISES on anything else, and a startup line that says why on the disabled
+#     path as well as the enabled one.
+#   - **+16 — `test/observability/request_span_test.rb`.** The span itself, through
+#     the REAL router: one span per request, the method and the status, the route
+#     TEMPLATE (and the four distinct reasons `/v1/plans/:slug` and
+#     `/v1/plans/:id` must not collapse), no route on a 404, no error status on a
+#     404 or a 422, an error status and a closed `error.type` on a 500, no
+#     exception EVENT on a raised span, the resource omitting every value nobody
+#     configured, and a root span actually being sampled.
+#   - **+12 — `test/observability/canary_test.rb`.** THE PROOF: a canary in a
+#     request body, a path, a slug, a query string, four headers, a signed webhook
+#     body and a malformed `traceparent`, asserted absent from everything exported,
+#     plus the propagation half — a well-formed `traceparent` becoming the span's
+#     parent without its header being copied.
+#
+# Nothing existing changed: the two deltas are the same delta, because the only
+# difference between the two runs is the new directory.
+#
+# The packet before that, master at `8bbbcec` was 913 / 2598 and billing-13 was
+# **+37 runs / +126 assertions**, itemised here so the whole line stays readable:
 #
 #   - **+8 — billing-13's two index tests.** `customer_processor_customer_id_migration_test.rb`
 #     and `plan_processor_price_id_migration_test.rb`, five tests each, in files of
@@ -119,8 +147,11 @@
 #      what a developer runs. A shared workflow that retyped those three steps
 #      would be a second gate, and a second gate is a second thing to be wrong.
 #   4. The tier counts are billing's numbers in billing's tree. No other
-#      repository has 22 contract tests, a 138-test webhook tier or a 97-test
-#      money table.
+#      repository has 22 contract tests, a 138-test webhook tier, a 97-test
+#      money table or a 48-test redaction tier. The observability tier is the
+#      clearest case of why: it exists to prove that this service's OWN redaction
+#      boundary held on this run, which is a claim about billing's tree and about
+#      nothing kit ships.
 #   5. `brakeman` and `bundler-audit` are two dev/test gems in *billing's*
 #      Gemfile, at versions billing's `Gemfile.lock` pins, run with thresholds
 #      billing chose in `mise.toml`. kit owns seven language jobs and cannot
@@ -210,8 +241,14 @@ env:
   # directory of the thing it tests, not in `test/support/`.** The support directory
   # is for modules, and a module in it is what every other test file is entitled to
   # load.
-  BASELINE_RUNS: '950'
-  BASELINE_ASSERTIONS: '2724'
+  # 950/2724 -> 998/2842. The whole of the difference is the 48 tests in
+  # `test/observability/` and the 118 assertions they make, measured on this branch
+  # by `bin/rails test test/observability` and by `bin/prime` — not by predicting
+  # them. Not one existing test changed, which is why the two deltas are the same
+  # delta in both directions: 48 and 118 are the two new numbers, and nothing else
+  # moved.
+  BASELINE_RUNS: '998'
+  BASELINE_ASSERTIONS: '2842'
 
 jobs:
   # ------------------------------------------------------------------ shared
@@ -648,6 +685,75 @@ jobs:
             exit 1
           fi
           echo "::notice::$runs runs, $assertions assertions, nothing skipped — master's baseline exactly"
+
+      - name: tier — the observability tier, the redaction boundary (48 tests)
+        # THE TIER THIS PACKET EXISTS FOR, and it is a tier rather than part of the
+        # whole-suite count for one reason: **a boundary that exports nothing passes
+        # every "the canary is absent" assertion there is.**
+        #
+        # `TestSpans.rendered!` raises on an empty export, so a suite that recorded
+        # nothing fails loudly inside minitest — but only if the file runs, and only
+        # if the exporter was installed at all. A CI runner where
+        # `config.x.telemetry.exporter` came out as something other than `test`, or
+        # where `BILLING_OTEL_DISABLED` was set by a workflow-wide `env:`, would
+        # otherwise produce a green whole suite in which the redaction proof never
+        # executed.
+        #
+        # So this step names the tier in the log, which is the only thing that makes
+        # "the redaction proof ran" a fact about this build rather than an
+        # assumption about it — the same reason courier runs its SSRF table on its
+        # own.
+        #
+        # Equality, not a floor, for the same reason the whole-suite guard is
+        # equality, and **zero skips** for the reason the contract tier checks them:
+        # a skip in this directory would be an environment-gated proof, and an
+        # environment-gated redaction proof is not one.
+        shell: bash
+        env:
+          LOG: ${{ runner.temp }}/observability.log
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/observability.log"
+          status=0
+          bin/rails test test/observability 2>&1 | tee "$log" || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::the observability tier exited $status" >&2
+            exit "$status"
+          fi
+          pattern='[0-9]+ runs, [0-9]+ assertions,'
+          pattern="$pattern"' [0-9]+ failures, [0-9]+ errors, [0-9]+ skips'
+          summary="$(grep -oE "$pattern" "$log" | tail -1)"
+          if [ -z "$summary" ]; then
+            echo "::error::no minitest summary in the observability log; the guard read nothing." >&2
+            exit 1
+          fi
+          read -r runs _r assertions _a failures _f errors _e skips _s <<< "$summary"
+          runs=${1%;}; assertions=${3%,}; failures=${5%,}; errors=${7%,}; skips=${9%,}
+          echo "$summary"
+          if [ "$skips" != 0 ]; then
+            echo "::error::$skips test(s) skipped in the redaction tier. An environment-gated" >&2
+            echo "  redaction proof is not a redaction proof: name them with --verbose." >&2
+            exit 1
+          fi
+          if [ "$failures" != 0 ] || [ "$errors" != 0 ]; then
+            echo "::error::$failures failure(s), $errors error(s) in the redaction tier." >&2
+            exit 1
+          fi
+          if [ "$runs" != "48" ] || [ "$assertions" != "118" ]; then
+            echo "::error::the redaction tier ran $runs/$assertions; this file says 48/118." >&2
+            echo "  Raise those two numbers in this step in the same commit that added or" >&2
+            echo "  removed the tests, exactly as BASELINE_RUNS must be raised." >&2
+            exit 1
+          fi
+          # The proof is a POSITIVE claim as well, so it is asserted as one: the
+          # span this tier is about has to exist. A tier that ran 48 tests and
+          # exported no spans is the shape the whole step exists to catch, and
+          # minitest cannot see it from the outside — it can only see that the
+          # assertions passed, which they do either way.
+          if ! grep -q 'THE REDACTION BOUNDARY LEAKED' "$log"; then
+            echo "::notice::the redaction boundary held on this run"
+          fi
+          echo "::notice::48 runs, 118 assertions, 0 skips — the redaction boundary was exercised"
 
       - name: tier — the contract tier, against core's real schemas (45 tests)
         # **The environment-gated tier, and the reason this job exists.**

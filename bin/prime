@@ -130,4 +130,29 @@ fi
 step "rails test"
 bundle exec rails test
 
-step "prime ok (rails $(version_of bin/rails))"
+# Through `bundle exec`, and this is a FIX rather than a preference.
+#
+# Every command above is `bundle exec <thing>`, and this one was the only bare
+# `bin/rails`. `bin/rails` reaches its gems through `require "bundler/setup"`,
+# which resolves against the INTERPRETER's GEM_HOME, while `bundle exec` uses
+# bundler's own resolution — and on a machine where bundler installs a new gem
+# version into its own `libexec/gems`, the two disagree. The observable
+# consequence is not a warning: `gate.yml` declares a proof that this line reads
+# `== prime ok (rails <X.Y.Z>)`, so an empty version string made the gate FAIL
+# with `gate.proof-missing` while `mix test`-equivalent output above it was green.
+#
+# Measured, on the machine the observability packet was written on, adding
+# `opentelemetry-exporter-otlp 0.37.0`:
+#
+#     $ bin/rails --version
+#     Could not find opentelemetry-exporter-otlp-0.37.0, opentelemetry-common-0.25.2,
+#     google-protobuf-4.36.2 in locally installed gems (Bundler::GemNotFound)
+#
+# `version_of` swallows that (`2>/dev/null … || true`), so the gate printed
+# `== prime ok (rails )` and the proof did not match. The gate caught it; this is
+# what it caught.
+#
+# `bundle exec bin/rails --version` is also more correct in principle: it reports
+# the Rails that `bundle exec rails test` above it actually ran, rather than a
+# Rails resolved by a different route that may not be the same one.
+step "prime ok (rails $(version_of bundle exec bin/rails))"

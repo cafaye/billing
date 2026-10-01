@@ -447,14 +447,23 @@ defaults plus `pg`.
 
 ```sh
 mise install            # or use any Ruby 4.0.1
-docker compose up -d    # postgres on :5432
-bin/prime               # bundle, db:prepare, rubocop, rails test
-bin/rails server        # http://localhost:3000
+bin/prime               # bundle, db:prepare, rubocop, rails test — the gate, and what CI runs
+bin/dev                 # kit's stack: postgres, NATS, Redis, the collector, and Grafana
+bin/dev stack           # which bytes of kit this worktree runs, and the merged compose result
+bin/rails server        # http://localhost:3000, against whatever database you have
 ```
 
-`bin/prime` is the gate and is what CI runs. If you already have a PostgreSQL on
-the machine, skip the compose file: `config/database.yml` connects over the
-local socket as the current user.
+`bin/prime` is the gate. If you already have a PostgreSQL on the machine, skip
+`bin/dev` entirely: `config/database.yml` connects over the local socket as the
+current user.
+
+**`bin/dev` is kit's script, verbatim**, and it brings up kit's shared stack
+rather than a stack of this repository's own. `kit.ref` pins the commit those
+bytes come from, and `docker-compose.yml` is an OVERRIDE merged beside it: this
+service, its database name and role, and the crash layer. There is no `db:`
+service in it any more and no collector configuration — see
+[Observability](AGENTS.md#observability) for why the collector's file is never a
+service's to own.
 
 Point the app at a database elsewhere with `DATABASE_URL`, the same variable CI
 uses:
@@ -533,8 +542,12 @@ app/services/subscriptions/          the lifecycle: state machine, plan-change r
 app/services/processor/              the three requests this service makes
 app/lib/problem.rb                   the one error shape
 app/lib/money_params.rb              the only place a request becomes an amount
+lib/kit/telemetry.rb                 the span-attribute ALLOWLIST, and the ONE recorder
+lib/middleware/request_telemetry.rb  the request span, the route TEMPLATE, the 404
 openapi/v1.yaml                      the HTTP contract
 test/contract/                       the checks against core, and the HTTP one
+test/observability/                  the redaction boundary, and its proof
+kit.ref                              the pinned kit commit `bin/dev` fetches
 cafaye.yml                           the manifest
 ```
 
@@ -547,6 +560,26 @@ Two environment variables are needed for the webhook to answer at all:
 | `STRIPE_WEBHOOK_SECRET` | the endpoint's signing secret. Unset, every request is a 503 `unavailable` rather than a 400, because that is this service's misconfiguration and not the sender's. |
 | `STRIPE_WEBHOOK_SECRETS` | a comma-separated list, for a rotation. A signature that verifies under any configured secret is accepted. |
 | `STRIPE_WEBHOOK_TOLERANCE` | seconds, default 300. The window in which a captured request stays replayable. |
+
+And one that is needed for nothing: observability is **on by default**, so this
+variable only matters if you are pointing billing at a backend you already run.
+
+| Variable | Meaning |
+| --- | --- |
+| `BILLING_OTEL_ENDPOINT` | the OTLP endpoint, default `http://otel-collector:4318` — which is the collector that ships with kit's stack. **The only contract** (core D16), so a self-hoster on Datadog or Grafana Cloud sets this one variable and kit's stack goes quiet. Unset costs spans and nothing else: no queue, no retry loop, no dial at boot. |
+| `BILLING_OTEL_DISABLED` | set to anything, and telemetry is not installed at all. The startup line says so and names the reason. |
+| `BILLING_TENANT_ID` | the `tenant_id` **resource** attribute. Never a span attribute — see [Observability](AGENTS.md#observability). Unset by default, because an empty one is a second service row in every collector's service list. |
+| `DEPLOYMENT_ENVIRONMENT` | the `deployment.environment` resource attribute; an enum in core's schema, so there is no fourth spelling to invent. |
+| `OTEL_SERVICE_VERSION` | the `service.version` resource attribute. Omitted rather than defaulted when unset. |
+
+The exported spans carry **four attributes and no others**: the method, the status
+code, the route template and a closed-vocabulary `error.type`. No path, no query
+string, no headers, no email, no price, no exception message. The proof is
+`test/observability/canary_test.rb`, which plants a canary in every field a caller
+controls and raises if it finds one in anything exported, and the allowlist it is
+checked against is `Kit::Telemetry::ALLOWED_SPAN_ATTRIBUTES` — one list, one
+recorder, and `test/observability/allowlist_test.rb` fails if a name carrying a
+word that means content ever gets onto it.
 
 Nothing is stubbed in the specs: the suite signs committed fixture bytes with a
 constant that is a credential for nothing and exercises the real verification

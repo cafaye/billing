@@ -211,7 +211,11 @@ are later packets with their own briefs.
 billing/
 ├── mise.toml               # toolchain pins + the tasks (mise run prime)
 ├── bin/prime               # the gate: bundle, db:prepare, rubocop, rails test
-├── docker-compose.yml      # local postgres:17-alpine, the only service in the stack
+├── bin/dev                 # kit's, VERBATIM: fetch kit.ref, merge with our override, up
+├── bin/migrate             # `bundle exec rails db:prepare`, and why kit needs this file
+├── kit.ref                 # the pinned kit commit the local stack comes from
+├── docker-compose.yml      # an OVERRIDE on kit's stack: this service, our database,
+│                            #   our crash layer. No collector config, no own postgres.
 ├── Dockerfile              # ruby slim, multi-stage, non-root, via Kamal/Thruster
 ├── cafaye.yml              # the manifest; DECISION NEEDED notes are load-bearing
 ├── openapi/v1.yaml         # the HTTP contract, and what `exposes.api` points at
@@ -242,6 +246,13 @@ billing/
 │       │   └── lifecycle.rb           # the only writer of a subscription
 │       └── webhooks/                  # verify, store, normalize, emit — in that order
 │           └── ingestion.rb           # store, act once, and what a lost race records
+├── lib/
+│   ├── kit/
+│   │   ├── telemetry.rb               # the span-attribute ALLOWLIST and the ONE recorder
+│   │   ├── exporter.rb                # which exporter, from a CLOSED vocabulary
+│   │   └── tracer_installer.rb        # the provider, the processor, the propagator
+│   └── middleware/
+│       └── request_telemetry.rb       # the request span, the route TEMPLATE, the 404
 ├── test/
 │   ├── contract/                      # the checks against core, and the HTTP one
 │   │   ├── http_surface_contract_test.rb # the document and the router, by method and path
@@ -252,12 +263,19 @@ billing/
 │   │   ├── outbox_processor_event_id_migration_test.rb # reversibility, run for real
 │   │   ├── customer_processor_customer_id_migration_test.rb # ditto, for the cus_ index
 │   │   └── plan_processor_price_id_migration_test.rb       # ditto, for the price_ index
+│   ├── observability/                 # the redaction boundary, and its proof
+│   │   ├── allowlist_test.rb          # the allowlist itself: 12 tests
+│   │   ├── telemetry_test.rb          # the contract, the resource, the wiring: 8
+│   │   ├── request_span_test.rb       # the span, through the real router: 16
+│   │   └── canary_test.rb             # THE PROOF: a canary in every caller field: 12
 │   ├── requests/v1/                   # the API specs
 │   ├── services/                      # the lifecycle, the client, the webhook mapping
 │   │   └── webhooks/
 │   │       └── concurrent_delivery_test.rb  # the duplicate-charge race, deterministically
 │   ├── support/                       # shared helpers: frozen clock, fake Stripe, two accounts
-│   │   └── two_accounts.rb            # the pair every isolation spec compares against
+│   │   ├── two_accounts.rb            # the pair every isolation spec compares against
+│   │   ├── test_span_exporter.rb      # the exporter that records instead of sending
+│   │   └── test_spans.rb              # reading those spans, and RAISING on empty
 │   └── tenant/                        # the tenant boundary, enumerated and held
 │       ├── account_entry_point_matrix_test.rb # every account-scoped access, derived from app/
 │       ├── cross_account_delivery_test.rb     # the boundaries that hold, against Postgres
@@ -282,7 +300,9 @@ Run these; do not improvise equivalents.
 | Run one file | `bin/rails test test/models/money_test.rb` |
 | Run the linter | `bin/rubocop --parallel` |
 | Security scan | `bin/bundler-audit check --update` and `bin/brakeman --no-pager` |
-| Start the database | `docker compose up -d` |
+| Start the stack (database + collector + traces) | `bin/dev` |
+| Resolve which bytes of kit this worktree runs | `bin/dev stack` |
+| Stop it, keeping the data | `bin/dev down` |
 | Everything CI runs | `bin/prime`, plus `bin/bundler-audit check --update` and `bin/brakeman --no-pager --quiet --exit-on-warn` (`mise run security`) |
 
 ## Money
@@ -547,6 +567,161 @@ transaction that marks the delivery finished. The rules:
   a DECISION in `cafaye.yml`, and changed by one line in
   `Webhooks::StripeEvents.subject_for`.
 
+## Observability
+
+OpenTelemetry, in this service rather than only in kit's toolkit, and **on by
+default in every environment**: unset, `BILLING_OTEL_ENDPOINT` is the collector
+that ships with kit's stack. A developer running `bin/rails server` and a deployer
+both get traces without assembling anything, and a self-hoster already running a
+backend sets one variable and kit's stack goes quiet. That is the whole of core
+D16, and it is a *default* rather than a production-only switch because a
+production-only switch is a no-op everywhere it is actually used — including in
+this repository's own suite, where every redaction assertion would then pass
+having proved nothing.
+
+**One span per request, `billing.http.request`**, recorded by
+`lib/middleware/request_telemetry.rb`. `kind: :server`, the method, the status, and
+— where one exists — the **route template**.
+
+**One span-attribute allowlist, in `Kit::Telemetry`, and it is a choke point
+rather than a convention.** Every attribute goes through `Kit::Telemetry.record/2`,
+which drops anything not on `ALLOWED_SPAN_ATTRIBUTES`. The realistic failure is not
+an attacker: it is a well-meaning engineer in six months adding
+`span.set_attribute("customer.email", customer.email)` because it would help debug
+a subscription, in the service whose rows carry a customer's email, a processor id
+and a price in minor units. **Do not call `span.set_attribute` directly** — a
+`set_attribute` on a span billing owns bypasses the allowlist by exactly as much as
+the engine will later strip, which is to say it succeeds. Four names are allowed
+and each is bounded rather than merely allowed:
+
+| name | why it is bounded |
+|---|---|
+| `http.request.method` | eight values in HTTP/1.1, nine in HTTP/2 |
+| `http.response.status_code` | an integer, bounded by the protocol |
+| `http.route` | **one value per endpoint**, because it is the template |
+| `error.type` | a CLOSED vocabulary of three, this service's own |
+
+Three properties of the middleware are decisions rather than conventions, and each
+has a test that fails when it stops holding:
+
+- **`http.route` is the template, from the ROUTER'S OWN TABLE.** A template has one
+  value per endpoint; a concrete path has one per request, and kit's collector
+  derives metrics with a `spanmetrics` connector that mints a series per distinct
+  value. The lookup is `[verb, controller, action]` → template, derived from
+  `Rails.application.routes.routes` — not a hand-written list of fourteen routes,
+  which would be a second answer to "what does the router serve" and would rot the
+  way `test/contract/http_surface_contract_test.rb` exists to prove a list rots.
+  **A 404 carries NO route at all**: the path of an unmatched request is
+  caller-controlled text, so recording it is the cardinality bomb and the content
+  leak in one move. The 404 status is the answer.
+- **Only 5xx is an error span.** A 401 or a 404 is this service REFUSING a caller,
+  which is this service working; an error rate that counts them is a function of
+  how much guessing the internet absorbs, and an alert on it pages somebody to
+  switch off the protection doing its job.
+- **A raised exception's MESSAGE and STACKTRACE are not on the span.** That is why
+  the middleware calls `start_span` and finishes the span itself rather than using
+  `tracer.in_span`: `in_span` calls `span.record_exception(e)` by default, which
+  attaches the class name, the message and the backtrace as a span **EVENT**, and
+  an event is exported. An exception message here is built three frames up from what
+  a caller sent — `test/integration/secrets_do_not_leak_test.rb` exists because that
+  is where leaks live, and the span is a second place the same string would land.
+  The status description is `RequestTelemetry::FAILURE_DESCRIPTION`, a constant,
+  for the same reason `Problem::INTERNAL_DETAIL` is one.
+
+**Metrics come from the collector's `spanmetrics` connector, not from billing**, and
+so do the logs:
+
+- **No `opentelemetry-exporter-otlp-metrics`.** The connector derives metrics from
+  spans *after* redaction, so a derived metric can never carry a dimension the
+  allowlist stripped, and there is no second definition of the same series anywhere
+  in the fleet. The cost is stated rather than hidden: **billing cannot emit a
+  gauge**, so "the outbox relay has stalled" is visible only as a flat trace count.
+- **No `opentelemetry-instrumentation-rails` / `-rack`.** `use_all!` records
+  `http.target`, `url.full`, `url.query` and request headers as its own span
+  attributes. Those are exactly the values a redacting collector strips, so
+  depending on the engine to strip them would make billing's boundary ONE control
+  where this repository insists on TWO. The middleware is hand-rolled for that
+  reason and for no other.
+- **Logs are the container's stdout.** compose's `logging:` driver ships them to the
+  collector's `syslog/crash` receiver, which makes a panic a log record with a
+  `service.name` on it and adds no per-language dependency to the `Gemfile`.
+
+### The redaction proof, and what makes it a proof
+
+`test/observability/canary_test.rb` plants a canary in every field a caller
+controls — a request body, a path, a slug, a query string, four headers, a signed
+webhook body, a malformed `traceparent` — drives REAL requests through the REAL
+router, and **raises `THE REDACTION BOUNDARY LEAKED`** if it finds the string in
+anything exported. It is a test that fails when the boundary leaks, which is the
+only shape a redaction proof can have.
+
+**Every absence assertion in it is paired with a presence one**, through
+`TestSpans.rendered!/0`, which RAISES on an empty export. A boundary that deletes
+everything passes "no canary" and is useless, and that is not hypothetical: three
+separate exporter-contract mistakes did exactly this while this telemetry was being
+written, each of which left the suite green —
+
+- an exporter implementing `export(span_datas)` where the callback is
+  `export(span_datas, timeout:)`; `SimpleSpanProcessor#on_finish` rescues
+  everything and hands the `ArgumentError` to `OpenTelemetry.handle_error`, which
+  logs it and continues;
+- `SUCCESS` resolved as an unqualified constant from a subclass, where
+  `OpenTelemetry::SDK::Trace::Export::SUCCESS` is a **sibling namespace**, not an
+  inherited one — the same rescue, the same silence;
+- a batch appended as one value, putting an Array of `SpanData` where every reader
+  expects a span.
+
+All three are written down in `test/support/test_span_exporter.rb`, next to the
+class, because the next person to touch it will be near all three.
+
+**The redaction tier has its own CI step** and its own count. It exists because a
+suite that exported nothing would otherwise satisfy every assertion in the file:
+`config.x.telemetry.exporter` could come out as something other than `test`, or a
+workflow-wide `env:` could set `BILLING_OTEL_DISABLED`, and the whole-suite baseline
+would still read green with the proof never executed. The step's equality check and
+its zero-skips check are both guards against that, and both were proven able to
+fail — see `CHANGELOG.md`.
+
+### Fault injections this packet recorded
+
+Every guard above was broken on purpose, and each one is a claim about a mutation
+rather than about the code:
+
+| mutation | caught by |
+|---|---|
+| `route_template` returning `env["PATH_INFO"]` instead of the template | `request_span_test.rb` — 3 failures; the concrete uuid appears in the export |
+| a `span.set_attribute` that bypasses `record/2`, with the canary in the query string | `canary_test.rb` — **THE REDACTION BOUNDARY LEAKED** |
+| `"billing.customer.email"` added to `ALLOWED_SPAN_ATTRIBUTES` | `allowlist_test.rb` — both the content-word test and the pinned list |
+| `mark_error`'s threshold moved from 500 to 400 | `request_span_test.rb` — 2 failures, the 404 and the 422 |
+| `span.record_exception` re-enabled in the rescue | `request_span_test.rb` — the message, the class and the stacktrace are on the span as an EVENT |
+
+**One injection did NOT bite and is recorded because it is instructive.** Recording
+the status code *before* `@app.call` returned changed nothing: Rack returns the
+status, so the second write simply overwrites the first. In Go the equivalent trap
+is real — `http.ResponseWriter` latches its status at `WriteHeader`, so reading it
+early reads a 200 forever — and `identity`'s telemetry tests hold that one. The
+difference is a property of the two runtimes, and the asymmetry is why the same
+"read the status after" rule is enforced by a test in one service and merely
+explained in the other.
+
+### The kit adoption
+
+`kit.ref` pins the kit commit, `bin/dev` is **kit's own script verbatim**, and
+`docker-compose.yml` is an OVERRIDE on kit's stack: it names this service, its
+database and its crash layer, and it carries **no collector configuration**, **no
+postgres container of its own**, and **no `depends_on: otel-collector`**. That file
+holds the redaction allowlist, which kit derives from core's schemas; a service
+that owned it would be shipping a telemetry boundary nobody derived. Nothing but
+the collector may be in a readiness path, because a service that waits for the
+collector serves no traffic while the collector is down — strictly worse than
+serving traffic with no traces, and it teaches people to switch telemetry off.
+
+`bin/migrate` exists for one line of real content and the reason is in its header:
+kit's `bin/dev` falls back to `bin/rails db:prepare`, and on a machine where
+bundler installs into its own `libexec/gems` that fallback cannot find the gems.
+`bin/migrate` is the FIRST probe kit reaches for, and it is `bundle exec rails
+db:prepare`.
+
 ## CI
 
 `.github/workflows/ci.yml` has four jobs, and **the job names are the claims** —
@@ -556,7 +731,7 @@ and in this repository the unknown is load-bearing.
 | job | what it is |
 |-----|------------|
 | `ruby (kit)` | `uses: cafaye/kit/.github/workflows/ci.reusable.yml@master` with `language: ruby`. The shared half. Fails on two steps, absorbed by `continue-on-error` — see below. |
-| `gate` | THE gate. `bin/prime` against a real Postgres, every environment-gated tier forced on and counted, and `git diff --exit-code`. |
+| `gate` | THE gate. `bin/prime` against a real Postgres, every environment-gated tier forced on and counted, and `git diff --exit-code`. Four tiers are named: the whole suite (998 / 2842 by equality), the redaction tier (48 / 118), the contract tier (45 / 400) and the webhook tier (163). |
 | `security` | `brakeman` and `bundler-audit`, with no database. |
 | `pins` | One Ruby number in three files, the documented `uses:` path, and no secret in the file. No toolchain, so it fails in seconds. |
 
@@ -594,7 +769,9 @@ Four things that are not obvious and that the file argues in full:
   first are the money arithmetic and the webhook signatures. Adding a test turns
   CI red until
   `BASELINE_RUNS`/`BASELINE_ASSERTIONS` are raised **in the same commit** — that
-  is the intended direction, and lowering one is not.
+  is the intended direction, and lowering one is not. They were 950 / 2724 and are
+  now **998 / 2842**, and the whole of that difference is the 48 tests and 118
+  assertions in `test/observability/`, itemised in the workflow's own header.
 
   **The tiers are measured by directory, and `test_helper.rb` requires all of
   `test/support/**/*.rb`** — so a `_test.rb` file living in `test/support/` joins
@@ -778,7 +955,14 @@ environment, and the `pins` job fails the build if the workflow file ever gains 
   a licensed product and the shallow clones are behavioral references only;
   every line here is written from scratch (PLAN §2).
 - **Never** add a gem without saying so in the PR body. Rails defaults and `pg`
-  are the current floor; a new dependency is a decision, not a convenience.
+  are the current floor; a new dependency is a decision, not a convenience. Two have
+  been added since, with their cause in the `Gemfile`'s own comment and in
+  [Observability](#observability) above: `opentelemetry-sdk` and
+  `opentelemetry-exporter-otlp`. Without them billing cannot emit a span at all and
+  the collector kit ships has nothing to redact, so they are the floor rather than a
+  choice among alternatives. **What was NOT added is as load-bearing**, and each is
+  named there: no `-metrics`, no `-instrumentation-rails`, no `-instrumentation-rack`,
+  no log SDK.
   (This is why there is no JSON Schema validator, no outbox gem and no HTTP
   client: each would have been one, and each was refused.)
 - Errors are raised at the boundary with the identifier needed to find the
@@ -1014,6 +1198,12 @@ environment, and the `pins` job fails the build if the workflow file ever gains 
 
 - [ ] `bin/prime` is green from a clean worktree
 - [ ] New behavior has a test that fails without it
+- [ ] A span attribute is added to `Kit::Telemetry::ALLOWED_SPAN_ATTRIBUTES` **and**
+      to `test/observability/allowlist_test.rb`'s pinned list in the same commit, and
+      its name survives the content-word test — a name that names content fails there
+- [ ] Nothing sets a span attribute except through `Kit::Telemetry.record/2`, and a
+      500's span still carries no exception event, no exception message and no
+      stacktrace
 - [ ] Money changes keep 100% line and branch coverage on every file in
       `MoneyPathsCoverageTest::MONEY_PATHS`, and a file that touches money is in
       that list or in `MIXED_MONEY_FILES` with a reason that still holds
