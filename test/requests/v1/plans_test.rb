@@ -204,6 +204,63 @@ class V1PlansTest < ActionDispatch::IntegrationTest
     assert_problem "conflict"
   end
 
+  # `processor_price_id` is unique, and this is the request that says so — F3.
+  #
+  # `Subscriptions::Lifecycle#plan` resolves a delivery by this column with
+  # `find_by`, so two plans on one `price_` means a subscription is billed against
+  # whichever plan claimed the id, at an amount this service never agreed to with
+  # the customer. `billing.subscription.started` then carries that plan's currency
+  # and nothing about the one that was intended, so the wrong amount is published
+  # as well as charged.
+  test "POST /v1/plans is a 409 when the processor price id is another plan's" do
+    create_plan(processor_price_id: "price_FAKEalreadytakenBBBBBBB")
+
+    assert_no_difference [ "Plan.count", "OutboxEvent.count" ] do
+      post "/v1/plans",
+        params: plan_params(name: "Cheaper", slug: "cheaper", processor_price_id: "price_FAKEalreadytakenBBBBBBB"),
+        as: :json
+    end
+
+    assert_response :conflict
+    assert_problem "conflict"
+    # Named, so a client knows which of its fields collided. `price` and
+    # `processor_price_id` are two different fields and a 409 that said only
+    # "already exists" would leave the client guessing between them.
+    assert_match(/processor_price_id/, response.body)
+  end
+
+  test "PATCH /v1/plans/:id is a 409 when the new processor price id is another plan's" do
+    plan = create_plan
+    other = create_plan(slug: "enterprise-yearly", processor_price_id: "price_FAKEtheirsBBBBBBBBBB")
+
+    patch "/v1/plans/#{plan.id}", params: { processor_price_id: other.processor_price_id }, as: :json
+
+    assert_response :conflict
+    assert_problem "conflict"
+    assert_nil plan.reload.processor_price_id,
+      "the refused field was written anyway"
+  end
+
+  # The two that would break every client if they were wrong: a `price_` nobody
+  # holds is accepted, and a plan that is not on sale at the processor at all
+  # stays that way. A unique index over a **nullable** column has to allow both,
+  # which is the reason the index is partial.
+  test "POST /v1/plans accepts a plan with no processor price id" do
+    post "/v1/plans", params: plan_params, as: :json
+
+    assert_response :created
+    assert_nil Plan.sole.processor_price_id
+  end
+
+  test "PATCH /v1/plans/:id accepts the processor price id it already holds" do
+    plan = create_plan(processor_price_id: "price_FAKEsameBBBBBBBBBBBBB")
+
+    patch "/v1/plans/#{plan.id}", params: { processor_price_id: "price_FAKEsameBBBBBBBBBBBBB" }, as: :json
+
+    assert_response :ok
+    assert_equal "price_FAKEsameBBBBBBBBBBBBB", plan.reload.processor_price_id
+  end
+
   test "PATCH /v1/plans/:id is a 404 for an id that does not exist" do
     patch "/v1/plans/99999999-9999-4999-8999-999999999999", params: { active: false }, as: :json
 

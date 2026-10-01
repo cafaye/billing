@@ -42,6 +42,26 @@ class Customer < ApplicationRecord
   # well-formed, it just collides with something that already exists.
   validates :processor, uniqueness: { scope: %i[owner_type owner_id] }
 
+  # **A second row may not claim one `cus_`.** The database says so
+  # (`customers_processor_customer_id_idx`, billing-13); this is what turns the
+  # collision into a *named* answer for a client.
+  #
+  # `Subscriptions::Lifecycle#customer` resolves a delivery by this column with
+  # `find_by`, so two rows claiming one id is a question with two answers and a
+  # delivery about one account's subscription billed to whichever row the planner
+  # reached first. With the index alone the answer is a 409 whose body says "That
+  # record already exists." and names no field; with this the 409 names
+  # `processor_customer_id`, which is the one column of this resource a client can
+  # move onto somebody else's.
+  #
+  # `allow_nil` because the column is nullable on purpose: a customer created
+  # through `/v1` has no `cus_` until its first subscription tells this service
+  # what the processor calls it, and many rows are legitimately in that state at
+  # once. So the rule is "a value here is unique", not "this column is unique" —
+  # the same reading the index's partial predicate states, and the reason that
+  # index is partial rather than a bare `unique`.
+  validates :processor_customer_id, uniqueness: true, allow_nil: true
+
   before_validation :normalize_metadata
 
   # The wire shape, and the outbox payload: one representation, so an event and

@@ -342,12 +342,21 @@ class SubscriptionTest < ActiveSupport::TestCase
       @customer ||= create_customer
     end
 
+    # A **distinct** `cus_` per customer, and not because these two helpers
+    # wanted variety: `customers_processor_customer_id_idx` is unique, so the two
+    # of them sharing one id was an F2 collision this file was accidentally
+    # arranging. `test "a second account may hold the same plan at the same time"`
+    # builds two customers, and the second was refused for holding an id the first
+    # already had. `build_customer` never saves, so it needs no counter and takes
+    # the same first id for a row that is only going to be validated.
     def create_customer(account_id: nil)
+      @customer_count = @customer_count.to_i + 1
+
       Customer.create!(
         owner_type: "Account",
         owner_id: account_id || create_account,
         processor: "stripe",
-        processor_customer_id: "cus_R1pQKz9xLp2mN4vB6yH8jL0"
+        processor_customer_id: next_processor_customer_id
       )
     end
 
@@ -356,8 +365,13 @@ class SubscriptionTest < ActiveSupport::TestCase
         owner_type: "Account",
         owner_id: create_account,
         processor: "stripe",
-        processor_customer_id: "cus_R1pQKz9xLp2mN4vB6yH8jL0"
+        processor_customer_id: next_processor_customer_id
       )
+    end
+
+    def next_processor_customer_id
+      [ "cus_FIRST", *StripeSubscriptionFixtures::ADDITIONAL_CUSTOMER_IDS ][@customer_count - 1] ||
+        raise("no unused processor customer id left in this file")
     end
 
     def create_account

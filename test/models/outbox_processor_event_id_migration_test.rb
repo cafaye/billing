@@ -162,22 +162,13 @@ class OutboxProcessorEventIdMigrationTest < ActiveSupport::TestCase
 
     # A uniqueness violation aborts the enclosing PostgreSQL transaction, after
     # which every later command on that connection fails with
-    # `PG::InFailedSqlTransaction`. A savepoint absorbs it. This is the only
-    # place in the repository that needs the trick, because this is the only
-    # test that writes outside a transaction.
-    def assert_raises_in_savepoint
-      violation = nil
-      ActiveRecord::Base.transaction(requires_new: true) do
-        violation = begin
-          yield
-          nil
-        rescue ActiveRecord::StatementInvalid => e
-          e
-        end
-        raise ActiveRecord::Rollback
-      end
-
-      assert_instance_of ActiveRecord::RecordNotUnique, violation,
-        "expected the restored index to refuse the duplicate, got #{violation.inspect}"
+    # `PG::InFailedSqlTransaction`. A savepoint absorbs it, and the trick lives in
+    # `test/support/constraint_refusals.rb` because billing-13's two index tests
+    # need the same thing — see that file for why it is shared rather than copied.
+    def assert_raises_in_savepoint(&block)
+      assert_refused_by_constraint(
+        "expected the restored index to refuse the duplicate",
+        &block
+      )
     end
 end

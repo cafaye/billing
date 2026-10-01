@@ -67,6 +67,43 @@ module Subscriptions
     # the next reader is a human with a subscription id and nothing else.
     STALE_REASON = "stale_delivery".freeze
 
+    # The reason a delivery is refused for naming an account the row is not on.
+    #
+    # This is the seventh refusal and the only one about **tenancy** rather than
+    # about the row's own shape. The other six ask "can this delivery be applied
+    # to this subscription?"; this one asks "whose subscription is it?" — and the
+    # answer is not allowed to change.
+    #
+    # ## What it is refusing
+    #
+    # `attributes` writes `account_id: customer.owner_id` onto the row, and before
+    # this rule it did so **without ever comparing it to the account already
+    # there**. So a second delivery naming a different customer moved a live
+    # subscription between accounts, and published the move as
+    # `billing.subscription.updated` carrying the new account. `Subscription#account_is_the_customers_owner`
+    # did not catch it, and could not: that rule is "a subscription's account is
+    # its customer's", which the new account satisfied, and not "a subscription's
+    # account does not move". This is finding F1 in
+    # `REPORT-billing-12-isolation.md`.
+    #
+    # ## Why the refusal and not a correction
+    #
+    # Moving the subscription back would be this service inventing a fact, and the
+    # status came with the delivery — a `canceled` this service never saw would
+    # revoke entitlements a customer had paid for. A refusal records the decision
+    # on the delivery row and answers 200, because a processor that retries it
+    # reaches the identical conclusion. That is the same argument as
+    # `stale_delivery`, and for the same reason.
+    #
+    # ## Where it sits in the order, and why
+    #
+    # After the state machine, after `no_subscription_to_update` and after
+    # `stale_delivery`, because those are the rules a subscriber is relying on and
+    # none of them should be reported as something incidental. A delivery that is
+    # both out of order *and* cross-account is recorded as the out-of-order one, and
+    # the honest reading of that row is the earlier problem.
+    ACCOUNT_REASON = "account_mismatch".freeze
+
     # The three processor types this lifecycle acts on, and the cafaye event each
     # of them can become. The same three the outbox and the manifest declare, so a
     # type cannot be emitted that core's catalog does not list.
@@ -187,6 +224,17 @@ module Subscriptions
 
       def apply(subscription, from, transition)
         existed = !subscription.nil?
+
+        # **Before `assign_attributes`**, because that is the statement which
+        # overwrites the account, and a comparison made afterwards would compare
+        # the new account with itself and always agree.
+        #
+        # Only for a row that already exists. A creation has no account to
+        # disagree with, which is exactly what lets a `deleted` arriving before
+        # its own `created` still create its `canceled` row — a rule that would
+        # break here if the check were unconditional.
+        raise Refused, ACCOUNT_REASON if existed && !same_account?(subscription)
+
         subscription ||= Subscription.new
 
         subscription.assign_attributes(attributes)
@@ -205,6 +253,28 @@ module Subscriptions
 
       def changes_anything?(subscription)
         STATE_ATTRIBUTES.any? { |attribute| subscription.will_save_change_to_attribute?(attribute) }
+      end
+
+      # Whether the delivery resolves to the account the row is already on.
+      #
+      # **The comparison the model could not make.**
+      # `Subscription#account_is_the_customers_owner` answers "is this account
+      # this customer's?", and after a reassignment the answer is yes — which is
+      # why the defect survived it. The question here is the other one: has the
+      # account *moved*? A row that already names an account, and a delivery that
+      # resolves to another, are two accounts, and no amount of internal
+      # consistency makes that one subscription.
+      #
+      # **There is no nil branch, and there is not one to write.** Both sides are
+      # `null: false` — `subscriptions.account_id` and `customers.owner_id` — so
+      # "both absent" is not a state this table can be in, and a guard for it
+      # would be unreachable code that reads as if it were doing something. A nil
+      # account is refused at the edge instead: the column's NOT NULL for a write
+      # that skips the model, and `Subscription`'s presence validation for one that
+      # does not. The same reasoning is why `Subscription#account_id` carries no
+      # shape validation, and the comment on `Customer#owner_id` is the same note.
+      def same_account?(subscription)
+        subscription.account_id == customer.owner_id
       end
 
       def attributes

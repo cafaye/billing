@@ -263,8 +263,12 @@ published both events and left the active row; that was the bug this fixes.
 
 A refusal is recorded on the delivery row with its reason and answered 200. The
 reasons are `unknown_customer`, `unknown_plan`, `no_subscription_to_update`,
-`canceled_is_terminal` and `no_change_to_record`, and "we refused this" is a
-query rather than an absence.
+`canceled_is_terminal`, `no_change_to_record`, `stale_delivery` and
+`account_mismatch`, and "we refused this" is a query rather than an absence.
+`account_mismatch` is the only one about **tenancy** rather than about the row's
+own shape: a delivery naming a customer on a *different* account than the row is
+on is refused rather than applied, so a subscription cannot be moved between
+accounts by a delivery. See `REPORT-billing-13-fixes.md`.
 
 There is deliberately no `billing.customer.updated`: core's catalog has no row
 for it, and a service that publishes a type the catalog does not list is a
@@ -401,6 +405,15 @@ to make, not an oversight.
   to fail to match. The table stays as a constant and the contract test derives
   the gap from core's files, because a table iterated zero times would exit 0
   having proved nothing.
+- **A processor customer id and a price id each belong to one row.**
+  `customers.processor_customer_id` and `plans.processor_price_id` carry unique
+  indexes over their non-null values, and both `POST` and `PATCH` answer **409
+  naming the field** when a client claims one another row already holds. Without
+  them a delivery could resolve to either of two accounts' rows — a
+  `find_by` with no `ORDER BY` decides nothing when two rows answer to one id —
+  and a subscription could be billed against a plan at a price nobody agreed to.
+  `/v1` is still unauthenticated and still unscoped; these make the *delivery
+  path* resolve deterministically, which is not the same as authorizing the caller.
 - **A subscription created directly in the processor's dashboard is not tracked.**
   It carries no cafaye customer id, so the delivery is recorded as
   `ignored:unknown_customer` and answered 200. Matching it to whoever happens to

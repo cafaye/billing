@@ -44,17 +44,24 @@
 openapi: 3.1.0
 info:
   title: billing
+  # 1.3.0 adds a response, not an operation. `PATCH /v1/customers/{id}` can now
+  # answer 409, because `processor_customer_id` became unique and that is the one
+  # field on a customer a client can move; `POST /v1/customers` and both plan
+  # writes could already answer 409 and now say *which* collision they are
+  # reporting. No operation was added, removed or changed, and no response body
+  # shape moved, so this is a minor bump and the `/v1` prefix is untouched —
+  # core's checklist asks for `info.version` to be raised if anything else in the
+  # document moved, and the `/409` rows are that.
+  #
   # 1.2.0 moved no operation. What moved is this document's account of itself:
   # `info.description` said it "describes the v0 surface" while the version said
   # otherwise, and the header above now states the rule that holds the document to
-  # the router. core's checklist asks for `info.version` to be bumped if anything
-  # else in the document moved, and this is that bump; the operations are
-  # unchanged, so the `/v1` prefix is untouched.
+  # the router.
   #
   # 1.1.0 was the five subscription paths under the same `/v1` prefix, plus a new
   # response field on the subscription resource (`price`) and one on the plan
   # resource (`entitlements`).
-  version: 1.2.0
+  version: 1.3.0
   description: >-
     Plans, customers, the subscription lifecycle, and one inbound
     payment-processor webhook for cafaye. This document describes every client
@@ -125,7 +132,8 @@ paths:
       summary: Create a customer
       description: >-
         Creates billing's record of an identity user or account. One customer
-        per (owner, processor): a second attempt is a 409.
+        per (owner, processor), and one customer per `processor_customer_id`: a
+        second attempt at either is a 409.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/TraceId'
@@ -185,6 +193,11 @@ paths:
         Partial update. Emits no event: core's event catalog has no
         `billing.customer.updated` row, and this service does not publish a type
         the catalog does not list.
+
+        `processor_customer_id` is unique across customers, so a claim on an
+        identifier another customer already holds is a 409. `owner` and
+        `processor` are not updatable, which leaves this as the one identifier a
+        client can move.
       parameters:
         - $ref: '#/components/parameters/TraceId'
       requestBody:
@@ -205,6 +218,8 @@ paths:
                 $ref: '#/components/schemas/Customer'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '422':
           $ref: '#/components/responses/ValidationFailed'
 
@@ -236,6 +251,9 @@ paths:
       tags: [plans]
       operationId: createPlan
       summary: Create a plan
+      description: >-
+        One plan per `slug`, and one plan per `processor_price_id`. A second
+        attempt at either is a 409, and the body names the field that collided.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/TraceId'
@@ -308,6 +326,9 @@ paths:
         a mutable handle is not a safe thing to address a mutation by. A slug
         is a 404 here: this operation does not look plans up by slug. Emits
         `billing.plan.updated` only when a field actually changed.
+
+        `slug` and `processor_price_id` are both unique across plans, so a claim
+        on either one another plan already holds is a 409 and nothing is written.
       parameters:
         - $ref: '#/components/parameters/TraceId'
       requestBody:
@@ -846,12 +867,21 @@ components:
         Every field is optional, and an absent field is left alone. `owner` and
         `processor` are not updatable: they are the key the uniqueness rule is
         built on, and moving a customer is a delete and a create.
+
+        `processor_customer_id` IS updatable, and it is unique across customers —
+        the one identifier a client can move, and the reason this operation can
+        answer 409. A null means "this customer has no id at the processor yet",
+        which many customers may be at once, so the rule is on the value and not
+        on the column.
       properties:
         email:
           type: [string, 'null']
           format: email
         processor_customer_id:
           type: [string, 'null']
+          description: >-
+            The processor's own id for this customer. Unique: a value another
+            customer already holds is a 409 naming this field.
         metadata:
           type: object
           additionalProperties: true
@@ -934,6 +964,10 @@ components:
     PlanUpdate:
       type: object
       additionalProperties: false
+      description: >-
+        Every field is optional, and an absent field is left alone. `slug` and
+        `processor_price_id` are both unique across plans, so a claim on either
+        one another plan already holds is a 409 and nothing is written.
       properties:
         name:
           type: string
@@ -954,6 +988,10 @@ components:
           type: [string, 'null']
         processor_price_id:
           type: [string, 'null']
+          description: >-
+            The processor's own id for this plan's price. Unique: a value another
+            plan already holds is a 409 naming this field. A null means the plan
+            is not on sale yet, which many plans may be at once.
 
     PlanEntitlements:
       type: object

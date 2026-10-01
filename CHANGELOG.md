@@ -6,6 +6,69 @@ All notable changes to billing are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **The three cross-tenant defects billing-12 proved are now closed: a delivery
+  can no longer move a subscription between accounts, and a processor customer id
+  or price id can no longer be claimed twice.** `+37 runs / +126 assertions`
+  (913 → 950 runs, 2598 → 2724 assertions), and the six findings tests in
+  `test/tenant/cross_account_findings_test.rb` are **rewritten rather than
+  deleted**: same two accounts, same delivery, same `PATCH`, same pair of plans,
+  with each assertion flipped from "the defect reproduces" to "the defect is
+  refused". See `REPORT-billing-13-fixes.md` for the before/after of each.
+
+  | finding | before | after |
+  |---|---|---|
+  | **F1** | a delivery naming another account's customer moved a live subscription between accounts and published it as `billing.subscription.updated` | refused as `ignored:account_mismatch`, answered **200**, no row change, no event |
+  | **F2** | two customers could answer to one `cus_`, so a delivery's account was undecided | `customers_processor_customer_id_idx` is unique over the non-null values; a colliding `POST`/`PATCH` is a **409 naming `processor_customer_id`** |
+  | **F3** | two plans could claim one `price_`, so a subscription could be billed at an unagreed amount | `plans_processor_price_id_idx`, and a **409 naming `processor_price_id`** |
+
+  **`account_mismatch` is the seventh `Subscriptions::Refused` reason** and the
+  first about tenancy rather than about the row's shape. It is recorded on the
+  delivery row and answered 200, because a refused delivery is a decision and not
+  an error: the processor would retry a 4xx, reach the identical conclusion, and
+  the row already carries the reason. The comparison lives in
+  `Subscriptions::Lifecycle#apply`, before `assign_attributes` and only for a row
+  that already exists — a first delivery has no account to disagree with, which is
+  what lets a deletion arriving before its own creation still create its
+  `canceled` row.
+
+  **Both indexes are partial, and the reason is not stylistic.** The columns are
+  nullable and legitimately so — a customer created through `/v1` has no `cus_`
+  until a subscription tells this service what the processor calls it — so the
+  rule is *a value here is unique*, not *this column is unique*. A bare `unique`
+  index would allow the nulls by way of PostgreSQL's `NULLS DISTINCT` default, and
+  that is a database default rather than a statement of intent; the partial index
+  does not depend on it, because a null is not **in** the index.
+
+  **`openapi/v1.yaml` gains a 409 on `PATCH /v1/customers/{id}`** and
+  `info.version` moves to 1.3.0 — that operation could not answer a conflict
+  before, and a response the document does not list is a document lying about its
+  own surface. The other three writes could already answer 409 and now say which
+  collision they report. No operation was added, removed or changed, so the `/v1`
+  prefix is untouched.
+
+  **No existing webhook test broke.** A guard that turns green tests red would
+  have been a test encoding the defect; none was, and the report says what changed
+  in the two files that did move.
+
+### Changed
+
+- **The subscription-fixture helpers no longer default to one processor id.**
+  `create_stripe_plan` and `create_stripe_customer` in
+  `test/support/stripe_subscription_fixtures.rb` handed every row the same
+  `price_`/`cus_`, which is precisely finding F2 and F3's shape: two rows claiming
+  one processor id. Nothing was *arranging* a collision — it was an artifact of a
+  shared default — and the two new unique indexes turned 85 passing tests in
+  `test/requests/v1/subscriptions_test.rb` into 85 errors. **The first call in a
+  test still gets the committed fixtures' id**, which is load-bearing: it is what
+  the subscription fixtures carry and what a delivery resolves through. A separate
+  euro-currency plan in that file was also claiming the USD plan's `price_`, which
+  is incoherent on its face and now has an id of its own.
+  `test/coverage/fixture_processor_ids_check_test.rb` holds the two id lists in
+  step, and holds the regression: two customers and two plans in one test get two
+  ids each and are both written.
+
 ### Added
 
 - **Tenant isolation, enumerated and held: 14 account-scoped routes and 33

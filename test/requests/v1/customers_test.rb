@@ -46,6 +46,81 @@ class V1CustomersTest < ActionDispatch::IntegrationTest
     assert_problem "conflict"
   end
 
+  # `processor_customer_id` is unique, and this is the request that says so.
+  #
+  # It is the collision F2 was about, arriving through the service's own surface:
+  # `CustomerUpdate` closes `owner` and `processor` — the columns the
+  # `(owner_type, owner_id, processor)` index is built on — and permits
+  # `processor_customer_id`, which makes that one field the whole of it. Two rows
+  # on one `cus_` means `Lifecycle#customer` resolves a delivery with `find_by` to
+  # a row the data does not decide, and the account that gets billed is whichever
+  # one the planner reached.
+  test "POST /v1/customers is a 409 when the processor customer id is another customer's" do
+    create_customer(processor_customer_id: "cus_FAKEalreadytakenBBBBBBBBB")
+
+    assert_no_difference [ "Customer.count", "OutboxEvent.count" ] do
+      post "/v1/customers",
+        params: {
+          owner_type: "User", owner_id: OTHER_OWNER_ID, processor: "stripe",
+          processor_customer_id: "cus_FAKEalreadytakenBBBBBBBBB"
+        },
+        as: :json
+    end
+
+    assert_response :conflict
+    assert_problem "conflict"
+    # The body names the field. A 409 that only said "that record already exists"
+    # would tell a client its request collided with *something* and not with what,
+    # and this is the one field on this resource a client can move onto somebody
+    # else's — so it is the one that has to be named.
+    assert_match(/processor_customer_id/, response.body)
+  end
+
+  # A 409 is not an error in the model, so nothing is half-written: the row the
+  # caller owns is exactly as it was. A conflict that left the field changed would
+  # be a different bug, and a *worse* one, because the caller would believe it had
+  # moved.
+  test "a refused processor customer id leaves the caller's own row untouched" do
+    victim = create_customer(
+      owner_id: OTHER_OWNER_ID, processor_customer_id: "cus_FAKEvictimBBBBBBBBBBBBB"
+    )
+    caller = create_customer(processor_customer_id: "cus_FAKEcallerAAAAAAAAA")
+
+    patch "/v1/customers/#{caller.id}",
+      params: { processor_customer_id: victim.processor_customer_id },
+      as: :json
+
+    assert_response :conflict
+    assert_equal "cus_FAKEcallerAAAAAAAAA", caller.reload.processor_customer_id,
+      "the refused field was written anyway"
+    assert_equal "cus_FAKEvictimBBBBBBBBBBBBB", victim.reload.processor_customer_id
+  end
+
+  # The other direction, and the one that would break every client if it were
+  # wrong: a `cus_` nobody holds yet is accepted, and setting the same value the
+  # row already holds is not a collision with itself.
+  test "PATCH /v1/customers/:id accepts a processor customer id nobody holds" do
+    customer = create_customer(processor_customer_id: "cus_FAKEmineAAAAAAAAAA")
+
+    patch "/v1/customers/#{customer.id}",
+      params: { processor_customer_id: "cus_FAKEnewoneBBBBBBBBBBBB" },
+      as: :json
+
+    assert_response :ok
+    assert_equal "cus_FAKEnewoneBBBBBBBBBBBB", customer.reload.processor_customer_id
+  end
+
+  test "PATCH /v1/customers/:id accepts setting the processor customer id to the value it already holds" do
+    customer = create_customer(processor_customer_id: "cus_FAKEsameAAAAAAAAAAA")
+
+    patch "/v1/customers/#{customer.id}",
+      params: { processor_customer_id: "cus_FAKEsameAAAAAAAAAAA" },
+      as: :json
+
+    assert_response :ok
+    assert_equal "cus_FAKEsameAAAAAAAAAAA", customer.reload.processor_customer_id
+  end
+
   test "POST /v1/customers is a 422 for a field the client got wrong" do
     post "/v1/customers", params: { owner_type: "User", owner_id: OWNER_ID, processor: "stripe", email: "nope" }, as: :json
 

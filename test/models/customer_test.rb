@@ -23,6 +23,43 @@ class CustomerTest < ActiveSupport::TestCase
     assert @customer.valid?, @customer.errors.full_messages.to_sentence
   end
 
+  # --- one `cus_`, one customer ----------------------------------------------
+  #
+  # The validation behind `customers_processor_customer_id_idx`, and the reason the
+  # index is not enough on its own: a validation is not a lock, so the index has to
+  # be there too — but with only the index, a `PATCH` is answered with a 409 whose
+  # body names no field. `:taken` is what `ProblemResponses` turns into a named
+  # 409, and this is the error it reads.
+  test "a second customer may not claim a processor customer id that is taken" do
+    Customer.create!(owner_type: "Account", owner_id: OTHER_OWNER_ID, processor: "stripe",
+      processor_customer_id: "cus_FAKEnotmineBBBBBBBBBBBBB")
+
+    @customer.processor_customer_id = "cus_FAKEnotmineBBBBBBBBBBBBB"
+
+    refute @customer.valid?
+    assert @customer.errors.of_kind?(:processor_customer_id, :taken),
+      "the refusal has to be `:taken` and not a generic `:invalid`, or the 409 stops being a " \
+      "conflict and becomes a 422 about a field the client cannot fix"
+  end
+
+  test "a processor customer id nobody holds is accepted" do
+    @customer.processor_customer_id = "cus_FAKEnobodyhasitBBBBBBBBB"
+
+    assert_predicate @customer, :valid?
+  end
+
+  # `allow_nil`, and the reason is that many rows are legitimately in this state:
+  # a customer created through `POST /v1/customers` has no `cus_` until its first
+  # subscription tells this service what the processor calls it. The rule is "a
+  # value here is unique", not "this column is unique" — which is the same reading
+  # the index's partial predicate states.
+  test "many customers may hold no processor customer id at all" do
+    Customer.create!(owner_type: "Account", owner_id: OWNER_ID, processor: "stripe")
+    other = Customer.new(owner_type: "Account", owner_id: OTHER_OWNER_ID, processor: "stripe")
+
+    assert_predicate other, :valid?
+  end
+
   test "a customer needs no email" do
     @customer.email = nil
 
