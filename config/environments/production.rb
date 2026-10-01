@@ -84,4 +84,12 @@ Rails.application.configure do
   #
   # Skip DNS rebinding protection for the default health check endpoint.
   # config.host_authorization = { exclude: ->(request) { request.path == "/up" } }
+
+  # OPENTELEMETRY. On by default here, and the default value of
+  # `BILLING_OTEL_ENDPOINT` is the collector that ships with kit's stack — so a
+  # developer running `bin/rails server` sees real traces with nothing switched
+  # on, and a self-hoster already running a backend sets one variable and kit's
+  # stack goes quiet. `config/application.rb` already sets `otlp`; naming it here
+  # as well would be a second answer to a question with one, so it is left to the
+  # file that owns the default and only the endpoint is discussed here.
 end

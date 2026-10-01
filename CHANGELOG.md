@@ -21,6 +21,94 @@ All notable changes to billing are recorded here. The format follows
   The copyright line matches the three repositories that already shipped a
   licence exactly: `Copyright (c) 2026 cafaye`.
 
+||||||| 80538f5
+- **billing emits OpenTelemetry spans into the collector that ships with kit's
+  stack.** `BILLING_OTEL_ENDPOINT` is the only contract (core D16) and it is **on
+  by default** — unset, it is `http://otel-collector:4318` — so a developer running
+  `bin/rails server` and a deployer both get traces without assembling anything.
+  Before this, a deployed billing produced no traces, no request timings and no
+  error spans, and the collector kit ships had nothing to receive.
+
+  - **One span per request, `billing.http.request`, `kind: :server`**, carrying the
+    method, the status, and — where one exists — the **route template**.
+  - **`http.route` is the template, from the ROUTER'S OWN TABLE.** The lookup is
+    `[verb, controller, action]` → template, derived from
+    `Rails.application.routes.routes`, not a hand-written list of fourteen routes:
+    a second list of what the router serves is a second answer to a question
+    `test/contract/http_surface_contract_test.rb` already exists to keep honest.
+    A template has one value per endpoint and a concrete path has one per request,
+    and kit's collector derives metrics with a `spanmetrics` connector that mints a
+    series per distinct value — so a path here would be a metric-series explosion
+    and a content leak in one move.
+  - **A 404 carries NO route at all.** The path of an unmatched request is
+    caller-controlled text; the 404 status is the answer.
+  - **Only 5xx is an error span.** A 404 and a 422 are this service REFUSING a
+    caller, which is this service working. An error rate that counts them is a
+    function of how much guessing the internet absorbs, and an alert on it pages
+    somebody to switch off the protection doing its job.
+  - **Four span attributes, and no others: the method, the status code, the route
+    template, and a CLOSED-vocabulary `error.type`.** Each is bounded rather than
+    merely allowed, and the list is the whole redaction boundary. No path, no query
+    string, no headers, no email, no price, no tenant, no exception message.
+  - **`tenant_id` is a RESOURCE attribute**, never a span attribute — on a span it
+    is unbounded cardinality by another name.
+  - **A raised exception's message and stacktrace are NOT on the span**, and that is
+    why the middleware calls `start_span` and finishes the span itself rather than
+    using `tracer.in_span`: `in_span` calls `span.record_exception(e)` by default,
+    which attaches the class name, the message and the backtrace as a span **EVENT**,
+    and an event is exported. An exception message in this service is built three
+    frames up from what a caller sent.
+  - **W3C trace context is honoured**, so an inbound `traceparent` becomes the
+    span's parent and the collector shows one trace per CALLER rather than one per
+    request. `Baggage` is deliberately **not** installed: it propagates
+    caller-chosen key/value pairs into a downstream service's context, which is one
+    more thing to allowlist for no property anybody asked for.
+  - **Metrics come from the collector's `spanmetrics` connector, which runs after
+    redaction** — so a derived metric can never carry a dimension the allowlist
+    stripped, and there is no second definition of the same series in the fleet.
+  - **Logs cost nothing.** compose's `logging:` driver ships the container's stdout
+    to the collector's `syslog/crash` receiver, which makes a panic a log record
+    with a `service.name` on it and adds no per-language dependency to the Gemfile.
+- **THE REDACTION PROOF, and it fails when the boundary leaks.**
+  `test/observability/canary_test.rb` plants a canary in every field a caller
+  controls — a request body, a path, a slug, a query string, four headers, a signed
+  webhook body, a malformed `traceparent` — drives REAL requests through the REAL
+  router, and **raises `THE REDACTION BOUNDARY LEAKED`** if it finds the string in
+  anything exported.
+  - **Every absence assertion is paired with a presence one**, through
+    `TestSpans.rendered!/0`, which RAISES on an empty export. A boundary that
+    deletes everything passes "no canary" and is useless, and three separate
+    exporter-contract mistakes did exactly that while this was being written — an
+    `export/1` where the callback is `export(span_datas, timeout:)`,
+    `SUCCESS` resolved as an inherited constant when
+    `OpenTelemetry::SDK::Trace::Export::SUCCESS` is a sibling namespace, and a batch
+    appended as one value. All three are swallowed by
+    `SimpleSpanProcessor#on_finish`'s rescue, so all three leave the suite green.
+  - **The redaction tier has its own CI step and its own count** (48 / 118), because
+    a suite that exported nothing would satisfy every assertion in the file: a
+    runner where `config.x.telemetry.exporter` came out as something other than
+    `test`, or where a workflow-wide `env:` set `BILLING_OTEL_DISABLED`, would
+    otherwise produce a green whole suite with the proof never executed.
+- **Two gems, with their cause:** `opentelemetry-sdk` (1.13.1) and
+  `opentelemetry-exporter-otlp` (0.37.0), in **every** group including test.
+  Without them billing cannot emit a span at all. Deliberately **not** added:
+  `opentelemetry-exporter-otlp-metrics` (metrics come from the collector),
+  `opentelemetry-instrumentation-rails` and `-rack` (their `use_all!` records
+  `http.target`, `url.full`, `url.query` and request headers as its own attributes
+  — depending on the engine to strip them would make this boundary ONE control
+  where this repository insists on TWO, which is why the middleware is hand-rolled),
+  and any log SDK (logs are the container's stdout).
+- **kit adoption, through kit.** `kit.ref` pins the commit, `bin/dev` is **kit's
+  own script verbatim**, and `docker-compose.yml` is an OVERRIDE on kit's stack
+  instead of a file that carried its own `postgres:17-alpine` service. No collector
+  configuration (kit derives the redaction allowlist from core's schemas, and a
+  service that owned that file would be shipping a telemetry boundary nobody
+  derived), no postgres container of its own, and no `depends_on: otel-collector`
+  — nothing but the collector may be in a readiness path.
+- **`bin/migrate`**, so `bin/dev` has a migration step to call. It is
+  `bundle exec rails db:prepare`, and the reason it is not left to kit's
+  `bin/rails db:prepare` fallback is in its header: on a machine where bundler
+  installs into its own `libexec/gems`, `bin/rails` cannot find the gems.
 - **`gate.yml`: this repository's gate is now declared, and `bin/prime` refuses
   an unpinned Ruby.** billing was one of the six cafaye services with no gate
   declaration, so a developer here could run `bin/prime`, see green, and learn
@@ -1204,6 +1292,28 @@ never calls.
 - The cursor is unsigned, the unique-index race path is handled but not
   covered by a spec, and idempotency keys are never pruned. All three are listed
   in README under "Known gaps".
+
+### Known gaps (observability)
+
+- **billing cannot emit a metric gauge**, so a stalled outbox relay is invisible on
+  the metrics signal and shows up only as a flat trace count. The alternative would
+  be a service-side meter, and the metrics signal was deliberately left to the
+  collector's `spanmetrics` connector so that it runs *after* redaction.
+- **`SimpleSpanProcessor` exports on the request thread.** Its own documentation
+  warns against production use and the warning is real. It is the deliberate trade
+  in a service whose request volume is a Stripe webhook and a handful of reads, and
+  the OTLP exporter has no retry queue and a short timeout, so a collector that is
+  down costs a failed export rather than a slow request. A service that outgrew it
+  would move to `BatchSpanProcessor` with a bounded queue — one line in
+  `Kit::TracerInstaller`.
+- **There is one span per request and nothing finer.** No span wraps a subscription
+  lifecycle, a webhook ingestion or an outbox emission, so "how long did the
+  processor call take" is not answerable from a trace. Each would be a child span
+  started where the work happens, and none exists yet.
+- **`BILLING_OTEL_DISABLED` switches telemetry off entirely**, and the only thing
+  that says so is one startup log line. There is no metric for it, because a metric
+  asserting that telemetry is off is a metric nobody is looking at.
+
 
 ## [0.1.0] - 2026-09-30
 

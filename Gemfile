@@ -41,6 +41,37 @@ gem "image_processing", "~> 1.2"
 # forged amount must never be believed.
 gem "stripe", "~> 19.6"
 
+# OpenTelemetry. The trace SDK and the OTLP exporter, and the reason each is named
+# here is in app/lib/kit/telemetry.rb: without them billing cannot emit a span at
+# all, and the collector kit ships with the stack has nothing to redact.
+#
+# In EVERY group, including test: `BILLING_OTEL_ENDPOINT` is ON BY DEFAULT (core
+# D16), so a developer running `bin/rails server` exports into the collector that
+# ships with the stack, and a deployer gets traces without assembling them.
+# Gating the exporter to production would make the default a no-op everywhere it
+# is actually used, which is backwards — and it would make the redaction tests in
+# this repository assert nothing, because a suite with no exporter exports nothing.
+#
+# Deliberately NOT added, each with a reason rather than a preference:
+#
+#   * opentelemetry-instrumentation-rails / -rack. `use_all!` records
+#     `http.target`, `url.full`, `url.query` and request headers as its own span
+#     attributes. Those are exactly the values a redacting collector strips, and
+#     depending on the engine to strip them would make billing's boundary ONE
+#     control where this repository insists on TWO. Hence a hand-rolled Rack
+#     middleware in app/middleware/, which records only what
+#     `Kit::Telemetry::ALLOWED_SPAN_ATTRIBUTES` permits.
+#   * opentelemetry-exporter-otlp-metrics. Metrics come from kit's collector's
+#     `spanmetrics` connector, which derives them from spans AFTER redaction — so
+#     a derived metric can never carry a dimension the allowlist stripped, and
+#     there is no second definition of the same series anywhere in the fleet.
+#   * opentelemetry-instrumentation-logger / opentelemetry-logs. Logs are the
+#     container's stdout: compose's `logging:` driver ships them to the
+#     collector's `syslog/crash` receiver, which makes a panic a log record with a
+#     `service.name` on it and adds no per-language dependency to this repository.
+gem "opentelemetry-sdk", "~> 1.13"
+gem "opentelemetry-exporter-otlp", "~> 0.37"
+
 group :development, :test do
   # See https://guides.rubyonrails.org/debugging_rails_applications.html#debugging-with-the-debug-gem
   gem "debug", platforms: %i[ mri windows ], require: "debug/prelude"

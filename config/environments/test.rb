@@ -62,4 +62,18 @@ Rails.application.configure do
 
   # Raise error when a before_action's only/except options reference missing actions.
   config.action_controller.raise_on_missing_callback_actions = true
+
+  # OPENTELEMETRY IS ON IN TEST, and it is the only reason the redaction tests
+  # here mean anything.
+  #
+  # Every absence assertion in `test/observability/` reads `TestSpans.rendered!`,
+  # which RAISES on an empty export. So a suite that exported nothing fails those
+  # tests loudly rather than passing them: the alternative is a redaction boundary
+  # that is never exercised and a suite that reports it holds.
+  #
+  # The exporter is the in-memory one, so nothing leaves the process, and it is the
+  # REAL SDK with a real exporter swapped in — a test reads `SpanData`, which is
+  # what a collector would have received, rather than a parallel object this
+  # repository invented.
+  config.x.telemetry.exporter = "test"
 end

@@ -332,7 +332,15 @@ gate:
       # floors, at 758/763 and 92/93. It was caught zero times, because the
       # deletion moved the run count to 945, which is 182 above the floor.
       #
-      # This is the fourth instance in this file of the shape D13, D15 and D16
+      # RAISED 950 -> 998, IN THE OBSERVABILITY PACKET, measured. 998 runs /
+      # 2842 assertions / 0 failures / 0 errors / 0 skips, and the whole of that
+      # difference is the 48 tests and 118 assertions in `test/observability/` —
+      # the same two numbers `BASELINE_RUNS`/`BASELINE_ASSERTIONS` in CI moved to
+      # in this commit, counted the same way and in the same run. One floor, not
+      # two: a declaration and a workflow holding different numbers for the same
+      # suite is two answers to one question.
+      #
+      # This is the fifth instance in this file of the shape D13, D15 and D16
       # describe, and the most quotable one: **the floor was not too strict, it
       # was too loose, and nothing said so.** A floor never blocks a merge, so
       # this one rotted silently through two landings while the declaration read
@@ -340,7 +348,7 @@ gate:
       # a comment, and the comment is prose, and prose is not compared against
       # anything. The self-test caught it, which is the entire argument for
       # shipping the self-test with the declaration.
-      minimum: 950
+      minimum: 998
     # ---------------------------------------------------------------------
     # The gate reached its own last line. With the five above it, the step
     # markers bracket the run: the toolchain was pinned, the bundle resolved, a
