@@ -560,5 +560,8 @@ edited as a side effect, and nothing is copied out of `moon/refs/`.
 
 ## License
 
-Released under the same license as the rest of cafaye. See `LICENSE` once the
-manager adds it — this repository is public and the file is not written yet.
+MIT. See [LICENSE](LICENSE).
+
+Same reasoning as the rest of the fleet: billing is a platform reached as a
+dependency through the service registry, and MIT is what lets a consumer add it
+without its own licensing situation changing.

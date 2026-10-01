@@ -8,6 +8,19 @@ All notable changes to billing are recorded here. The format follows
 
 ### Added
 
+- **`LICENSE`: billing is MIT.** billing shipped no licence file, which is not
+  "unlicensed, therefore free" — it is **all rights reserved**, the default
+  copyright position when a public repository grants nothing. README.md said so
+  out loud and pointed at a file that did not exist; it now points at one that
+  does.
+
+  billing publishes no gem (no gemspec, and the Gemfile has no `gemspec`
+  directive), so there is no package metadata field to reconcile and the
+  `LICENSE` file is the entire grant.
+
+  The copyright line matches the three repositories that already shipped a
+  licence exactly: `Copyright (c) 2026 cafaye`.
+
 - **`gate.yml`: this repository's gate is now declared, and `bin/prime` refuses
   an unpinned Ruby.** billing was one of the six cafaye services with no gate
   declaration, so a developer here could run `bin/prime`, see green, and learn
