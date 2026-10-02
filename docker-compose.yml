@@ -181,10 +181,52 @@ services:
       POSTGRES_HOST_AUTH_METHOD: trust
     # `fsync=off` is acceptable here and nowhere else. kit's volume is scratch space
     # on a laptop; durability costs seconds on every write in the suite and buys
-    # nothing that `bin/dev nuke` does not throw away anyway. It is a COMMAND on a
-    # service kit ships, which is a documented override — and unlike `ports:` it is
-    # a scalar, so it replaces rather than appends.
-    command: "-c fsync=off"
+    # nothing that `bin/dev nuke` does not throw away anyway.
+    #
+    # THIS IS A LIST, AND IT REPEATS KIT'S OWN ARGUMENTS, which is the whole
+    # reason it looks redundant. Compose's `command` REPLACES rather than merges,
+    # and it replaces the entire value whatever shape that value has — so the
+    # scalar this used to be,
+    #
+    #     command: "-c fsync=off"
+    #
+    # did not add `fsync=off` to kit's command. It deleted kit's command. Measured
+    # on the merged config, not inferred:
+    #
+    #     $ docker compose -f kit/…/docker-compose.yml -f ./docker-compose.yml config
+    #     …
+    #       command:
+    #         - -c
+    #         - fsync=off
+    #
+    # Two things are gone, and the second is the dangerous one:
+    #
+    #   1. `postgres` — the entrypoint argument the image needs to start in
+    #      server mode rather than printing usage and exiting.
+    #   2. `-c max_connections=${KIT_POSTGRES_MAX_CONNECTIONS:-200}` — the
+    #      connection budget kit raises precisely so that ONE cluster can carry
+    #      the whole fleet. Losing it reverts the cluster to Postgres's default
+    #      100, silently, and only for whichever service happens to override
+    #      `command` at all.
+    #
+    # That second one is a fleet-shaped defect wearing a local costume. The
+    # budget for nine services is (9 tenants x 10) + 8 = 98, which fits inside
+    # 200 with room to spare and does NOT fit inside 100 alongside kit's
+    # reserved slots. So the override did not merely lose an optimisation — it
+    # removed the headroom that the shared-cluster plan depends on, and it did
+    # so in the one file whose green health check says the cluster is healthy.
+    #
+    # So kit's arguments are repeated here verbatim rather than appended, and the
+    # repetition is the cost of compose having no merge for this key. If kit's
+    # command ever changes, this line is the thing that goes stale — which is why
+    # it names kit's setting rather than a literal 200, and why the gate checks
+    # that this service still declares a connection budget at all.
+    command:
+      - "postgres"
+      - "-c"
+      - "fsync=off"
+      - "-c"
+      - "max_connections=${KIT_POSTGRES_MAX_CONNECTIONS:-200}"
 
   billing:
     build:

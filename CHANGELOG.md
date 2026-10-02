@@ -196,6 +196,47 @@ All notable changes to billing are recorded here. The format follows
 
 ### Fixed
 
+- **billing's `fsync=off` was deleting the cluster's connection budget, and the
+  comment above it said it was only adding an optimisation.** The override was a
+  scalar:
+
+  ```yaml
+  command: "-c fsync=off"
+  ```
+
+  Compose's `command` REPLACES rather than merges, and it replaces the whole
+  value whatever shape that value has — so this did not add `fsync=off` to kit's
+  command, it deleted it. Measured on the merged config rather than inferred:
+
+  ```console
+  $ docker compose -f kit/…/docker-compose.yml -f ./docker-compose.yml config
+  …
+    command:
+      - -c
+      - fsync=off
+  ```
+
+  kit ships `["postgres", "-c", "max_connections=${KIT_POSTGRES_MAX_CONNECTIONS:-200}"]`,
+  and both of those are gone: the `postgres` entrypoint argument, and the
+  connection budget kit raises **so that one cluster can carry the whole fleet**.
+
+  The second is the one that matters here. The budget for nine services is
+  `(9 tenants x 10) + 8 = 98`, which sits comfortably inside 200 and does **not**
+  fit inside Postgres's default 100 alongside kit's reserved slots. So the
+  override did not merely lose a tuning knob — it removed the headroom the
+  shared-cluster plan depends on, and only for whichever service overrides
+  `command` at all, which is the kind of asymmetry that arrives as a mystery
+  under load rather than as a defect.
+
+  The comment above the line already knew `command` was a scalar and replaced
+  rather than appended, and drew the wrong conclusion from it — treating the
+  replacement as harmless because the *intent* was an addition. It is now a list
+  that repeats kit's own arguments, and that repetition is the cost of compose
+  having no merge for this key.
+
+  Verified on the running cluster rather than on the merged YAML alone:
+  `show max_connections` returns **200** with billing's `fsync=off` in place.
+
 - **`core`'s payload schemas grew a `$comment`, and billing's contract test
   answered a documentation change as a contract change.** core now records on
   each of its 22 payload schemas a `$comment` naming the commit the shape was
