@@ -15,10 +15,10 @@
 # WHY THERE IS NO `db:` CONTAINER HERE ANY MORE, and it is the first thing a
 # reader will look for. kit's stack already ships a postgres:17-alpine, and a
 # second copy is two postgres majors to upgrade and a port collision for the second
-# developer on the machine. billing's own database is named by overriding kit's
-# `postgres` service's environment, which is an ENVIRONMENT override — the one
-# kind compose merges per key, so kit's own `POSTGRES_*` defaults survive for
-# anything not named here.
+# developer on the machine. billing's own database and its role are named in ONE
+# environment key on kit's `postgres` service, which is an ENVIRONMENT override —
+# the one kind compose merges per key, so kit's own `POSTGRES_*` defaults survive
+# for anything not named here and the cluster keeps an identity of its own.
 #
 # WHAT THIS FILE MAY NOT DO, and the collector is the reason
 #
@@ -51,18 +51,132 @@
 #   The same rule is why the OTLP exporter has no retry: a collector that is not up
 #   yet is the normal state of a fresh `bin/dev up`, and the service must not care.
 services:
-  # kit ships the postgres container; this is the one thing about it that belongs to
-  # this service.
+  # kit ships the postgres CLUSTER: one database and one role per service,
+  # created by `initdb/10-cluster.sh` on a fresh volume, with
+  # `REVOKE ALL ON DATABASE … FROM PUBLIC` applied to every database in it.
+  # billing's whole of that is ONE line of environment. The three lines that used
+  # to sit above it were the reason this file could not move onto kit `f6d3b74`.
   postgres:
     environment:
-      POSTGRES_DB: billing
-      POSTGRES_USER: billing
-      POSTGRES_PASSWORD: billing
+      # `KIT_POSTGRES_DATABASES` is the single place billing's database AND its
+      # role come from — one entry here becomes one `CREATE ROLE … LOGIN
+      # NOSUPERUSER NOCREATEDB` and one `CREATE DATABASE … OWNER` in the init
+      # script. It is named here rather than left to kit's default because kit
+      # deliberately has none: the fetched file spells it `${KIT_POSTGRES_DATABASES}`
+      # with no `:-`, and `10-cluster.sh` opens with `:?` on it, so a service that
+      # declares nothing is refused by a message that names the fix — "Name the
+      # services, comma-separated" — rather than served a healthy cluster holding
+      # some other service's database. A default in shared infrastructure that
+      # names a tenant is the same defect one layer up.
+      #
+      # It is `${…:-billing}` and NOT a committed literal `billing`, and the `:-`
+      # is the part that matters. This is the ONE key anybody has to extend to put
+      # a second service on this cluster, and it is a LIST. Measured on this stack
+      # with `KIT_POSTGRES_DATABASES=billing,neighbour` and nothing else changed:
+      #
+      #   [cluster] provisioning billing
+      #   [cluster] billing: CREATE EXTENSION IF NOT EXISTS vector
+      #   [cluster] provisioning neighbour
+      #   [cluster] neighbour: CREATE EXTENSION IF NOT EXISTS vector
+      #   [cluster] done: 2 service database(s), one role each, PUBLIC holds
+      #                   CONNECT on none of them
+      #
+      # A literal `billing` here could only be extended by editing this file and
+      # re-reviewing it, which would make "one shared cluster, nine services" a
+      # description rather than something a stack could do. `.env` beats a compose
+      # default — which is exactly why the committed value has to be a default and
+      # not a fact, and why kit's `.env.example` ships the key EMPTY.
+      KIT_POSTGRES_DATABASES: ${KIT_POSTGRES_DATABASES:-billing}
+
+      # THE THREE KEYS THIS BLOCK DOES NOT SET. All of them were here until kit
+      # `f6d3b74`, and all three describe the CLUSTER rather than the service:
+      #
+      #   POSTGRES_USER     the cluster's ADMINISTRATOR. The official image
+      #                     creates it as a superuser, and the init script's
+      #                     closing sweep grants CONNECT on every database in the
+      #                     cluster to `current_user` — so a service whose
+      #                     POSTGRES_USER is its own name becomes a role that can
+      #                     open every other service's database. Isolation by
+      #                     privilege is what makes one shared cluster safe;
+      #                     isolation by superuser is the absence of it, wearing
+      #                     the same green health check.
+      #
+      #                     And it never gets that far. Measured, this block's three
+      #                     old keys restored on top of kit `f6d3b74` with
+      #                     `KIT_POSTGRES_DATABASES=billing` set, so that the test
+      #                     isolates them rather than tripping over the missing
+      #                     declaration:
+      #
+      #                       $ docker logs <container>
+      #                       running /docker-entrypoint-initdb.d/10-cluster.sh
+      #                         [cluster] provisioning billing
+      #                       ERROR:  role "billing" already exists
+      #                       STATEMENT:  CREATE ROLE "billing" LOGIN NOSUPERUSER
+      #                                 NOCREATEDB NOCREATEROLE NOREPLICATION
+      #                                 PASSWORD 'billing';
+      #                       $ docker ps -a --filter name=<container>
+      #                       Exited (3)
+      #
+      #                     The image created that role before any init script was
+      #                     sourced, so `CREATE ROLE` collides with it and
+      #                     `ON_ERROR_STOP=1` turns the collision into a cluster
+      #                     that will not finish initdb.
+      #
+      #   POSTGRES_DB       the cluster's ADMINISTRATION database — it holds
+      #                     cluster administration state and no service's rows.
+      #                     Created by the image before any init script is
+      #                     sourced, for the same reason as the role above, so
+      #                     `CREATE DATABASE billing` would find it already there.
+      #                     That one is the reasoning rather than the measurement:
+      #                     in the run above `CREATE ROLE` is what fails first.
+      #
+      #   POSTGRES_PASSWORD the credential of EVERY role `10-cluster.sh` creates,
+      #                     so a per-service value is a claim about two things at
+      #                     once. It is the only one of the three that does not
+      #                     stop the cluster starting — what it does is make one
+      #                     service's file decide a credential every other service
+      #                     on the cluster authenticates with. kit already exposes
+      #                     it as `KIT_POSTGRES_PASSWORD` in `.env`, which is where
+      #                     an operator sets it, and `DATABASE_URL` below
+      #                     interpolates that same variable instead of hard-coding
+      #                     a pair.
+      #
+      # kit's `tests/fleet_check.py` fails this repository over any of the three.
+      # Measured on kit `worker/kit-29`, where `check_override_surface` is not on
+      # master yet, against this file at `master` and against this file as it
+      # stands: the old shape is three findings and exit 1, this one is `PASS
+      # fleet` and exit 0.
+      #
+      # WHAT THE REMOVAL BUYS, measured on this stack at the same ref with a
+      # two-entry list. billing is not an administrator; it owns one database and
+      # is refused at the door of the other:
+      #
+      #   select rolname, rolsuper, rolcreatedb from pg_roles
+      #    where rolname in ('cafaye','billing','neighbour');
+      #    rolname   | rolsuper | rolcreatedb
+      #   -----------+----------+-------------
+      #    billing   | f        | f
+      #    cafaye    | t        | t
+      #    neighbour | f        | f
+      #
+      #   $ psql -U billing -d billing     -tAc "select current_user, current_database()"
+      #   billing|billing
+      #   $ psql -U billing -d neighbour  -tAc "select current_user, current_database()"
+      #   psql: error: connection to server on socket … failed: FATAL:
+      #         permission denied for database "neighbour"
+      #   DETAIL:  User does not have CONNECT privilege.
+      #
+      # and the admin role this file no longer takes over reaches all of them,
+      # which is the whole of what it was giving away:
+      #
+      #   $ psql -U cafaye -d neighbour   -tAc "select current_database()"
+      #   neighbour
+      #
       # Trust auth, and it is spelled out because kit does not default it. This is a
-      # local-only database with a well-known password, and a prompt-free connection
-      # keeps `db:prepare` from ever hanging on input that nobody is there to type.
-      # It was explicit on the container this service used to own and it is explicit
-      # here for the same reason: an authentication default that changes because a
+      # local-only database, and a prompt-free connection keeps `db:prepare` from
+      # ever hanging on input that nobody is there to type. It was explicit on the
+      # container this service used to own and it is explicit here for the same
+      # reason: an authentication default that changes because a
       # base image changed is an authentication change nobody reviewed.
       POSTGRES_HOST_AUTH_METHOD: trust
     # `fsync=off` is acceptable here and nowhere else. kit's volume is scratch space
@@ -87,7 +201,28 @@ services:
       PORT: "3000"
       # Over the compose network, by service name. The host mapping above is for the
       # developer and the host-side suite.
-      DATABASE_URL: postgresql://billing:billing@postgres:5432/billing
+      #
+      # The password is INTERPOLATED, and it used to be the literal `billing` to
+      # match a `POSTGRES_PASSWORD: billing` this file no longer sets. Every role
+      # `10-cluster.sh` creates takes the cluster's `POSTGRES_PASSWORD`, so that
+      # role's password is now kit's `${KIT_POSTGRES_PASSWORD:-cafaye}` and the
+      # pair in this URL would have been a credential no role holds. A cluster
+      # password changed in `.env` cannot leave this file authenticating as a
+      # password that no longer exists. (A password containing `@` or `/` will not
+      # survive URL interpolation unescaped; that is the cost of a URL string, and
+      # it is not worth a percent-encoder to keep a development default out of a
+      # comment.)
+      #
+      # The role is `billing` and NOT the cluster's administrator: the init script
+      # creates it `LOGIN NOSUPERUSER` and owns the `billing` database with it, and
+      # that is the whole of billing's credential on this cluster. It is also the
+      # credential that is refused at the door of every other database in it.
+      #
+      # The database name is a LITERAL rather than the `:-billing` above, and
+      # deliberately so: the name here has to match the ROLE name, and the role
+      # name is the first entry of a list. Interpolating the list would hand a
+      # comma-separated string to a URL path.
+      DATABASE_URL: postgresql://billing:${KIT_POSTGRES_PASSWORD:-cafaye}@postgres:5432/billing
 
       # ---------------------------------------------------------------------
       # OBSERVABILITY, ON BY DEFAULT
