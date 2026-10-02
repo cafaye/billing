@@ -196,6 +196,50 @@ All notable changes to billing are recorded here. The format follows
 
 ### Fixed
 
+- **`core`'s payload schemas grew a `$comment`, and billing's contract test
+  answered a documentation change as a contract change.** core now records on
+  each of its 22 payload schemas a `$comment` naming the commit the shape was
+  transcribed from. `$comment` is a JSON Schema 2020-12 *metadata* keyword —
+  §8.3 requires a validator to ignore it — so this is not a change to any
+  payload's shape at all.
+
+  billing reads core's schemas with a deliberately closed vocabulary
+  (`UNDERSTOOD_KEYWORDS`), where an unmodelled keyword is a **raise** rather than
+  a skip, and its drift test holds that vocabulary against every keyword core
+  uses. That design did exactly its job: it reported the new keyword, by name,
+  once.
+
+  ```
+  Failure: OutboxEnvelopeContractTest#test_every_keyword_core's_payload_schemas_use_is_one_this_validator_understands
+  core's payload schemas now use ["$comment"], which this validator does not model
+  ```
+
+  `$comment` is now listed as understood, alongside `title` and `description`,
+  which are already there for the same reason. Two consequences worth stating,
+  because "understood" is the word that hides both:
+
+  - **It is ignored, not honoured.** A test asserts this in both directions and
+    at both schema positions — a comment claiming a valid payload is invalid, and
+    a comment excusing a breaching one, change no verdict. The dangerous patch
+    here is not the one that breaks; it is the one that makes a prose note an
+    oracle, and it would fail *open*.
+  - **The closed set did not weaken.** Every check dispatches on the keyword it
+    knows, so a listed keyword nothing dispatches on cannot contribute a breach.
+    The drift test still fires on the next keyword core starts *constraining*
+    with.
+
+  Both positions are covered because root-level coverage alone was measured to be
+  insufficient: `violations` receives the root schema and then each property's
+  constraint, so a patch honouring comments in the root walk passes every
+  root-level assertion while leaving the per-field level open — which is the
+  level a per-field comment would actually arrive at. `ONE_OF_BRANCH_KEYWORDS`
+  carries `$comment` for the same reason: metadata is ignorable at every position
+  in a schema document, and a `oneOf` branch is a position.
+
+  This was pre-existing on `master` (`7251993`) and had nothing to do with the
+  shared-cluster work in `d95fb54`; it was found while reviewing that commit's
+  gate, which is why it is recorded here separately rather than folded into it.
+
 - **The two numeric floors in `gate.yml` were 187 runs below the truth, and the
   declaration's own self-test could not tell.** The packet wrote the merge
   obligation into a comment — *"WHEN billing-09-race MERGES, raise this and

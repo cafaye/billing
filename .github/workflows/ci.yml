@@ -247,8 +247,14 @@ env:
   # them. Not one existing test changed, which is why the two deltas are the same
   # delta in both directions: 48 and 118 are the two new numbers, and nothing else
   # moved.
-  BASELINE_RUNS: '998'
-  BASELINE_ASSERTIONS: '2842'
+  # RAISED IN THIS COMMIT alongside `gate.yml`'s `suite` floor, which moved to
+  # 999 for the same reason and in the same run: the tree now runs one more test
+  # ("$comment is ignored as metadata…") at 18 more assertions, measured — not
+  # predicted — in the `bin/prime` run whose output produced both numbers. The
+  # two are raised together on purpose: a workflow and a declaration holding
+  # different numbers for one suite is two answers to one question.
+  BASELINE_RUNS: '999'
+  BASELINE_ASSERTIONS: '2860'
 
 jobs:
   # ------------------------------------------------------------------ shared

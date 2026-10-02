@@ -262,7 +262,17 @@ gate:
       # the two halves of one ratchet, one maintained and one not, which is the
       # same shape as D14 and D15: a declaration that records what the gate is
       # worth, and nothing that keeps it worth it after a merge.
-      minimum: 109
+      #
+      # RAISED IN THIS COMMIT, and this one is not this commit's doing: the tree
+      # lints **120 files**, and this floor had been sitting at 109 while every
+      # measurement above it said otherwise. It is the exact failure the paragraph
+      # above describes — a floor too loose, nothing red — except that it had been
+      # loose by eleven for long enough that the number in this comment (109) and
+      # the number in the tree (120) were both "current" and disagreed. Found by
+      # measuring rather than by guessing, in the same run that moved the `suite`
+      # floor below; both floors are claims about the same tree and they are now
+      # both true of it.
+      minimum: 120
     # ---------------------------------------------------------------------
     # The suite. THE load-bearing proof, and the only line that cannot appear
     # unless the suite ran to the end and every assertion in it passed.
@@ -348,7 +358,14 @@ gate:
       # a comment, and the comment is prose, and prose is not compared against
       # anything. The self-test caught it, which is the entire argument for
       # shipping the self-test with the declaration.
-      minimum: 998
+      # RAISED IN THIS COMMIT, and by the rule the comment above states rather
+      # than by a new instance of the defect it describes. This commit adds one
+      # test — "$comment is ignored as metadata, and changes no verdict in either
+      # direction" — so the measured tree is **999 runs / 2860 assertions**,
+      # counted in the same run that produced the number written here. CI's
+      # `BASELINE_RUNS`/`BASELINE_ASSERTIONS` move with it in this same commit:
+      # one floor, not two, for the reason the paragraph above gives.
+      minimum: 999
     # ---------------------------------------------------------------------
     # The gate reached its own last line. With the five above it, the step
     # markers bracket the run: the toolchain was pinned, the bundle resolved, a

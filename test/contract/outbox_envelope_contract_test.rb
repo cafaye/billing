@@ -145,8 +145,24 @@ class OutboxEnvelopeContractTest < ActiveSupport::TestCase
   # and the drift test below holds it against every keyword core actually uses
   # across this service's eight payload schemas. That test is what turns "core
   # changed shape" into one named failure instead of five scattered ones.
+  #
+  # `$comment` is on this list and constrains nothing, which is the point rather
+  # than an exception to it. JSON Schema 2020-12 §8.3 makes it a *metadata*
+  # keyword: a validator is REQUIRED to ignore it, and `title`/`description` —
+  # already here for the same reason — are its siblings in the same section. core
+  # writes a `$comment` on every payload schema recording where the shape was
+  # transcribed from, so "core's schemas grew a provenance note" arrives as a
+  # constraint this validator cannot check, and the closed set would answer a
+  # documentation change as if it were a contract change.
+  #
+  # Being *understood* here means ignored, and that is already true by
+  # construction: every check below dispatches on the keyword it knows
+  # (`type`, `enum`, `pattern`, …), so a listed keyword nothing dispatches on
+  # cannot contribute a breach. Adding `$comment` therefore widens what the file
+  # tolerates without widening what it accepts — and the drift test still fires on
+  # the next keyword core genuinely starts constraining with.
   UNDERSTOOD_KEYWORDS = %w[
-    $id $schema title description
+    $id $schema $comment title description
     type enum const format pattern
     minLength maxLength minimum maximum
     properties required additionalProperties oneOf
@@ -181,7 +197,14 @@ class OutboxEnvelopeContractTest < ActiveSupport::TestCase
   # required fields, which is enough to say which of two shapes is present. A
   # branch that grew a real schema inside it would raise rather than be read as a
   # `required` list it is not.
-  ONE_OF_BRANCH_KEYWORDS = %w[title description required].freeze
+  #
+  # `$comment` is here for the reason it is in UNDERSTOOD_KEYWORDS: it is metadata,
+  # ignorable at every position in a schema document, and a branch is a position.
+  # core does not put one inside a `oneOf` branch today, so this line is not
+  # covering anything real yet — it is here so that the day it does, the answer is
+  # "ignored, as the spec requires" instead of a raise from a list that had drifted
+  # one nesting level behind the vocabulary it mirrors.
+  ONE_OF_BRANCH_KEYWORDS = %w[$comment title description required].freeze
 
   # The webhook fixtures that produce the events that do not come from a model
   # callback. Ingested for real by the fixtures under test, so the payloads
@@ -291,6 +314,65 @@ class OutboxEnvelopeContractTest < ActiveSupport::TestCase
   test "the payload validator refuses a keyword it does not understand, rather than skipping it" do
     assert_raises(RuntimeError) { violations({ "patternProperties" => {} }, {}, "slug") }
     assert_raises(RuntimeError) { violations({ "format" => "hostname" }, "cafaye.com", "site") }
+  end
+
+  # The other half of the closed set, and the reason `$comment` may sit in it.
+  #
+  # Being on UNDERSTOOD_KEYWORDS means IGNORED, and this is the assertion that says
+  # so — because the two mistakes look identical in a diff and are opposites:
+  #
+  #   treating `$comment` as metadata  (correct)  — a note cannot change a verdict
+  #   treating `$comment` as a constraint (wrong)  — a note in a schema file
+  #                                              becomes an oracle
+  #
+  # The second is the more dangerous of the two, and it is what a well-meaning
+  # patch to this drift looks like: "core told me id must be an integer, let me
+  # read it out of the comment." It would make every payload fail, so it would be
+  # caught — but a comment that *relaxes* a check would pass, and that is the
+  # shape of a silent hole.
+  #
+  # So both directions are pinned, and pinned against a comment that says the
+  # opposite of the schema: `$comment` claiming a valid payload is invalid, and
+  # `$comment` claiming a breaching one is fine. Neither moves. A `$comment` that
+  # is not even a string is covered too — it is metadata, so its type is nobody's
+  # business, and refusing it would be the closed set refusing its own rule.
+  test "a $comment is ignored as metadata, and changes no verdict in either direction" do
+    # BOTH positions, and the second one is not belt-and-braces.
+    #
+    # `violations` is called with the *root* schema, and then again with each
+    # property's constraint — so a `$comment` at the root is never seen by
+    # `scalar_violations`, which receives only `{ "type" => "string" }`. A patch
+    # that taught the root walk to honour comments therefore passes every
+    # root-level assertion here while leaving the property level wide open, and
+    # that is the level at which a per-field comment would actually arrive. core
+    # writes `$comment` at the root today; "today" is not a schema constraint, and
+    # a test that only covers the position core happens to use is a test of core's
+    # current habit rather than of this validator's rule.
+    schema_for = lambda do |where, note|
+      property = { "type" => "string" }
+      root = { "type" => "object", "properties" => { "id" => property }, "required" => %w[id] }
+      case where
+      when :root then root.merge("$comment" => note)
+      when :property then root.merge("properties" => { "id" => property.merge("$comment" => note) })
+      end
+    end
+
+    %i[root property].each do |where|
+      label = "at the #{where} level"
+
+      assert_empty violations(schema_for.(where, nil), { "id" => "x" }, "data"),
+        "a valid payload is valid #{label} with no comment present"
+      assert_empty violations(schema_for.(where, "id MUST be an integer"), { "id" => "x" }, "data"),
+        "a comment demanding a stricter payload did not change a passing verdict #{label}"
+      assert_equal 1, violations(schema_for.(where, nil), { "id" => 7 }, "data").length,
+        "a breaching payload breaches #{label} with no comment present"
+      assert_equal 1, violations(schema_for.(where, "id is fine"), { "id" => 7 }, "data").length,
+        "a comment excusing a breaching payload did not change a failing verdict #{label}"
+      assert_empty violations(schema_for.(where, 42), { "id" => "x" }, "data"),
+        "a non-string comment is still ignored rather than refused #{label}"
+      assert_equal 1, violations(schema_for.(where, { "id" => "string" }), { "id" => 7 }, "data").length,
+        "a comment carrying a schema is still ignored rather than honoured #{label}"
+    end
   end
 
   # What is left of the recorded id-pattern gap, and how it is now decided.
