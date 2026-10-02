@@ -21,7 +21,6 @@ All notable changes to billing are recorded here. The format follows
   The copyright line matches the three repositories that already shipped a
   licence exactly: `Copyright (c) 2026 cafaye`.
 
-||||||| 80538f5
 - **billing emits OpenTelemetry spans into the collector that ships with kit's
   stack.** `BILLING_OTEL_ENDPOINT` is the only contract (core D16) and it is **on
   by default** — unset, it is `http://otel-collector:4318` — so a developer running
