@@ -8,20 +8,32 @@
 #
 # Five things a reader should know before trusting this document:
 #
-# 1. `security` is declared but empty, and the endpoints answer without a
-#    token. Authorization is a later platform packet; until it lands this
-#    surface is open, which is a recorded gap in README.md and not an oversight
-#    here. `GET /v1/customers` in particular returns every customer, because
-#    there is no account to scope it by.
+# 1. **Every `/v1` operation requires a bearer token**, except the one path
+#    named in note 3. `security` below is `[{bearerToken: []}]`, the scheme is an
+#    RS256 JWT issued by `identity` and verified locally against its published
+#    JWKS, and a request with no token is a `401`. A deployment that has not
+#    configured an issuer and an audience is **locked, not open**: every `/v1`
+#    request is a `503`, because a billing API whose authentication degrades open
+#    when nobody configured it is the failure this scheme exists to prevent.
+#    `401` is for the caller's credential and `503` is for ours — an unreachable
+#    identity is not something a caller can fix by rotating a token. Every
+#    customer and subscription operation is additionally scoped by the token's
+#    `account_id`, so another account's uuid is a `404`: the same answer as a uuid
+#    that names nothing, never a `403`.
 # 2. The plans read/write asymmetry is deliberate: `GET /v1/plans/{slug}` reads
 #    by the public handle, `PATCH /v1/plans/{id}` writes by uuid, because a slug
 #    can be changed by the very request being made and a mutable handle is not a
-#    safe thing to address a mutation by.
+#    safe thing to address a mutation by. **A plan is platform catalogue and
+#    carries no account**, so these four operations are authenticated but not
+#    account-scoped; see note 6.
 # 3. `/v1/webhooks/stripe` is the one path that is not a cafaye client surface.
 #    Its sender is a processor and it authenticates by signature over the raw
-#    body, so it takes no `Idempotency-Key` (the processor's own event id is the
-#    dedupe key, and it is enforced by a unique index rather than by a header),
-#    and it must never grow a token check.
+#    body, so it declares `security: []`, takes no `Idempotency-Key` (the
+#    processor's own event id is the dedupe key, and it is enforced by a unique
+#    index rather than by a header), and it must never grow a token check — a
+#    `Bearer` here would be a second, weaker trust path to the same door.
+#    Structurally it cannot: the token check is a filter on the `/v1` client base
+#    controller, and this one does not inherit from it.
 # 4. **The subscription endpoints do not decide a subscription's state.** Every
 #    mutating one asks the payment processor to do something and returns; the
 #    subscription's own status changes only when `customer.subscription.*` arrives
@@ -41,10 +53,38 @@
 #    described here" different from "in no document at all". The two sets are
 #    compared as sets rather than as counts: a rename and a pure addition are
 #    different failures, and a count cannot tell them apart.
+# 6. **Catalogue writes are authenticated but not capability-checked.** A plan has
+#    no `account_id` — it is what an account may buy, not what an account owns —
+#    so `POST /v1/plans` and `PATCH /v1/plans/{id}` change what every account is
+#    offered and core's answer to that is `scopes`, not tenancy. No client in
+#    this build holds a billing scope, so none is enforced here and **any
+#    authenticated caller can currently write the catalogue**. Recorded in
+#    `README.md` rather than papered over with a check no token could pass.
 openapi: 3.1.0
 info:
   title: billing
-  # 1.3.0 adds a response, not an operation. `PATCH /v1/customers/{id}` can now
+  # 2.0.0 is billing-21, and it is a **major** bump under a `/v1` prefix, which
+  # core's sync rule says should not happen — so the reasoning is here.
+  #
+  # Every `/v1` operation now requires a bearer token and every customer and
+  # subscription operation is scoped by the token's `account_id`. That is breaking
+  # for every client of this document: an unauthenticated call that used to answer
+  # 200 now answers 401, a request naming another account's uuid that used to
+  # answer 200 now answers 404, and `POST /v1/customers` no longer takes
+  # `owner_type`/`owner_id` from the body.
+  #
+  # **The prefix stays `/v1` anyway, because the alternative is worse than a rule.**
+  # Core's rule exists so a breaking change lands *beside* the old prefix and the
+  # old one keeps answering — which is exactly what cannot be done here: the old
+  # `/v1` answers every request without a token, so "keep serving `/v1` for
+  # compatibility" is "keep the vulnerability", and a second prefix over one open
+  # door is one open door. The major bump in `info.version` plus the migration note
+  # in `README.md` and `CHANGELOG.md` is the signal instead, and `info.version` is
+  # read by every client generator, so a client that ignores it ignored a published
+  # major version of the whole document. **This is a judgement call and it is
+  # recorded as one** rather than made silently.
+  #
+  # 1.3.0 added a response, not an operation. `PATCH /v1/customers/{id}` can now
   # answer 409, because `processor_customer_id` became unique and that is the one
   # field on a customer a client can move; `POST /v1/customers` and both plan
   # writes could already answer 409 and now say *which* collision they are
@@ -61,12 +101,18 @@ info:
   # 1.1.0 was the five subscription paths under the same `/v1` prefix, plus a new
   # response field on the subscription resource (`price`) and one on the plan
   # resource (`entitlements`).
-  version: 1.3.0
+  version: 2.0.0
   description: >-
     Plans, customers, the subscription lifecycle, and one inbound
     payment-processor webhook for cafaye. This document describes every client
     operation this service serves, and a test holds it to that by method and
     path: see note 5 above.
+
+    **Every `/v1` operation here requires a bearer token** (note 1), and every
+    customer and subscription operation is scoped by the token's `account_id`, so
+    another account's resource is a `404` rather than a `403`. The one exception is
+    `/v1/webhooks/stripe`, whose sender is a payment processor and which
+    authenticates by signature (note 3).
 
     Not described here, and not missed. The health probes (/healthz, /readyz,
     /up) are infrastructure. The /404, /422, /500 and /503 pages are where the app
@@ -83,8 +129,16 @@ servers:
   - url: http://localhost:3000
     description: Local
 
-# Declared, and empty. See note 1 above.
-security: []
+# Applied to every operation below, **except** the one that overrides it with
+# `security: []` (the Stripe webhook, note 3).
+#
+# It is not `[]`, and it was not `[]` for a reason: a document declaring no
+# security for an API holding payment records is a document a self-hoster reads as
+# permission to serve it to anybody. core's checklist asks every new operation to
+# state "required scopes + `account_id` scoping" in the security scheme, and this is
+# where billing's answer lives.
+security:
+  - bearerToken: []
 
 tags:
   - name: customers
@@ -107,6 +161,15 @@ paths:
       tags: [customers]
       operationId: listCustomers
       summary: List customers
+      description: >-
+        **This account's customers**, scoped by the token's `account_id`. Another
+        account's customer is not in this listing and is not distinguishable from one
+        that does not exist.
+
+        The listing holds at most one row: `customers` is unique on
+        `(owner_type, owner_id, processor)` and the owner is the token's account, so
+        an account holds one customer per processor. Pagination is still declared
+        because the shape is the platform's and a second processor would fill it.
       parameters:
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
@@ -124,16 +187,29 @@ paths:
                 $ref: '#/components/schemas/CustomerPage'
         '400':
           $ref: '#/components/responses/CursorInvalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '422':
           $ref: '#/components/responses/ValidationFailed'
+        '503':
+          $ref: '#/components/responses/CallerIdentityUnavailable'
     post:
       tags: [customers]
       operationId: createCustomer
       summary: Create a customer
       description: >-
-        Creates billing's record of an identity user or account. One customer
-        per (owner, processor), and one customer per `processor_customer_id`: a
-        second attempt at either is a 409.
+        Creates billing's record of the **authenticated account**. One customer per
+        (owner, processor), and one customer per `processor_customer_id`: a second
+        attempt at either is a 409.
+
+        **`owner_type` and `owner_id` are no longer read from the body.** The owner is
+        the token's `account_id` and `owner_type` is always `Account`, so anything the
+        body sends under those two names is ignored. This is a breaking change from
+        the version that took them from the body, and it is deliberate: honouring a
+        body-supplied owner would let any authenticated caller mint a customer owned by
+        another tenant, which is a cross-tenant write wearing a `POST`. A `User`-owned
+        customer is therefore no longer creatable here — billing cannot know which
+        account a user belongs to, so such a row would have no tenant to be scoped to.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/TraceId'
@@ -159,11 +235,14 @@ paths:
                 $ref: '#/components/schemas/Customer'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '409':
           $ref: '#/components/responses/Conflict'
         '422':
           $ref: '#/components/responses/ValidationFailed'
-
+        '503':
+          $ref: '#/components/responses/CallerIdentityUnavailable'
   /v1/customers/{id}:
     parameters:
       - $ref: '#/components/parameters/CustomerId'
@@ -171,6 +250,11 @@ paths:
       tags: [customers]
       operationId: getCustomer
       summary: Get a customer
+      description: >-
+        Reads the customer by uuid **within the token's account**. Another account's
+        uuid is a `404` — byte for byte the answer a uuid naming nothing gets, which
+        is what makes it safe: a `403` would tell a caller walking uuids which ids
+        exist.
       parameters:
         - $ref: '#/components/parameters/TraceId'
       responses:
@@ -183,21 +267,26 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Customer'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/CallerIdentityUnavailable'
     patch:
       tags: [customers]
       operationId: updateCustomer
       summary: Update a customer
       description: >-
-        Partial update. Emits no event: core's event catalog has no
-        `billing.customer.updated` row, and this service does not publish a type
-        the catalog does not list.
+        Partial update of a customer **in the token's account**. Another account's
+        uuid is a `404`, and no field of another account's row is writable from here.
+
+        Emits no event: core's event catalog has no `billing.customer.updated` row,
+        and this service does not publish a type the catalog does not list.
 
         `processor_customer_id` is unique across customers, so a claim on an
-        identifier another customer already holds is a 409. `owner` and
-        `processor` are not updatable, which leaves this as the one identifier a
-        client can move.
+        identifier another customer already holds is a 409. `owner` and `processor`
+        are not updatable, which leaves this as the one identifier a client can move.
       parameters:
         - $ref: '#/components/parameters/TraceId'
       requestBody:
@@ -216,6 +305,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Customer'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -223,11 +314,17 @@ paths:
         '422':
           $ref: '#/components/responses/ValidationFailed'
 
+        '503':
+          $ref: '#/components/responses/CallerIdentityUnavailable'
   /v1/plans:
     get:
       tags: [plans]
       operationId: listPlans
       summary: List plans
+      description: >-
+        **The whole catalogue.** A plan is what an account may buy, not what an
+        account owns, so it has no `account_id` and this listing is not filtered —
+        every authenticated caller reads the same rows. Note 6.
       parameters:
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
@@ -245,8 +342,12 @@ paths:
                 $ref: '#/components/schemas/PlanPage'
         '400':
           $ref: '#/components/responses/CursorInvalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '422':
           $ref: '#/components/responses/ValidationFailed'
+        '503':
+          $ref: '#/components/responses/CallerIdentityUnavailable'
     post:
       tags: [plans]
       operationId: createPlan
@@ -254,6 +355,12 @@ paths:
       description: >-
         One plan per `slug`, and one plan per `processor_price_id`. A second
         attempt at either is a 409, and the body names the field that collided.
+
+        **This changes what every account is offered, so it is a capability question
+        and not a tenancy one** — and no capability is enforced here. core's answer is
+        `scopes`, and no client in this build holds a billing scope, so any
+        authenticated caller can currently create a plan. Recorded in `README.md`
+        rather than gated by a check no token could pass.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/TraceId'
@@ -279,11 +386,14 @@ paths:
                 $ref: '#/components/schemas/Plan'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '409':
           $ref: '#/components/responses/Conflict'
         '422':
           $ref: '#/components/responses/ValidationFailed'
-
+        '503':
+          $ref: '#/components/responses/CallerIdentityUnavailable'
   /v1/plans/{slug}:
     get:
       tags: [plans]
@@ -311,9 +421,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Plan'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
-
+        '503':
+          $ref: '#/components/responses/CallerIdentityUnavailable'
   /v1/plans/{id}:
     parameters:
       - $ref: '#/components/parameters/PlanId'
@@ -326,6 +439,11 @@ paths:
         a mutable handle is not a safe thing to address a mutation by. A slug
         is a 404 here: this operation does not look plans up by slug. Emits
         `billing.plan.updated` only when a field actually changed.
+
+        **Like `POST /v1/plans`, this changes what every account is offered and no
+        capability is enforced on it.** A plan carries no account, so there is no
+        tenancy to scope the write by; core's answer is `scopes` and no client in
+        this build holds a billing scope. Recorded in `README.md`. Note 6.
 
         `slug` and `processor_price_id` are both unique across plans, so a claim
         on either one another plan already holds is a 409 and nothing is written.
@@ -347,23 +465,25 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Plan'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
         '422':
           $ref: '#/components/responses/ValidationFailed'
-
+        '503':
+          $ref: '#/components/responses/CallerIdentityUnavailable'
   /v1/subscriptions:
     get:
       tags: [subscriptions]
       operationId: listSubscriptions
       summary: List subscriptions
       description: >-
-        Every subscription, not one account's, because v0 has no token and so no
-        account to scope by. A recorded gap, the same one `GET /v1/customers` has,
-        and closed the same way: when authorization lands this becomes an
-        `account_id` filter read from the token and never from a query parameter.
+        **This account's subscriptions**, scoped by the token's `account_id` and by
+        nothing else. Another account's subscription is not in this listing, and the
+        scope is read from the token and never from a query parameter.
       parameters:
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
@@ -381,8 +501,12 @@ paths:
                 $ref: '#/components/schemas/SubscriptionPage'
         '400':
           $ref: '#/components/responses/CursorInvalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '422':
           $ref: '#/components/responses/ValidationFailed'
+        '503':
+          $ref: '#/components/responses/CallerIdentityUnavailable'
     post:
       tags: [subscriptions]
       operationId: createSubscriptionCheckout
@@ -400,14 +524,22 @@ paths:
         `billing.subscription.started` is published in the same transaction as that
         row.
 
-        `customer_id` is in the body because v0 has no token to name the account
-        with, and it is why a customer whose owner is a `User` rather than an
-        `Account` is refused: which account a user belongs to is identity's fact and
-        no event carrying it is in this build's `consumes`.
+        `customer_id` names the buyer, and it is resolved **inside the token's account** —
+        a `customer_id` naming another account's row is refused as "not a record this
+        service has", the same answer a uuid nobody holds gets. The session this
+        creates carries `customer_reference` and the customer's saved processor id, so
+        an unscoped lookup would have opened a payment against another tenant's saved
+        card.
+
+        A customer whose owner is a `User` rather than an `Account` is refused:
+        which account a user belongs to is identity's fact and no event carrying it is
+        in this build's `consumes`, so such a row has no tenant to be scoped to.
 
         Idempotent on `Idempotency-Key`: the same key with the same body replays the
         first response rather than creating a second Checkout session, and the same
-        key with a different body is a 409.
+        key with a different body is a 409. **The key is scoped to the caller's `sub`**
+        as well as to the endpoint, so one tenant cannot replay another's stored
+        response by guessing a uuid.
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/TraceId'
@@ -432,6 +564,8 @@ paths:
                 $ref: '#/components/schemas/CheckoutSession'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '409':
           $ref: '#/components/responses/Conflict'
         '422':
@@ -446,6 +580,11 @@ paths:
       tags: [subscriptions]
       operationId: getSubscription
       summary: Get a subscription
+      description: >-
+        Reads the subscription by uuid **within the token's account**. Another
+        account's uuid is a `404` — byte for byte the answer a uuid naming nothing
+        gets. `404` and never `403`: a 403 would say "this exists, you may not have
+        it", which is an enumeration oracle over ids a caller can walk.
       parameters:
         - $ref: '#/components/parameters/TraceId'
       responses:
@@ -458,9 +597,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Subscription'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
-
+        '503':
+          $ref: '#/components/responses/CallerIdentityUnavailable'
   /v1/subscriptions/{id}/cancel:
     parameters:
       - $ref: '#/components/parameters/SubscriptionId'
@@ -474,6 +616,11 @@ paths:
         `customer.subscription.deleted` arrives and `billing.subscription.canceled` is
         published. A response claiming the cancellation had happened would be a lie
         about a state this service does not own.
+
+        **The subscription is resolved within the token's account first**, so another
+        account's uuid is a `404` and the processor is **never asked** — the scope is
+        the resolution, not the request. This is the expensive direction, so it is the
+        one the scoping matters most for.
 
         `at_period_end` is required and must be a boolean: the caller chooses, and
         this service does not inherit a processor's default on its behalf. It is
@@ -509,6 +656,8 @@ paths:
                 $ref: '#/components/schemas/Subscription'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -530,6 +679,9 @@ paths:
         plan does not change by this response** — it changes when
         `customer.subscription.updated` arrives and `billing.subscription.updated` is
         published.
+
+        **The subscription is resolved within the token's account first**, so another
+        account's uuid is a `404` and the processor is never asked.
 
         The timing rule, which is the point of the endpoint and is decided in one
         place:
@@ -571,6 +723,8 @@ paths:
                 $ref: '#/components/schemas/SubscriptionWithPlanChange'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -589,7 +743,9 @@ paths:
       summary: What this subscription grants, right now
       description: >-
         The plan's features and limits, and whether this subscription is currently
-        granting them.
+        granting them, **for a subscription in the token's account**. Another
+        account's uuid is a `404`, so entitlements are never disclosed about a
+        subscription the caller does not hold.
 
         A `canceled` subscription grants nothing: `features` is `[]` and `limits` is
         `{}`. A `past_due` or `unpaid` one still grants, because the processor's grace
@@ -606,9 +762,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Entitlements'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
-
+        '503':
+          $ref: '#/components/responses/CallerIdentityUnavailable'
   /v1/webhooks/stripe:
     post:
       tags: [webhooks]
@@ -636,7 +795,11 @@ paths:
 
         This endpoint is not token-authenticated and must never grow a token
         check: a `Bearer` here would be a second, weaker trust path to the same
-        door as the `/v1` API.
+        door as the `/v1` API. **`security: []` below overrides the document's**
+        `bearerToken` for this operation and for no other — and it is structural
+        rather than a convention: the token check is a filter on the `/v1` client
+        base controller, which this one does not inherit from.
+      security: []
       parameters:
         - $ref: '#/components/parameters/StripeSignature'
       requestBody:
@@ -671,6 +834,72 @@ paths:
           $ref: '#/components/responses/SigningUnconfigured'
 
 components:
+  securitySchemes:
+    # The scheme `security` above names, and the whole of what a caller has to
+    # know to get past the door. core's checklist asks a new endpoint to state
+    # "required scopes + `account_id` scoping" here, so this is where billing's
+    # answer lives rather than as prose on each of fourteen operations.
+    bearerToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        `Authorization: Bearer <jwt>`, where the JWT is an **RS256** token issued by
+        `identity` and verified **locally** against its published JWKS at
+        `{issuer}/.well-known/jwks.json`. Keys are cached by `kid` for five minutes
+        and refreshed once per cache window on an unknown `kid`, so a burst of forged
+        tokens cannot aim one request per token at `identity`.
+
+        **RS256 only, and `alg` is a constant rather than a hint.** `alg: none`,
+        HS256 signed with the published public key, and any algorithm the key set does
+        not advertise are refused — on the *protected header*, before any network
+        call. core's conventions also allow ES256; widening this is a one-line change
+        and belongs with the moment `identity` publishes ES256 keys.
+
+        **Required claims: `iss`, `aud`, `exp`, `sub`, `iat`, `jti` and `account_id`.**
+        `account_id` is the tenancy key: every customer and subscription operation is
+        scoped by it and by nothing else, and a token without one is refused rather
+        than treated as "no account", because "no account" and "an account I could not
+        read" must not both be answers to the same request.
+
+        **> A token `identity` issues to a user today will be REFUSED, and this
+        > section is where that is written down rather than discovered.** core's
+        > conventions ask for a singular `account_id`; `identity` sends `accounts`,
+        > an array of `{account_id, name, slug, role, personal}`, on the `accounts`
+        > scope, because a user is in a personal account and usually several team
+        > accounts, and any one of them would be wrong for the rest. billing refuses
+        > the array rather than reading the first entry, the personal one, or any
+        > other guess: a tenancy key nobody chose is a cross-tenant read, and it
+        > would look like it works. **The disagreement is a DECISION NEEDED in
+        > `cafaye.yml`**, and the likeliest resolution is the gateway resolving the
+        > account and forwarding one. To an integrator: a `401` naming a tenancy
+        > claim on a token that looks perfectly valid is this, and it is not a bug
+        > in your token.
+
+        The capability claim is the space-separated `scope` string RFC 9068 registers —
+        not core's `scopes`, which `identity` does not issue. It is **parsed and not
+        yet enforced**: no client in this build holds a billing scope, and the one
+        operation that would need one (catalogue writes) is recorded in `README.md` as
+        a gap rather than gated by a check no token could pass. An absent `scope`
+        claim is an empty set, never everything.
+
+        ### The two refusals, and which one is which
+
+        | | |
+        | --- | --- |
+        | `401 unauthorized` | the **caller's** credential: absent, malformed, the wrong algorithm, signed by a key `identity` does not publish, expired, issued to another service, or carrying no `account_id`. **One fixed body** — which of those it was is not something a caller learns by trying. |
+        | `503 unavailable` | **this service's**: no issuer or audience configured, or `identity`'s key set unreachable. A `401` here would tell a caller holding a valid token to go and rotate it. |
+
+        **An unconfigured deployment is locked, not open.** Every `/v1` operation
+        answers `503` when no issuer is configured, and that is the property this
+        scheme exists to protect. The cause goes to the log with the trace id; the body
+        names no environment variable, because an unauthenticated caller must not be
+        able to read a deployment's configuration out of an error document.
+
+        `/v1/webhooks/stripe` does **not** use this scheme. Its sender is a payment
+        processor and it authenticates by signature over the raw body; see that
+        operation's own `security: []`.
+
   parameters:
     Limit:
       name: limit
@@ -710,6 +939,13 @@ components:
         original response and sets `Idempotency-Replayed: true`; the same key
         with a different body is a 409 `idempotency_key_reused`. A request
         without the key is processed normally.
+
+        **The key is scoped to the caller's `sub` as well as to the endpoint**,
+        which is what core's `(endpoint, principal, key)` scope means once there is
+        a principal: two tenants choosing the same uuid no longer share one
+        namespace, so a replay cannot return another caller's stored response. It is
+        `sub` and not `account_id` because two users in one account are two callers,
+        and a replay under one user's key must not answer for the other's.
       schema:
         type: string
         format: uuid
@@ -845,11 +1081,20 @@ components:
 
     CustomerCreate:
       type: object
-      required: [owner, processor]
+      description: >-
+        **`owner` is not a property here, and that is the breaking change in 2.0.0.**
+        The owner is the authenticated account: `owner_type` is always `Account` and
+        `owner_id` is the token's `account_id`. This build ignores an `owner` (or an
+        `owner_type`/`owner_id` pair) sent in the body rather than refusing it, because
+        an unrecognised field is a field this version does not have and that is not an
+        error on this surface.
+
+        A `User`-owned customer is therefore not creatable through this operation.
+        Which account a user belongs to is identity's fact, no event carrying it is in
+        this build's `consumes`, and a row with no tenant has nobody to scope it to.
+      required: [processor]
       additionalProperties: false
       properties:
-        owner:
-          $ref: '#/components/schemas/CustomerOwner'
         processor:
           type: string
           enum: [stripe]
@@ -1367,6 +1612,66 @@ components:
                 type: string
 
   responses:
+    # --- the two authentication refusals, on every `/v1` operation --------------
+    #
+    # Declared once and referenced by all fourteen client operations, for the same
+    # reason the security scheme is: fourteen copies of a sentence about
+    # authentication is thirteen chances for one of them to drift, and a document
+    # saying `/v1/customers` needs a token and `/v1/plans` does not is worse than one
+    # saying neither.
+    Unauthorized:
+      description: >-
+        No bearer token, or one this service refused: malformed, not RS256, signed by
+        a key `identity` does not publish, expired, issued to another audience, or
+        carrying no `account_id`.
+
+        **The body is one fixed sentence and names none of those.** Which of them it
+        was is not something a caller learns by trying, and `detail` is the one
+        free-text field that could say so. The specific reason goes to the log with
+        the trace id the caller is handed.
+
+        This is never a statement about a resource: another account's resource is a
+        `404`, not a `401`, so a caller walking uuids learns nothing about which exist.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://errors.cafaye.com/unauthorized
+            title: Unauthorized
+            status: 401
+            detail: This request needs a bearer token issued by this platform's identity service.
+            instance: /v1/customers
+            code: unauthorized
+            trace_id: 0af7651916cd43dd8448eb211c80319c
+    CallerIdentityUnavailable:
+      description: >-
+        **This service cannot verify anybody right now**: no issuer or audience is
+        configured, or `identity`'s published key set cannot be reached.
+
+        Deliberately not a `401`. A `401` would tell a caller holding a perfectly
+        valid token to go and rotate it, which is the wrong instruction and sends an
+        operator to the wrong system — the same reasoning the webhook uses for a
+        missing signing secret.
+
+        **An unconfigured deployment is locked, not open.** This is the answer to every
+        `/v1` request in a service that has not been told how to verify a token, and
+        it is the property the whole scheme exists to hold. The cause goes to the log
+        with the trace id; the body names no environment variable, because an
+        unauthenticated caller must not be able to read a deployment's configuration
+        out of an error document.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://errors.cafaye.com/unavailable
+            title: Service unavailable
+            status: 503
+            detail: This service cannot verify a caller right now.
+            instance: /v1/customers
+            code: unavailable
+            trace_id: 0af7651916cd43dd8448eb211c80319c
     BadRequest:
       description: The body could not be read as JSON.
       content:
@@ -1404,12 +1709,20 @@ components:
             $ref: '#/components/schemas/Problem'
     ProcessorUnconfigured:
       description: >-
-        No API key is configured for the payment processor, so the request could not
-        be made. This is this service's misconfiguration and never the caller's, and
-        it is deliberately not a 4xx: telling a client its request was wrong when the
-        service cannot reach Stripe at all sends an operator looking in the wrong
-        place. The cause is logged; the body does not carry the processor's own
-        message, which is the processor's to decide who sees it.
+        **Either** no API key is configured for the payment processor, **or** this
+        service cannot verify the caller (see `CallerIdentityUnavailable`). Both are
+        `503` because both are *this service's* misconfiguration and never the
+        caller's, and one status per operation means this row has to name both.
+
+        Deliberately not a 4xx in either case: telling a client its request was wrong
+        when the service cannot reach Stripe at all — or cannot tell whether the token
+        was good — sends an operator looking in the wrong place. The cause is logged
+        with the trace id; the body does not carry the processor's own message, which
+        is the processor's to decide who sees it, nor any environment variable name.
+
+        An operation with no processor call of its own — every `GET`, every customer
+        and plan write — answers `503` only for the second cause, and references
+        `CallerIdentityUnavailable` instead.
       content:
         application/problem+json:
           schema:

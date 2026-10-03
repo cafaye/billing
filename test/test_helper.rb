@@ -80,6 +80,13 @@ end
 # deletes it with `with_env`.
 ENV["STRIPE_WEBHOOK_SECRET"] = StripeWebhookHelpers::WEBHOOK_SECRET
 
+# The identity the suite verifies against, installed once. `/v1` requires a token,
+# so a suite that ran with no identity configured would be a suite where every
+# request is a 503 and every assertion about the surface is about the lock rather
+# than about billing. The specs that prove the lock (`test/authentication/`) delete
+# the configuration with `with_env` and put it back.
+TestSupport::TestIdentity.install_default!
+
 module ActiveSupport
   class TestCase
     include StubbedCollaborators

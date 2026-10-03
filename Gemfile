@@ -41,6 +41,18 @@ gem "image_processing", "~> 1.2"
 # forged amount must never be believed.
 gem "stripe", "~> 19.6"
 
+# Identity's access tokens. billing is the first service in the fleet to verify
+# them, and it verifies them with this gem rather than by hand for the reason the
+# stripe gem is above: RS256 signature checking is the one place a forged amount
+# must never be believed, and a hand-rolled verifier is exactly the thing that
+# gets `alg: none` and HS256-with-the-public-key wrong.
+#
+# The claim this service makes is narrower than "we read a token": it is that
+# `/v1` is **locked** unless a deployment configures an issuer and an audience,
+# and that an unconfigured or unreachable identity is a refusal rather than an
+# open door. See `Identity::TokenVerifier` and `RequirePrincipal`.
+gem "jwt", "~> 3.3"
+
 # OpenTelemetry. The trace SDK and the OTLP exporter, and the reason each is named
 # here is in app/lib/kit/telemetry.rb: without them billing cannot emit a span at
 # all, and the collector kit ships with the stack has nothing to redact.

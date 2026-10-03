@@ -230,8 +230,13 @@ class SecretsDoNotLeakTest < ActionDispatch::IntegrationTest
     # signature hides the one side effect in it, and a reader checking what this
     # posts has to parse the parameter list to find it.
     def post_cancel_with_processor_error
+      # **The customer is owned by the account the token names**, not by a random
+      # uuid. `/v1` is scoped by the token's `account_id` since billing-21, so a
+      # subscription belonging to anybody else is a 404 and these tests would have
+      # asserted the *scoping* rather than the redaction — passing while the log line
+      # they exist to inspect was never written.
       customer = Customer.create!(
-        owner_type: "Account", owner_id: SecureRandom.uuid,
+        owner_type: "Account", owner_id: TestSupport::TestIdentity::Account,
         processor: "stripe", processor_customer_id: "cus_secret_probe"
       )
       plan = Plan.create!(

@@ -230,12 +230,134 @@ class HttpSurfaceContractTest < ActiveSupport::TestCase
     # out of the document and compared it with itself would pass every document ever
     # written, including a regenerated one.
     #
-    # 1.3.0 (billing-13) is the 409 on `PATCH /v1/customers/{id}`: making
-    # `processor_customer_id` unique gave that operation a status it could not
-    # answer before, and a response the document does not list is a document lying
-    # about its own surface.
-    assert_equal "1.3.0", document.fetch("info").fetch("version")
+    # **2.0.0 (billing-21) is a major bump under an unchanged `/v1` prefix**, which
+    # core's rule says should not happen — so the reasoning is in the document's own
+    # header and the assertion here is deliberately only the version. Keeping `/v1`
+    # while the surface breaks is a judgement call, not an oversight: the old prefix
+    # answers every request without a token, so "keep serving `/v1`" would be "keep the
+    # vulnerability". See the header on `info.version` and README's "Breaking change".
+    assert_equal "2.0.0", document.fetch("info").fetch("version")
   end
+
+  # --- the security the document declares, and what the router actually does ----
+
+  # `security: []` at the document level said this surface was open, and it was, and a
+  # self-hoster reading this file had no way to tell that from an oversight. billing-21
+  # replaced it with the real scheme, and these four assertions are what keeps it real:
+  #
+  #   1. the document declares a bearer scheme and applies it by default;
+  #   2. **every** `/v1` operation except the webhook declares no override;
+  #   3. the webhook declares `security: []` and says why;
+  #   4. every `/v1` operation declares the two refusals the service can now answer.
+  #
+  # (4) is the one that catches the interesting edit. A new operation that a packet
+  # added without thinking about authentication would still inherit `bearerToken`, so
+  # the document would not lie — but it would not say what it answers when the token is
+  # missing either, and a client generated from it would have no 401 to handle.
+  DOCUMENT_ROOT_SECURITY = [ { "bearerToken" => [] } ].freeze
+
+  UNAUTHENTICATED_OPERATION = "receiveStripeWebhook"
+
+  test "the document declares a bearer scheme and applies it to every operation" do
+    assert_equal DOCUMENT_ROOT_SECURITY, document["security"],
+      "the document-level `security` changed. Every `/v1` operation inherits it, so this is " \
+      "the single line that decides whether the whole surface is authenticated."
+
+    assert_equal %w[bearerToken], document.dig("components", "securitySchemes").keys
+
+    scheme = document.dig("components", "securitySchemes", "bearerToken")
+    assert_equal "http", scheme["type"]
+    assert_equal "bearer", scheme["scheme"]
+  end
+
+  test "every /v1 operation declares the two refusals the service can answer" do
+    missing = documented_operations.filter_map { |_method, path|
+      next if path == "/v1/webhooks/stripe"
+
+      operation = operation_at(path)
+      absent = %w[401 503] - operation.fetch("responses").keys
+      [ path, absent ] if absent.any?
+    }
+
+    assert_empty missing.map { |path, absent| "#{path} does not declare #{absent.join(", ")}" },
+      "these /v1 operations do not declare the statuses a missing token produces. A client " \
+      "generated from this document would have no 401 and no 503 to handle."
+  end
+
+  test "the webhook is the only operation that declares no security, and says why" do
+    overridden = documented_operations.filter_map { |_method, path|
+      operation = operation_at(path)
+      next unless operation.key?("security")
+
+      [ path, operation.fetch("security") ]
+    }
+
+    assert_equal [ [ "/v1/webhooks/stripe", [] ] ], overridden,
+      "an operation declared its own `security`. The only one that may is the Stripe " \
+      "webhook, whose sender is a processor authenticated by signature; a second would be " \
+      "a second trust path to a door this service already has one for."
+  end
+
+  # The webhook's `security: []` is a declaration, and a declaration nobody reads is a
+  # comment. Asserted that its own description says *why* it is unauthenticated, so a
+  # reader who lands on the operation is told rather than left to infer.
+  test "the webhook says why it is not token-authenticated, in its own description" do
+    description = operation_at("/v1/webhooks/stripe").fetch("description")
+
+    assert_match(/signature/i, description,
+      "the webhook's description no longer says how it authenticates. `security: []` on an " \
+      "operation that never explains itself is the declaration a reader is least likely to " \
+      "trust.")
+  end
+
+  # The catalogue is the one place the document must not overstate what is enforced, so
+  # it is asserted: the plan operations say they are not capability-checked. A document
+  # that implied the whole surface were authorized would be the same lie as `security: []`
+  # in the other direction.
+  test "the plan writes say they are not capability-checked, because they are not" do
+    %w[createPlan updatePlan].each do |operationId|
+      description = operation_by_id(operationId).fetch("description", "")
+
+      assert_match(/scope/i, description,
+        "#{operationId} does not mention capability. A plan has no `account_id`, so the only " \
+        "thing that could stop an authenticated caller rewriting every account's pricing is " \
+        "a `scopes` check, and this build enforces none.")
+    end
+  end
+
+  private
+    # The operation object at a document path, which may be a single `get` or may hold
+    # several verbs under one path item. The path is unique per verb here, so taking the
+    # first is unambiguous — and raising rather than defaulting means a path item with
+    # no operation under it is a failure rather than a nil.
+    def operation_at(path)
+      item = path_items.fetch(path)
+      verbs = item.slice(*OPERATION_KEYS)
+      raise "#{path} declares no operation" if verbs.empty?
+
+      verbs.values.first
+    end
+
+    # The one operation carrying `operationId`, found by id rather than by path so a
+    # rename in the document cannot quietly point this test at a different operation.
+    # `sole` rather than `first`: two operations sharing an id is the very thing the
+    # test above forbids, and a `first` here would let it through by answering anyway.
+    def operation_by_id(operationId)
+      found = path_items.flat_map { |_path, item|
+        item.filter_map { |key, operation|
+          next unless OPERATION_KEYS.include?(key)
+          next unless operation.is_a?(Hash) && operation["operationId"] == operationId
+
+          operation
+        }
+      }
+
+      raise "#{operationId} names #{found.size} operations" if found.size != 1
+
+      found.sole
+    end
+
+  # --- the manifest ---------------------------------------------------------
 
   test "the manifest declares an api, and the document it points at exists" do
     assert_path_exists Rails.root.join(manifest.fetch("exposes").fetch("api"))

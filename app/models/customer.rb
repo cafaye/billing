@@ -62,6 +62,23 @@ class Customer < ApplicationRecord
   # index is partial rather than a bare `unique`.
   validates :processor_customer_id, uniqueness: true, allow_nil: true
 
+  # **This account's customers, and nobody else's.**
+  #
+  # The tenancy key on a customer is `owner_type`/`owner_id`, and a customer is
+  # only in scope when that pair names an `Account` this caller is acting for.
+  # `owner_type: "User"` rows are deliberately **excluded** rather than matched on
+  # `owner_id` alone: which account a user belongs to is identity's fact and no
+  # event carrying it is in this build's `consumes`, so a user-owned customer has
+  # no account to scope by and must not be handed to a caller who guessed the uuid.
+  #
+  # The scope and not a `where` at each call site, because the shape that scoping
+  # arrives in is `scope :for_account, ->(id) { … }` and there are three customer
+  # reads on `/v1` that must all agree; a hand-written `where` at each is three
+  # chances to write one of them down differently.
+  scope :for_account, ->(account_id) {
+    where(owner_type: "Account", owner_id: account_id)
+  }
+
   before_validation :normalize_metadata
 
   # The wire shape, and the outbox payload: one representation, so an event and

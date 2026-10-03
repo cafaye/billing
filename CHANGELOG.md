@@ -8,6 +8,100 @@ All notable changes to billing are recorded here. The format follows
 
 ### Added
 
+- **`/v1` requires an identity JWT, and every customer and subscription query is
+  scoped by the account in it.** billing was the last purchasable service whose
+  client surface answered every caller: `GET /v1/customers` returned every row,
+  `POST /v1/subscriptions` took a `customer_id` in the body, and `README.md` said
+  out loud "the endpoints are open anyway". billing-12 measured the gap (14
+  account-scoped routes, 33 data accesses, **zero** account scopes) and this
+  packet closes it.
+
+  - **`app/services/identity/token_verifier.rb` is the only place a JWT is read in
+    this repository.** RS256 pinned as a constant and read from the *token's own
+    protected header* before any network call, so an `alg: none` token and an
+    HS256 token signed with the published public key are refused without aiming
+    traffic at identity. The key set is fetched from `{issuer}/.well-known/jwks.json`,
+    cached by `kid` for five minutes, and an unknown `kid` gets **one** forced
+    refresh per cache window — claimed *before* the fetch, because a budget
+    recorded on completion is a budget twenty-five concurrent requests all
+    believe is unspent. A failed fetch keeps the last good set rather than
+    replacing it with an outage.
+  - **It fails closed, and that is the property the whole thing exists to hold.**
+    No issuer or no audience configured answers **503**; identity unreachable
+    answers **503**; no token, a malformed one, a wrong-algorithm one, an expired
+    one, or one issued to somebody else answers **401**. There is no branch
+    anywhere in `AuthenticatesPrincipal` that lets a request through without a
+    verified principal — no default account, no "auth is off in development", no
+    rescue that renders a 200. A self-hosted billing API that quietly degrades open
+    because nobody filled in an environment variable is the failure this removes,
+    and the direction that matters is the one that refuses.
+  - **The boundary is a `before_action` on `V1::BaseController`, not a middleware
+    and not a path check.** `Webhooks::BaseController` does not inherit it, cannot
+    reach it, and `raise_on_missing_callback_actions` stops a future controller in
+    that namespace from skipping the filter by not naming an action. A
+    path-prefixed check gets "all of `/v1`" wrong in the direction that matters: it
+    would put a token requirement on `/v1/webhooks/stripe`, whose sender is a
+    processor and whose credential is a signature — core's conventions forbid a
+    JWT there, and a `Bearer` on that path would be a second, weaker trust path to
+    the same door. `test/authentication/principal_lock_test.rb` reads the boundary
+    **from the router's own table** rather than from a list of paths, so it is the
+    route set that is checked and not this paragraph.
+  - **Authorization, not just authentication.** `Customer.for_account` and
+    `Subscription.for_account` are the tenancy scopes and every `/v1` query names
+    one. Cross-tenant read and cross-tenant write are both **404** — the same
+    seven-key answer a uuid naming nothing gets — so `Problem::CATALOG` still has
+    no 403 and nothing added one. A `User`-owned customer is in no account and is
+    therefore invisible to `/v1`, which is a consequence worth stating rather than
+    a bug: which account a user belongs to is identity's fact and no event
+    carrying it is in this build's `consumes`.
+  - **`openapi/v1.yaml` is at 2.0.0 and tells the truth.** `security:
+    [{bearerToken: []}]` with a declared `bearerToken` scheme, `Unauthorized` and
+    `CallerIdentityUnavailable` referenced by all fourteen client operations,
+    `security: []` on the webhook, and the "declared, and empty" note deleted — a
+    document that admits it describes no authorization is a document that describes
+    an open door. `CustomerCreate` no longer *requires* `owner`, because the owner
+    is no longer from the body.
+
+  **Three breaking consequences, stated rather than discovered:**
+
+  | | |
+  | --- | --- |
+  | `POST /v1/customers` ignores `owner_type`/`owner_id` in the body | the owner is the token's account. A `User`-owned customer is no longer creatable through `/v1` |
+  | `Idempotency-Key` is scoped to the caller's `sub` | core scopes a key to `(endpoint, principal, key)`; two tenants choosing the same uuid no longer share one namespace, so a replay cannot return another caller's stored response. `IdempotencyKey::PRINCIPAL` is no longer a constant and `IdempotentRequests#idempotency_principal` raises rather than defaulting to `"anonymous"` |
+  | a listing returns one account's rows | `GET /v1/customers` and `GET /v1/subscriptions` return **this account's** rows, and an account's listing holds at most one customer per `(owner_type, owner_id, processor)` |
+
+  **The `/v1` prefix is deliberately unchanged, and that is a judgement call rather
+  than an oversight.** Core's rule is that a breaking change gets a new prefix
+  *beside* the old one so the old contract keeps being served — and that is exactly
+  what cannot be done here: the old `/v1` answers every request without a token, so
+  "keep serving `/v1` for compatibility" is "keep the vulnerability", and a second
+  prefix over one open door is one open door. The major bump plus this note is the
+  signal instead, and `info.version` is the field every client generator reads.
+
+  **One gem, with its cause: `jwt ~> 3.3`.** This is the first non-observability
+  dependency this service has taken. Same reasoning as `stripe`: this is the one
+  place a forged credential must never be believed, and a hand-rolled verifier is
+  how `alg: none` and HS256-signed-with-the-public-key get through. The gem does
+  the signature; `TokenVerifier` does the platform's rules about *which*
+  signatures, and nothing about what the claims mean.
+
+  **What is a finding rather than a fix.** Plans are the platform catalogue, so the
+  four plan routes are authenticated but **not** account-scoped, and
+  `test/contract/tenant_isolation_matrix_test.rb` carries a third verdict,
+  `catalogue`, for exactly them. The consequence is that **any authenticated
+  account may write the catalogue** — create, change or delete a plan everybody
+  subscribes to. Nothing checks a capability for it, because billing has no scope
+  vocabulary to check against and a scope invented here would be one nothing else
+  in the fleet grants. `Principal#scope_set` parses the token's `scope` claim and
+  nothing reads it yet. This is a DECISION NEEDED in `cafaye.yml` and a known gap
+  in `README.md`, and closing it is a decision about what a catalogue write is for
+  rather than a missing line.
+
+  The four `gap:` tripwires in `test/tenant/cross_account_web_test.rb` were
+  **rewritten rather than deleted**: same two accounts, same requests, each
+  assertion flipped from "the surface is open" to "the surface refuses". They were
+  pinned to fail when scoping lands, and they have now been seen firing.
+
 - **`LICENSE`: billing is MIT.** billing shipped no licence file, which is not
   "unlicensed, therefore free" — it is **all rights reserved**, the default
   copyright position when a public repository grants nothing. README.md said so
@@ -362,6 +456,62 @@ All notable changes to billing are recorded here. The format follows
   in the two files that did move.
 
 ### Changed
+
+- **The tests that asserted `/v1` is open were the bug, and they were changed
+  deliberately.** Four characterisation tests in
+  `test/tenant/cross_account_web_test.rb` were written by billing-12 to pin the
+  open surface: a customer and a subscription readable by uuid, a customer
+  **writable** by uuid, an unscoped listing. Each was coupled to a count of
+  account-constrained queries in `app/` that was `0`, so the day scoping landed
+  they would all four fail saying to rewrite them as 404s. **That day is this
+  commit**, and they are rewritten rather than deleted: same two accounts, same
+  requests, each assertion flipped from "the defect reproduces" to "the defect is
+  refused".
+
+  One thing in that file could not be left as it was. Its 403 audit scans `app/`
+  for `403`, `forbidden` and `:unauthorized`, and the new code in
+  `authenticates_principal.rb` *explains* the rule in prose containing the word
+  "forbidden" — a scanner that trips on a comment is a scanner that must be
+  silenced by deleting the explanation, which is backwards. It now skips comment
+  lines and scans `403|forbidden`, and the file's own header says why the scan
+  exists: `Problem::CATALOG` is a closed set with no 403 in it, so the guarantee is
+  a property of the catalog and the scan is what catches a controller reaching
+  past it.
+
+- **Two guards in this packet were wrong on first write, and both were caught by
+  mutation rather than by review.** Both are reported because "I broke it on
+  purpose and it noticed" and "I think it would notice" are different claims, and
+  in both cases the first claim was false.
+
+  | guard as written | mutation | result |
+  |---|---|---|
+  | `test/authentication/token_verifier_test.rb` scanned `app/` and `lib/` for `/\bJWT\./` | a file referencing `JWT::JWK` | **not caught** — `JWT::JWK` contains no `JWT.`, so a file doing precisely what the guard forbids passed. Now matches `/\bJWT\b/`, and fires naming the file and line |
+  | `cross_account_web_test.rb`'s meta test asserted `account_scoped_queries > 0` | rename `Subscription.for_account` to `for_account_disabled` | **not caught**, and it could not have been: the count's own regex was `scope :for_account`, an unanchored **prefix**, so the rename left the count at 2 and green. Now `assert_equal 4` and the regex is word-anchored; verified to fail on losing **either** scope |
+
+  The second one is the more interesting and the more embarrassing. The guard was
+  a tripwire *pointing backwards* — it existed to notice the day scoping
+  disappeared — and it was written so that the disappearance it was watching for
+  could not move it. `> 0` asked "is any scoping left?" when the question worth
+  asking is "is **this** scoping left?", and a refactor deleting one of two
+  scopes leaves the file asserting a boundary the code no longer has.
+
+- **`ACCESS_EXPRESSIONS` in the entry-point matrix gained two `for_account`
+  patterns.** `test/tenant/account_entry_point_matrix_test.rb` derives the
+  enumeration of account-scoped data accesses by scanning `app/` and resolving
+  each access to the method it sits in. Adding a scope made five reads vanish
+  from the scan — not because they stopped being queries but because the scanner
+  did not know the shape — so the scanner was taught the shape. The counts moved
+  from 33 to 35 accesses (reads stay at 12, lists 9 → 11) and are asserted, which
+  is the point: an enumeration that silently shrinks is worse than no enumeration.
+
+- **`test/support/identity_helpers.rb` holds a real 2048-bit RSA key and signs
+  real tokens.** The stub replaces the *fetch*, never the verification, so a spec
+  cannot pass by arranging a principal: a token with a broken signature, a wrong
+  `kid` or a past `exp` is refused by the same `JWT.decode` call production uses.
+  `ActionDispatch::IntegrationTest` gets an `Authorization` header by default and
+  `acts_as(account)` / `without_token!` are the two verbs — which means a spec that
+  forgets to think about authentication still runs, and the ones that mean to
+  exercise it have to say so.
 
 - **The subscription-fixture helpers no longer default to one processor id.**
   `create_stripe_plan` and `create_stripe_customer` in

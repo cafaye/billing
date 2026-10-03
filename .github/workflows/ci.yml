@@ -247,14 +247,42 @@ env:
   # them. Not one existing test changed, which is why the two deltas are the same
   # delta in both directions: 48 and 118 are the two new numbers, and nothing else
   # moved.
-  # RAISED IN THIS COMMIT alongside `gate.yml`'s `suite` floor, which moved to
-  # 999 for the same reason and in the same run: the tree now runs one more test
-  # ("$comment is ignored as metadata…") at 18 more assertions, measured — not
-  # predicted — in the `bin/prime` run whose output produced both numbers. The
-  # two are raised together on purpose: a workflow and a declaration holding
-  # different numbers for one suite is two answers to one question.
-  BASELINE_RUNS: '999'
-  BASELINE_ASSERTIONS: '2860'
+  #
+  # 998/2842 -> 1077/3064. **billing-21, and this delta is NOT all new tests**,
+  # so it is itemised per file, measured by running each file before and after
+  # rather than by reading the diff:
+  #
+  #   file                                    before       after       delta
+  #   test/authentication/ (2 new files)      --  /  --    66 / 180   +66 / +180
+  #   test/contract/http_surface_contract_test  7  /  19    12 /  32    +5 /  +13
+  #   test/contract/tenant_isolation_matrix    19  /  42    21 /  49    +2 /   +7
+  #   test/tenant/cross_account_web_test       16  / 101    23 / 133    +7 /  +32
+  #   test/requests/v1/plans_test              28  / 156    30 / 161    +2 /   +5
+  #   test/requests/v1/customers_test          30  / 175    27 / 160    -3 /  -15
+  #   (unchanged: account_entry_point_matrix, cross_account_findings,
+  #    subscriptions, secrets_do_not_leak — 0 / 0 on both sides)
+  #                                          ----  ----   ----  ----   ----  ----
+  #                                           998 / 2842 1077 / 3064  +79 / +222
+  # is a reading of the diff rather than a prediction of the total.
+  #
+  # **The negative line is the one to read.** `customers_test.rb` lost three
+  # tests and fifteen assertions: `bulk_customers` went, because an account's
+  # customer listing holds at most one row — `(owner_type, owner_id, processor)`
+  # is unique and the owner is now the token's account — so a "three customers"
+  # fixture cannot exist as a listing expectation. The paging tests moved to
+  # `plans_test.rb`, where the catalogue actually pages. **A suite that only ever
+  # grows is a suite in which a deleted assertion is invisible**, and this delta
+  # says out loud that tests asserting `/v1` is open were removed and replaced.
+  #
+  # **The `+7` in `cross_account_web_test.rb` is the four `gap:` tripwires plus
+  # three structural meta-tests.** The two new meta-tests are billing-12's
+  # coupling pointed the other way: `account_scoped_queries` is now asserted to
+  # be **exactly 4**, so dropping either `for_account` scope is a failure rather
+  # than a silent narrowing of the boundary. Both guards this packet added were
+  # wrong on first write and were caught by mutation, not by review; see
+  # CHANGELOG.md.
+  BASELINE_RUNS: '1077'
+  BASELINE_ASSERTIONS: '3064'
 
 jobs:
   # ------------------------------------------------------------------ shared
@@ -543,7 +571,11 @@ jobs:
         # being true is a setting; the count of `app/` files in `$LOADED_FEATURES`
         # after `eager_load!` is the thing that setting is supposed to cause, and
         # comparing it to the number of `app/**/*.rb` on disk makes "eager loading
-        # works" a measurement. Measured in this worktree: 38 and 38.
+        # works" a measurement. **The count is read, not asserted** — the step
+        # compares `$LOADED_FEATURES` against `Dir.glob` at run time — so
+        # billing-21's four new `app/` files (38 -> 42) needed no change here, and
+        # a hard-coded 38 would have bought a step that goes red when somebody
+        # adds a model, which is a red that teaches nothing. Measured here: 42/42.
         shell: bash
         run: |
           set -euo pipefail
@@ -761,7 +793,7 @@ jobs:
           fi
           echo "::notice::48 runs, 118 assertions, 0 skips — the redaction boundary was exercised"
 
-      - name: tier — the contract tier, against core's real schemas (45 tests)
+      - name: tier — the contract tier, against core's real schemas (52 tests)
         # **The environment-gated tier, and the reason this job exists.**
         #
         # `outbox_envelope_contract_test.rb` skips every test in the file when
@@ -797,7 +829,13 @@ jobs:
         # directory count and not a file list: that file must not be skippable,
         # and a list is how a new tier member goes unnamed. 45 / 400 on this
         # commit, and it does not read `core` at all — that is the point of it
-        # being here.
+        # being here. 52 / 420 on this commit.
+        #
+        # 45/400 -> 52/420 is billing-21's, measured per file in both
+        # directions: `http_surface_contract_test.rb` 7 -> 12 (five
+        # security-declaration assertions, and the `info.version` pin) and
+        # `tenant_isolation_matrix_test.rb` 19 -> 21 (a third `catalogue` verdict,
+        # split out of the set assertion).
         #
         # Run on its own so the log carries a line that can only exist if this
         # tier ran, and so a failure here is visibly about the contract rather
@@ -845,15 +883,81 @@ jobs:
           # that ends in a comma ("failures,") and every number is bare, so the
           # numbers land in the named variables with nothing to strip.
           read -r runs _r assertions _a failures _f errors _e skips _s <<< "$summary"
-          if [ "$runs" != 45 ] || [ "$assertions" != 400 ] ||
+          if [ "$runs" != 52 ] || [ "$assertions" != 420 ] ||
              [ "$failures" != 0 ] || [ "$errors" != 0 ] || [ "$skips" != 0 ]; then
-            echo "::error::expected 45 runs, 400 assertions, 0 failures, 0 errors, 0 skips; got '$summary'." >&2
+            echo "::error::expected 52 runs, 420 assertions, 0 failures, 0 errors, 0 skips; got '$summary'." >&2
             echo "  Skips mean core was not readable, and a skipped contract test" >&2
             echo "  proves nothing (PLAN §1)." >&2
             exit 1
           fi
           echo "$summary"
           echo "::notice::the contract tier ran against core at $(git -C "$CORE_PATH" rev-parse --short HEAD)"
+
+      - name: tier — the lock on /v1, and the verifier behind it (66 tests)
+        # **The tier whose absence would be a breach rather than an
+        # inconvenience**, and it exists for the same reason the redaction tier
+        # does: a whole-suite green cannot tell "the lock held" from "the lock was
+        # never exercised", because 66 passing tests and 66 tests that each
+        # asserted nothing look identical from outside.
+        #
+        # Equality, not a floor, and **zero skips** for the reason the contract tier
+        # checks them. A skip here would be an environment-gated proof that `/v1`
+        # is closed, which is not a proof.
+        #
+        # What makes this tier different from every other one in this file is that
+        # it **cannot pass by accident in the other direction either**: the specs
+        # mint real RSA-signed tokens and check them through the same `JWT.decode`
+        # production uses, so a verifier that refused everything would fail
+        # `token_verifier_test.rb`'s accept-path test. The refusals and the
+        # acceptance are asserted in the same file, which is the only shape in
+        # which "the lock works" is a claim rather than a hope.
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/authentication.log"
+          status=0
+          bin/rails test test/authentication 2>&1 | tee "$log" || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::the /v1 authorization tier exited $status" >&2
+            exit "$status"
+          fi
+          pattern='[0-9]+ runs, [0-9]+ assertions,'
+          pattern="$pattern"' [0-9]+ failures, [0-9]+ errors, [0-9]+ skips'
+          summary="$(grep -oE "$pattern" "$log" | tail -1)"
+          if [ -z "$summary" ]; then
+            echo "::error::no minitest summary in the authorization log; the guard read nothing." >&2
+            exit 1
+          fi
+          read -r runs _r assertions _a failures _f errors _e skips _s <<< "$summary"
+          runs=${1%;}; assertions=${3%,}; failures=${5%,}; errors=${7%,}; skips=${9%,}
+          echo "$summary"
+          if [ "$skips" != 0 ]; then
+            echo "::error::$skips test(s) skipped in the /v1 authorization tier. A proof that" >&2
+            echo "  /v1 is closed cannot be environment-gated; name them with --verbose." >&2
+            exit 1
+          fi
+          if [ "$failures" != 0 ] || [ "$errors" != 0 ]; then
+            echo "::error::$failures failure(s), $errors error(s) in the /v1 authorization tier." >&2
+            exit 1
+          fi
+          if [ "$runs" != "66" ] || [ "$assertions" != "180" ]; then
+            echo "::error::the /v1 authorization tier ran $runs/$assertions; this file says 66/180." >&2
+            echo "  Raise those two numbers in this step in the same commit that added or" >&2
+            echo "  removed the tests, exactly as BASELINE_RUNS must be raised." >&2
+            exit 1
+          fi
+          # A POSITIVE claim, asserted as one: the accept path has to have run, not
+          # only the refusals. A tier of 66 refusals and no acceptance is a
+          # verifier that refuses everything, which is "the door is shut" by
+          # another name and is not a working API.
+          if ! grep -q 'a correctly signed token with every required claim is accepted' "$log"; then
+            echo "::error::the /v1 authorization tier did not run its accept-path test." >&2
+            echo "  A tier that only proves refusals cannot tell a locked API from a" >&2
+            echo "  broken one." >&2
+            exit 1
+          fi
+          echo "::notice::66 runs, 180 assertions, 0 skips — /v1 refused an unconfigured, an" \
+               "unreachable and a forged credential, and accepted a real one"
 
       - name: tier — the webhook tier, signatures verified for real (163 tests)
         # **The highest-value tests in this repository.** A forged amount is
@@ -1044,16 +1148,18 @@ jobs:
             echo "### billing CI — what ran"
             echo
             whole="${BASELINE_RUNS} runs / ${BASELINE_ASSERTIONS} assertions / 0 skipped"
-            contract="45 runs / 400 assertions / 0 skipped"
+            contract="52 runs / 420 assertions / 0 skipped"
             webhook="163 runs / 396 assertions / 0 skipped"
+            auth="66 runs / 180 assertions / 0 skipped"
             coverage="5 runs / 11 assertions / 0 skipped"
             echo "| tier | asserted | checked by |"
             echo "|---|---|---|"
             echo "| whole suite (\`bin/prime\`) | $whole | gate step |"
             echo "| contract vs core | $contract | contract tier step |"
             echo "| webhook, signatures verified | $webhook | webhook tier step |"
+            echo "| the lock on /v1 | $auth | authz tier step |"
             echo "| money-path coverage | $coverage | coverage tier step |"
-            echo "| eager load | 38 \`app/\` files, \`config.eager_load\` on | eager-load step |"
+            echo "| eager load | every \`app/\` file, \`config.eager_load\` on | eager-load step |"
             echo "| signed fixtures | 9 committed, verifier unstubbable | signature step |"
             echo "| Gemfile.lock | no diff after the gate | lockfile step |"
             echo "| brakeman / bundler-audit | 0 warnings / no advisories | security job |"

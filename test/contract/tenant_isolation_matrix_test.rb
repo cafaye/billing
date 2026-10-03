@@ -2,52 +2,65 @@ require "test_helper"
 
 # Every account-scoped route, enumerated, with what the router actually serves.
 #
-# ## Why this file exists when the answer is "none of them are scoped"
+# ## Why this file existed when the answer was "none of them are scoped"
 #
 # The question a multi-tenant billing service has to answer is *can an
 # authenticated caller reach another account's subscription, invoice or payment
-# method?* Billing cannot answer it yet, because there is no authenticated caller:
-# `/v1` reads no token, since core says identity is the only issuer and the JWKS
-# verification is not in this repository. `GET /v1/subscriptions` returns every
-# row and `POST /v1/subscriptions/{id}/cancel` cancels whichever row the path
-# names. That is recorded in the README, in `AGENTS.md`, and in each controller's
-# own header — and a gap written in three places as prose is a gap that rots,
-# because prose is not compared against anything.
+# method?* billing-12 could not answer it, because there was no authenticated
+# caller: `/v1` read no token, since core says identity is the only issuer and the
+# JWKS verification was not in this repository. `GET /v1/subscriptions` returned
+# every row and `POST /v1/subscriptions/{id}/cancel` cancelled whichever row the
+# path named.
 #
-# So this file makes the gap **total**. It enumerates the routes the router
-# serves and requires every one of them to be classified here with a reason. A
-# route added tomorrow that nobody classified fails here, by name, the day it is
-# added rather than the day somebody notices it reading the diff.
+# So billing-12 made the gap **total**: it enumerated the routes the router serves
+# and required every one to be classified here with a reason, so a route added
+# tomorrow fails by name the day it is added rather than the day somebody notices
+# reading the diff. **billing-21 answered the question and kept the enumeration.**
 #
-# This is the billing half of identity's `authz_matrix_test.go`. The two strongest
-# tests in that file are `TestEveryRouteIsInTheMatrix` and
-# `TestEveryMountedRouteIsAnAccountRoute`; the second catches the route that was
-# never in the matrix at all, which is the one a reviewer reading a diff would
-# miss. Both directions are asserted below for the same reason, and the direction
-# that finds the *unstated* route is the one that matters.
+# ## What changed in billing-21, and what did not
+#
+# **Ten of the fourteen entries flipped from `unscoped` to `scoped`** — the four
+# customer reads/writes and all six subscription operations, which now resolve
+# inside `Customer.for_account` / `Subscription.for_account`. The four assertions
+# that held the word `unscoped` in place are **inverted**, not deleted: they now
+# assert the verdicts are exactly what the code does, so the day someone removes a
+# scope this file fails naming the route. A matrix whose verdict can only be
+# "unscoped" is a matrix that stops being a check on the day it is fixed.
+#
+# **The four plan rows did not flip, and that is the finding.** A plan is platform
+# catalogue — what an account may buy, not what an account owns — so it carries no
+# `account_id` column and there is nothing to scope it by. `test/support/two_accounts.rb`
+# shares one plan between both accounts precisely because that is true, and
+# `subscriptions_live_account_plan_idx` is keyed on `(account_id, plan_id)` for the
+# same reason. The four are asserted as `CATALOGUE` — a third verdict, for a route
+# that is neither account-scoped nor unscoped but shared — rather than being filed
+# under `unscoped` with a paragraph explaining it, which is how a shared resource
+# becomes an unnoticed gap.
 #
 # ## What this is not
 #
 # It is not an authorization check, and it does not become one by being strict
-# about prose. Every entry in `ACCOUNT_SCOPED` below is honestly `unscoped`, and
-# the word stays in the table until the code changes. Turning a test red to
-# advertise a known gap is how a suite starts being ignored; the honest move is a
-# green test that says precisely what is true, so that the day one of these lines
-# stops being true the failure is a real one.
+# about prose. It is a **verdict table**, and a verdict that stops matching the
+# code is a red test naming a route — which is the outcome worth having.
 #
 # It lives here rather than in `outbox_envelope_contract_test.rb` because that
 # file skips when `core` is not on disk, and a check that hides behind a skip is
 # not a check. This one reads the router, which is always there.
 class TenantIsolationMatrixTest < ActiveSupport::TestCase
-  # The two verdicts a `/v1` route can carry here.
-  #
-  # `unscoped` is the truth for every account-scoped route on this commit, and it
-  # is a **load-bearing word**: it is what makes "this route touches another
-  # tenant's data" and "this route does not" distinguishable at a glance, so a
-  # route cannot quietly move between the two tables by being reclassified
-  # without someone reading why.
+  # The three verdicts a `/v1` route can carry here, and all three are
+  # **load-bearing words**: they are what makes "this route reads another tenant's
+  # data", "this route reads only the caller's" and "this route is shared platform
+  # data" distinguishable at a glance, so a route cannot quietly move between
+  # tables by being reclassified without someone reading why.
   UNSCOPED = "unscoped"
   SCOPED = "scoped"
+
+  # Not tenant data. A plan is what an account may buy, not what an account owns,
+  # so it has no `account_id` and every account reads the same rows. Added in
+  # billing-21 because filing these four under `unscoped` — which they were —
+  # described a shared catalogue as a defect, and a table that calls the model
+  # broken is a table nobody reads.
+  CATALOGUE = "catalogue"
 
   # The per-checkout database makes `Rails.root` the right unit for "this
   # service"; the matrix is about the code in this worktree.
@@ -92,12 +105,13 @@ class TenantIsolationMatrixTest < ActiveSupport::TestCase
     # A customer is a tenant's record: `owner_type`/`owner_id` are the only link
     # back to identity, and `POST` takes them in the body because there is no
     # token to read them from.
-    Customer => "a customer row is `owner_type`/`owner_id`, and there is no token to derive that pair from",
+    Customer => "a customer row is `owner_type`/`owner_id`, and the tenancy key is the pair itself",
     # A subscription is billed to an account and grants entitlements. Reading or
-    # cancelling one is the operation this whole matrix exists to keep honest.
+    # cancelling one is the operation this whole matrix exists to keep honest, and
+    # `account_id` is a column on the row rather than a join.
     Subscription => "a subscription is billed to `account_id` and grants entitlements",
-    # A plan is the catalogue every account buys from.
-    Plan => "a plan is the catalogue of what an account may buy"
+    # A plan is the catalogue every account buys from, and carries **no account at all**.
+    Plan => "a plan is the catalogue of what an account may buy, and has no `account_id`"
   }.freeze
 
   # Why each model is tenant data, keyed by the table it means. The
@@ -122,30 +136,33 @@ class TenantIsolationMatrixTest < ActiveSupport::TestCase
   # spelling would otherwise have stayed "the router serves something this file
   # does not know about" forever, with a green tick.
   #
-  # **Every entry is `UNSCOPED`.** That is the honest state of this service on this
-  # commit and the reason the file is worth having: the table is the list of
-  # operations that will need a `where(account_id:)` when identity's JWKS
-  # verification lands, written down before the day somebody has to remember
-  # them.
+  # **billing-21 flipped ten of the fourteen.** The four customer operations and all
+  # six subscription operations are `SCOPED`; the four plan operations are
+  # `CATALOGUE`. There is no `UNSCOPED` entry left, which is the honest state of this
+  # service on this commit — and the assertion below holds that as a **set of distinct
+  # verdicts**, so the day someone removes a scope the failure names `scoped` rather
+  # than reporting a number that moved.
   ACCOUNT_SCOPED = {
-    [ "GET", "/v1/customers" ] => [ UNSCOPED, "returns every customer" ],
-    [ "POST", "/v1/customers" ] => [ UNSCOPED, "takes `owner_type`/`owner_id` in the body" ],
-    [ "GET", "/v1/customers/:id" ] => [ UNSCOPED, "finds any customer by its uuid" ],
-    [ "PATCH", "/v1/customers/:id" ] => [ UNSCOPED, "writes any customer by its uuid" ],
+    [ "GET", "/v1/customers" ] => [ SCOPED, "pages this account's customers, scoped by `Customer.for_account`" ],
+    [ "POST", "/v1/customers" ] => [ SCOPED, "writes a customer owned by the token's account — the write carries `owner_type: Account, owner_id: current_account_id` rather than the body's, which `Customer.for_account` then constrains every later read of" ],
+    [ "GET", "/v1/customers/:id" ] => [ SCOPED, "resolves inside `Customer.for_account`, so another account's uuid is a 404" ],
+    [ "PATCH", "/v1/customers/:id" ] => [ SCOPED, "writes a customer resolved inside `Customer.for_account`" ],
 
-    [ "GET", "/v1/plans" ] => [ UNSCOPED, "returns the whole catalogue" ],
-    [ "POST", "/v1/plans" ] => [ UNSCOPED, "writes the catalogue" ],
-    [ "GET", "/v1/plans/:slug" ] => [ UNSCOPED, "reads the catalogue by handle" ],
-    [ "PATCH", "/v1/plans/:id" ] => [ UNSCOPED, "writes the catalogue by uuid" ],
+    [ "GET", "/v1/plans" ] => [ CATALOGUE, "returns the shared catalogue; a plan has no `account_id`" ],
+    [ "POST", "/v1/plans" ] => [ CATALOGUE, "writes the catalogue every account is offered; capability, not tenancy, and unverified — README" ],
+    [ "GET", "/v1/plans/:slug" ] => [ CATALOGUE, "reads the shared catalogue by handle" ],
+    [ "PATCH", "/v1/plans/:id" ] => [ CATALOGUE, "writes the shared catalogue by uuid; capability, not tenancy, and unverified — README" ],
 
-    [ "GET", "/v1/subscriptions" ] => [ UNSCOPED, "returns every subscription" ],
-    [ "POST", "/v1/subscriptions" ] => [ UNSCOPED, "takes a `customer_id` in the body" ],
-    [ "GET", "/v1/subscriptions/:id" ] => [ UNSCOPED, "reads any subscription by its uuid" ],
+    [ "GET", "/v1/subscriptions" ] => [ SCOPED, "pages this account's subscriptions, scoped by `Subscription.for_account`" ],
+    [ "POST", "/v1/subscriptions" ] => [ SCOPED, "resolves the body's `customer_id` inside `Customer.for_account`" ],
+    [ "GET", "/v1/subscriptions/:id" ] => [ SCOPED, "resolves inside `Subscription.for_account`, so another account's uuid is a 404" ],
     # The two mutating ones, and the reason the table is ordered this way: these
-    # change another account's billing state, which is the expensive direction.
-    [ "POST", "/v1/subscriptions/:id/cancel" ] => [ UNSCOPED, "cancels whichever subscription the path names" ],
-    [ "POST", "/v1/subscriptions/:id/change_plan" ] => [ UNSCOPED, "moves whichever subscription the path names onto another plan" ],
-    [ "GET", "/v1/subscriptions/:id/entitlements" ] => [ UNSCOPED, "reads another account's entitlements" ]
+    # change another account's billing state, which is the expensive direction — and
+    # they resolve through the **same** scoped `subscription_record` as the read, so
+    # the scope cannot be the one somebody forgot.
+    [ "POST", "/v1/subscriptions/:id/cancel" ] => [ SCOPED, "cancels a subscription resolved inside `Subscription.for_account`; another account's is a 404 before the processor is called" ],
+    [ "POST", "/v1/subscriptions/:id/change_plan" ] => [ SCOPED, "moves a subscription resolved inside `Subscription.for_account`" ],
+    [ "GET", "/v1/subscriptions/:id/entitlements" ] => [ SCOPED, "reads entitlements for a subscription resolved inside `Subscription.for_account`" ]
   }.freeze
 
   # Every served `/v1` operation that is **not** account-scoped, with the reason.
@@ -156,9 +173,15 @@ class TenantIsolationMatrixTest < ActiveSupport::TestCase
   # operation: it authenticates the *processor* by signature, not a cafaye client,
   # and it must never grow a token check — a `Bearer` on that path would be a
   # second, weaker trust path to the same door.
+  #
+  # **billing-21 made that structural rather than a convention.** The token check is a
+  # `before_action` on `V1::BaseController`, and `Webhooks::BaseController` does not
+  # inherit from it — so the webhook cannot grow a token check without somebody
+  # reaching into another namespace on purpose. `test/authentication/principal_lock_test.rb`
+  # asserts the boundary from the router's own table.
   NOT_ACCOUNT_SCOPED = {
     [ "POST", "/v1/webhooks/stripe" ] =>
-      "authenticates the processor by signature, not a cafaye client, and must never grow a token check"
+      "authenticates the processor by signature, not a cafaye client, and cannot grow a token check: `Webhooks::BaseController` does not inherit the concern"
   }.freeze
 
   # --- the two directions ----------------------------------------------------
@@ -198,20 +221,56 @@ class TenantIsolationMatrixTest < ActiveSupport::TestCase
 
   # --- the claims the table makes -------------------------------------------
 
-  # Every entry is `UNSCOPED`, and that is the claim this file exists to make
-  # checkable. It is asserted as a **set of the distinct values rather than by
-  # counting rows**, so that the day one of these is genuinely scoped the failure
-  # names the verdict that changed instead of reporting a number that moved.
+  # **The verdicts are `scoped` and `catalogue`, and neither is `unscoped`.** That is
+  # the claim this file exists to make checkable, and billing-21 is the commit that
+  # made it true.
   #
-  # A floor or a count would accept the table silently losing its most dangerous
-  # rows; a set comparison cannot, because the removal *is* the change.
-  test "every account-scoped operation is currently unscoped, which is the recorded gap" do
+  # Asserted as a **set of the distinct values rather than by counting rows**, so the
+  # failure names the verdict that changed instead of reporting a number that moved.
+  # A floor or a count would accept the table silently losing its most dangerous rows; a
+  # set comparison cannot, because the removal *is* the change.
+  test "no tenant-data operation is unscoped: the ten tenant routes carry a scope and the four plans are shared catalogue" do
     verdicts = ACCOUNT_SCOPED.values.map(&:first).uniq.sort
 
-    assert_equal [ UNSCOPED ], verdicts,
-      "these operations are recorded as scoped. That is only true once a query carries a " \
-      "where(account_id:) — change the verdict here in the same commit that adds the scope, " \
-      "or this test is a claim about code that does not exist"
+    assert_equal [ CATALOGUE, SCOPED ], verdicts,
+      "these operations are recorded as unscoped, or a verdict this file does not know about " \
+      "has appeared. `unscoped` is only true while a query carries no account; `catalogue` is " \
+      "only true for a plan, which has no `account_id`. Change the verdict here in the same " \
+      "commit that changes the code, or this test is a claim about code that does not exist."
+  end
+
+  # **The four customer and subscription operations per group are `SCOPED`, pinned by
+  # count.** The set assertion above says "some are scoped and none are unscoped", which a
+  # table could satisfy by scoping one route and leaving thirteen open. These are the
+  # counts that make the set assertion mean what it says.
+  test "ten of the fourteen are scoped: every customer and subscription operation, and none of the four plan operations" do
+    scoped = ACCOUNT_SCOPED.select { |_operation, (verdict, _reason)| verdict == SCOPED }.keys
+    catalogue = ACCOUNT_SCOPED.select { |_operation, (verdict, _reason)| verdict == CATALOGUE }.keys
+
+    assert_equal 10, scoped.size, "the scoped set is #{names(scoped)}"
+    assert_equal 4, catalogue.size, "the catalogue set is #{names(catalogue)}"
+    assert_empty scoped.grep(%r{/v1/plans}),
+      "a plan operation is recorded as scoped. A plan has no `account_id` column, so there is " \
+      "nothing to scope it by — that is the model, not a defect."
+    assert_equal(
+      [ [ "GET", "/v1/plans" ], [ "GET", "/v1/plans/:slug" ], [ "PATCH", "/v1/plans/:id" ], [ "POST", "/v1/plans" ] ],
+      ACCOUNT_SCOPED.select { |_operation, (verdict, _reason)| verdict == CATALOGUE }.keys.sort,
+      "the catalogue table is not the four plan operations the router serves. A plan route that " \
+      "left the table without a verdict would be a shared resource recorded as a defect."
+    )
+  end
+
+  # Every `scoped` entry must name the scope it relies on. Without this the verdict is
+  # a word: "scoped" would be satisfied by a comment rather than by a query, which is
+  # the failure mode the whole file was written to prevent.
+  test "every scoped operation names the scope that scopes it" do
+    unevidenced = ACCOUNT_SCOPED.select { |_operation, (verdict, reason)|
+      verdict == SCOPED && !reason.match?(/for_account/)
+    }
+
+    assert_empty unevidenced.keys,
+      "these operations are recorded as scoped without naming the scope. A verdict with no " \
+      "scope in its reason is a comment: #{names(unevidenced.keys)}"
   end
 
   # The reason is not decoration: a row without one is a row nobody thought about,
@@ -251,21 +310,28 @@ class TenantIsolationMatrixTest < ActiveSupport::TestCase
 
   # --- and the claim the README makes ---------------------------------------
 
-  # The prose says the open surface is `GET /v1/customers`, `GET /v1/subscriptions`
-  # and `POST /v1/subscriptions`. Those are the three *visible* consequences, not
-  # the complete set — `POST /v1/subscriptions/{id}/cancel` is worse and is not
-  # in that sentence. This asserts the prose's three are at least accounted for,
-  # so the README cannot drift away from the matrix without something failing.
-  DOCUMENTED_OPEN_OPERATIONS = [
+  # **billing-21 removed this section's subject.** The prose used to name
+  # `GET /v1/customers`, `GET /v1/subscriptions` and `POST /v1/subscriptions` as the
+  # *open* surface — the three visible consequences of there being no caller — and
+  # this asserted those three were `UNSCOPED` so the README could not drift away from
+  # the matrix. There is no open surface to name any more, so the assertions are
+  # **inverted**: the same three operations, now asserted to be `SCOPED`, and the
+  # reason sentence has to have moved with the verdict.
+  #
+  # Inverting rather than deleting is the point. A deleted assertion is a hole a later
+  # packet can fill by accident; an inverted one fails the day somebody removes a
+  # scope from `GET /v1/subscriptions`, which is the operation that returned every
+  # row.
+  DOCUMENTED_SCOPED_OPERATIONS = [
     [ "GET", "/v1/customers" ],
     [ "GET", "/v1/subscriptions" ],
     [ "POST", "/v1/subscriptions" ]
   ].freeze
 
-  DOCUMENTED_OPEN_OPERATIONS.each do |operation|
-    test "the README's open surface includes #{operation.join(" ")}, and the matrix agrees" do
+  DOCUMENTED_SCOPED_OPERATIONS.each do |operation|
+    test "the README's once-open #{operation.join(" ")} is now scoped, and the matrix agrees" do
       assert_includes ACCOUNT_SCOPED.keys, operation
-      assert_equal UNSCOPED, ACCOUNT_SCOPED.fetch(operation).first
+      assert_equal SCOPED, ACCOUNT_SCOPED.fetch(operation).first
     end
   end
 

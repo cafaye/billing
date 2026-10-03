@@ -63,6 +63,29 @@ class Plan < ApplicationRecord
     Money.new(amount_cents, currency)
   end
 
+  # A plan is **platform catalogue and not tenant data**, and that is the reason
+  # `V1::PlansController` resolves a plan by slug or uuid with no account filter —
+  # while every customer and subscription query on `/v1` carries one.
+  #
+  # It is worth being explicit about why the two are different, because the matrix
+  # in `test/contract/tenant_isolation_matrix_test.rb` calls a plan tenant data
+  # ("a plan is the catalogue of what an account may buy") and this comment is where
+  # that is resolved. A plan has **no `account_id` column**: a plan is what an
+  # account may buy, not what an account owns, so every account reads the same rows.
+  # `test/support/two_accounts.rb` deliberately builds ONE plan shared by both
+  # accounts, and `subscriptions_live_account_plan_idx` is keyed on
+  # `(account_id, plan_id)` precisely because the plan is shared and the account is
+  # not — a fixture that gave each account its own plan could not tell a correct
+  # index from a missing `account_id`.
+  #
+  # **What this does NOT settle is who may write the catalogue.** `POST /v1/plans`
+  # and `PATCH /v1/plans/{id}` change what *every* account is offered and at what
+  # price, so they are a capability question and core's answer is `scopes`, not
+  # `account_id`. No client in this build holds a billing scope, so no scope check
+  # is enforced and any authenticated caller can currently write the catalogue.
+  # That is a recorded gap (`README.md`, "Known gaps") rather than a decision, and
+  # `Principal#scopes` is the place it is closed.
+
   # The write side. Refuses anything that is not a `Money`, because the whole
   # point of the type is that a bare integer has no currency and a Float has no
   # exact value. A caller with a raw pair must build the Money itself.

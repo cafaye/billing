@@ -79,6 +79,20 @@ class Subscription < ApplicationRecord
   scope :live, -> { where.not(status: TERMINAL_STATUSES) }
   scope :canceled, -> { where(status: TERMINAL_STATUSES) }
 
+  # **This account's subscriptions, and nobody else's.**
+  #
+  # `account_id` is a real column and is denormalised from the customer's owner
+  # precisely so that a query can be scoped by it without joining — see
+  # `account_is_the_customers_owner` for why it cannot drift, and
+  # `subscriptions_live_account_plan_idx` for the uniqueness it is keyed on.
+  #
+  # This is the scope that makes `POST /v1/subscriptions/{id}/cancel` safe. Every
+  # read on `/v1` reaches a subscription through here, so a uuid naming another
+  # account's row resolves to `nil` and the action answers **404** — the same answer
+  # a uuid naming nothing gets, because a 403 would tell a caller walking ids which
+  # ones exist. Absence, never refusal; see `AuthenticatesPrincipal`.
+  scope :for_account, ->(account_id) { where(account_id: account_id) }
+
   def canceled?
     TERMINAL_STATUSES.include?(status)
   end

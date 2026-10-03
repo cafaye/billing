@@ -40,7 +40,22 @@
 module StripeSubscriptionFixtures
   PROCESSOR_CUSTOMER_ID = "cus_R1pQKz9xLp2mN4vB6yH8jL0".freeze
   PROCESSOR_PRICE_ID = "price_1PZQaBcDeFgHiJkLmNoPqR2".freeze
-  ACCOUNT_ID = "11111111-1111-4111-8111-111111111111".freeze
+
+  # **The account the suite's tokens act as, and not a literal here.**
+  #
+  # `/v1` is scoped by the token's `account_id`, so a fixture owned by any other
+  # account is invisible to every request in the suite — a request spec would pass
+  # asserting the *lock* while the behaviour it meant to test was never reached.
+  # Naming the identity module's constant makes that impossible to get wrong in one
+  # place, and `test/requests/v1/customers_test.rb` and
+  # `test/requests/v1/subscriptions_test.rb` inherit it rather than each pinning
+  # their own copy.
+  #
+  # Distinct from `TwoAccounts::ACCOUNT_A/B` on purpose: those are the pair
+  # `test/tenant/` compares against, and the suite's ordinary authenticated account
+  # being one of them would make a cross-account spec's "the caller's own row" and
+  # "the other account's row" the same row.
+  ACCOUNT_ID = TestSupport::TestIdentity::Account
 
   # Extra processor ids for the *second* and later rows of a kind, handed out in
   # order. Obviously fake like everything else here, and named rather than
