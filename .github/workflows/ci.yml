@@ -281,8 +281,8 @@ env:
   # than a silent narrowing of the boundary. Both guards this packet added were
   # wrong on first write and were caught by mutation, not by review; see
   # CHANGELOG.md.
-  BASELINE_RUNS: '1077'
-  BASELINE_ASSERTIONS: '3064'
+  BASELINE_RUNS: '1078'
+  BASELINE_ASSERTIONS: '3082'
 
 jobs:
   # ------------------------------------------------------------------ shared

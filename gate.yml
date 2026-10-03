@@ -372,7 +372,7 @@ gate:
       # suite that quietly lost the assertions saying `/v1` was open — and that
       # is the direction this packet moved, so a decrease here is the honest
       # reading rather than a suspicious one.
-      minimum: 1077
+      minimum: 1078
     # ---------------------------------------------------------------------
     # The gate reached its own last line. With the five above it, the step
     # markers bracket the run: the toolchain was pinned, the bundle resolved, a
