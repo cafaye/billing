@@ -42,7 +42,7 @@ gem "image_processing", "~> 1.2"
 # has. Every `Stripe::` call in this repository is one of the three
 # `StripeClient` methods or `construct_event` — a checkable claim about the code
 # rather than a sentence in a README.
-gem "stripe", "~> 19.6"
+gem "stripe", "~> 20.0"
 
 # There is no `pay` gem here any more, and the gap it left is deliberate.
 #
